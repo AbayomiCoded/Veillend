@@ -9,10 +9,9 @@ import {
   Dimensions,
   TextInput,
   Platform,
+  Clipboard,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { LinearGradient } from 'expo-linear-gradient';
-import * as Clipboard from 'expo-clipboard';
 import Toast from '../utils/toast';
 
 const { width } = Dimensions.get('window');
@@ -42,7 +41,8 @@ export function WalletBackupModal({
       // Show only first 4 and last 4 characters with dots in between
       const firstFour = secretKey.slice(0, 4);
       const lastFour = secretKey.slice(-4);
-      setMaskedKey(`${firstFour}${'•'.repeat(Math.min(secretKey.length - 8, 20))}${lastFour}`);
+      const dotCount = Math.min(secretKey.length - 8, 20);
+      setMaskedKey(`${firstFour}${'•'.repeat(dotCount > 0 ? dotCount : 0)}${lastFour}`);
     }
   }, [secretKey]);
 
@@ -52,7 +52,7 @@ export function WalletBackupModal({
 
   const handleCopyToClipboard = async () => {
     if (secretKey) {
-      await Clipboard.setStringAsync(secretKey);
+      await Clipboard.setString(secretKey);
       Toast.show({
         type: 'success',
         text1: 'Copied to clipboard',

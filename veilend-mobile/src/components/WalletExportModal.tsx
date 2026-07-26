@@ -8,11 +8,11 @@ import {
   Dimensions,
   ScrollView,
   Platform,
+  Clipboard,
+  Share,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import * as Clipboard from 'expo-clipboard';
 import * as FileSystem from 'expo-file-system';
-import * as Sharing from 'expo-sharing';
 import Toast from '../utils/toast';
 
 const { width } = Dimensions.get('window');
@@ -40,7 +40,7 @@ export function WalletExportModal({
 
   const handleCopyToClipboard = async () => {
     if (secretKey) {
-      await Clipboard.setStringAsync(secretKey);
+      await Clipboard.setString(secretKey);
       Toast.show({
         type: 'success',
         text1: 'Copied to clipboard',
@@ -55,16 +55,33 @@ export function WalletExportModal({
     setIsExporting(true);
     try {
       const fileName = `veilend_backup_${Date.now()}.txt`;
-      const filePath = `${FileSystem.documentDirectory}${fileName}`;
+      // Use FileSystem with type assertion to access documentDirectory
+      const fs = FileSystem as any;
+      const documentDir = fs.documentDirectory;
+      
+      if (!documentDir) {
+        throw new Error('Unable to access document directory');
+      }
+      
+      const filePath = `${documentDir}${fileName}`;
       
       const content = `VEILEND WALLET BACKUP\n\nSecret Key: ${secretKey}\nGenerated: ${new Date().toISOString()}\n\nWARNING: Keep this file secure. Anyone with access to this file can control your wallet.\n`;
       
       await FileSystem.writeAsStringAsync(filePath, content);
       
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(filePath, {
-          mimeType: 'text/plain',
-          dialogTitle: 'Export Wallet Backup',
+      // Use Share.share directly with content
+      try {
+        await Share.share({
+          message: content,
+          title: 'Export Wallet Backup',
+        });
+      } catch (shareError) {
+        // If sharing fails, at least the file was created
+        console.log('Share failed but file was created:', shareError);
+        Toast.show({
+          type: 'info',
+          text1: 'File Created',
+          text2: `Backup saved to device storage`,
         });
       }
       

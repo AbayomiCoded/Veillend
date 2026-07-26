@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Keypair } from '@stellar/stellar-base';
 import * as SecureStoreShim from '../utils/secureStoreShim';
-import * as Clipboard from 'expo-clipboard';
+import { Clipboard } from 'react-native';
 
 let SecureStore: typeof SecureStoreShim;
 try {
@@ -19,7 +19,7 @@ type WalletSecurityState = {
   secretKey: string | null;
   isBackupConfirmed: boolean;
   isRevealActive: boolean;
-  revealTimer: NodeJS.Timeout | null;
+  revealTimer: ReturnType<typeof setTimeout> | null;
 };
 
 export function useWalletSecurity() {
@@ -76,7 +76,7 @@ export function useWalletSecurity() {
     if (!key) return null;
 
     // Set reveal active and start timer
-    const timer = setTimeout(() => {
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
       setState((prev) => ({
         ...prev,
         isRevealActive: false,
@@ -135,11 +135,11 @@ export function useWalletSecurity() {
 
   const copyToClipboard = useCallback(async (text: string): Promise<boolean> => {
     try {
-      await Clipboard.setStringAsync(text);
+      await Clipboard.setString(text);
       // Set a timer to clear clipboard after 30 seconds (iOS/Android limitation)
       setTimeout(async () => {
         try {
-          await Clipboard.setStringAsync('');
+          await Clipboard.setString('');
         } catch (e) {
           // Ignore clipboard clear errors
         }
