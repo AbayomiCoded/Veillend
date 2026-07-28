@@ -26,7 +26,7 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
     enabled = true,
     refreshInterval = 30000,
     retryOnError = true,
-    maxRetries = 3
+    maxRetries = 3,
   } = options;
 
   const [data, setData] = useState<DashboardData | null>(null);
@@ -37,12 +37,30 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   const retryCount = useRef<number>(0);
-  const timeoutId = useRef<NodeJS.Timeout | null>(null);
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const intervalIdRef = useRef<NodeJS.Timeout | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Ref container to hold fetchData reference for safe recursive retry calls
+  const fetchDataRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
   const client = getDashboardClient();
 
+  // Clear pending timers & abort pending requests
+  const cleanupPendingOperations = useCallback(() => {
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  }, []);
+
+  // Primary fetch execution function
   const fetchData = useCallback(async (): Promise<void> => {
-    // Validate address
+    // Validate address format
     if (!address || !address.startsWith('G')) {
       setData(null);
       setIsLoading(false);
@@ -51,11 +69,7 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
       return;
     }
 
-    // Cancel any ongoing fetch
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
+    cleanupPendingOperations();
     abortControllerRef.current = new AbortController();
 
     setIsLoading(true);
@@ -73,8 +87,9 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
       setLastUpdated(new Date());
       retryCount.current = 0;
       setIsStale(false);
+      setIsLoading(false);
     } catch (err) {
-      // Handle abort errors gracefully
+      // Ignore request cancellations
       if (err instanceof Error && err.name === 'AbortError') {
         return;
       }
@@ -82,71 +97,83 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
       const errorObj = err instanceof Error ? err : new Error('Failed to fetch dashboard data');
       setError(errorObj);
       setIsError(true);
+      setIsLoading(false);
 
-      // Handle retry logic
+      // Exponential backoff retry logic using ref call to satisfy ESLint
       if (retryOnError && retryCount.current < maxRetries) {
+        const backoffDelay = Math.min(1000 * Math.pow(2, retryCount.current), 10000);
         retryCount.current += 1;
-        const backoffDelay = Math.min(1000 * Math.pow(2, retryCount.current - 1), 10000);
-        setTimeout(() => {
+
+        retryTimeoutRef.current = setTimeout(() => {
           if (enabled && address) {
-            fetchData();
+            fetchDataRef.current();
           }
         }, backoffDelay);
       }
-    } finally {
-      setIsLoading(false);
     }
-  }, [address, client, retryOnError, maxRetries, enabled]);
+  }, [address, client, enabled, maxRetries, retryOnError, cleanupPendingOperations]);
 
-  // Initial fetch and refresh setup
+  // Keep fetchDataRef in sync safely via effect
+  useEffect(() => {
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  // Separate effect for clearing data when disabled or unmounting
   useEffect(() => {
     if (!enabled || !address) {
-      setData(null);
-      setIsLoading(false);
+      cleanupPendingOperations();
+      const timer = setTimeout(() => {
+        setData(null);
+        setIsLoading(false);
+        setIsError(false);
+        setError(null);
+      }, 0);
+
+      return () => clearTimeout(timer);
+    }
+  }, [enabled, address, cleanupPendingOperations]);
+
+  // Main lifecycle effect: initial fetch + interval polling
+  useEffect(() => {
+    if (!enabled || !address) {
       return;
     }
 
-    fetchData();
+    // Deferred execution prevents synchronous setState calls inside the effect
+    const initialTimer = setTimeout(() => {
+      fetchData();
+    }, 0);
 
-    // Set up refresh interval
     if (refreshInterval > 0) {
-      timeoutId.current = setInterval(() => {
-        if (enabled && address) {
-          setIsStale(true);
-          fetchData();
-        }
+      intervalIdRef.current = setInterval(() => {
+        setIsStale(true);
+        fetchData();
       }, refreshInterval);
     }
 
-    // Cleanup
     return () => {
-      if (timeoutId.current) {
-        clearInterval(timeoutId.current);
-        timeoutId.current = null;
+      clearTimeout(initialTimer);
+      if (intervalIdRef.current) {
+        clearInterval(intervalIdRef.current);
+        intervalIdRef.current = null;
       }
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
+      cleanupPendingOperations();
     };
-  }, [address, enabled, refreshInterval, fetchData]);
+  }, [address, enabled, refreshInterval, fetchData, cleanupPendingOperations]);
 
+  // Manual refetch trigger
   const refetch = useCallback(async (): Promise<void> => {
     if (!enabled || !address) return;
+    retryCount.current = 0;
     await fetchData();
   }, [address, enabled, fetchData]);
 
-  // Reset stale state when component becomes active again
-  useEffect(() => {
-    if (document.hidden) {
-      setIsStale(true);
-    }
-  }, []);
-
-  // Handle visibility change for stale state
+  // Handle visibility changes when returning to active tab
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (!document.hidden && isStale) {
+      if (document.hidden) {
+        setIsStale(true);
+      } else if (isStale && enabled && address) {
         fetchData();
       }
     };
@@ -155,7 +182,7 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [isStale, fetchData]);
+  }, [isStale, enabled, address, fetchData]);
 
   return {
     data,
@@ -164,6 +191,6 @@ export function useDashboardData(options: UseDashboardDataOptions): UseDashboard
     error,
     isStale,
     refetch,
-    lastUpdated
+    lastUpdated,
   };
 }

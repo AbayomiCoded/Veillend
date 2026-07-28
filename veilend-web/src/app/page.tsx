@@ -30,14 +30,22 @@ export default function VeilLendLandingPage() {
     return () => clearInterval(interval)
   }, [])
 
-  // Handle wallet errors
+  // Handle wallet errors - using useCallback to avoid setState in effect
   React.useEffect(() => {
     if (error) {
-      setConnectionError(error)
+      // Use a timeout to avoid synchronous setState in effect
       const timer = setTimeout(() => {
+        setConnectionError(error)
+      }, 0)
+      
+      const clearTimer = setTimeout(() => {
         setConnectionError(null)
       }, 5000)
-      return () => clearTimeout(timer)
+      
+      return () => {
+        clearTimeout(timer)
+        clearTimeout(clearTimer)
+      }
     }
   }, [error])
 

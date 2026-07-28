@@ -1,7 +1,6 @@
 import { Container, Flex, Grid, Section } from '@/components/Layout';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { fetchDashboardData } from '@/lib/api/dashboard';
 import { headers } from 'next/headers';
@@ -22,6 +21,35 @@ async function getWalletAddress(): Promise<string | null> {
   
   return null;
 }
+
+// Helper functions moved outside component
+const getActionBadgeClassName = (action: string): string | undefined => {
+  switch (action) {
+    case 'DEPOSIT':
+      return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400';
+    case 'BORROW':
+      return 'border-amber-500/20 bg-amber-500/10 text-amber-400';
+    case 'REPAY':
+      return 'border-purple-500/20 bg-purple-500/10 text-purple-400';
+    case 'WITHDRAW':
+      return 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400';
+    default:
+      return undefined;
+  }
+};
+
+const formatUsd = (val: number): string =>
+  new Intl.NumberFormat('en-US', { 
+    style: 'currency', 
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(val);
+
+const formatHealthFactor = (factor: number): string => {
+  if (factor === Infinity) return '∞';
+  return factor.toFixed(2);
+};
 
 export default async function DashboardPage() {
   const walletAddress = await getWalletAddress();
@@ -52,41 +80,6 @@ export default async function DashboardPage() {
       lastUpdated: new Date().toISOString(),
     },
     recentActivity: [],
-  };
-
-  const getActionBadgeClassName = (action: string): string | undefined => {
-    switch (action) {
-      case 'DEPOSIT':
-        return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400';
-      case 'BORROW':
-        return 'border-amber-500/20 bg-amber-500/10 text-amber-400';
-      case 'REPAY':
-        return 'border-purple-500/20 bg-purple-500/10 text-purple-400';
-      case 'WITHDRAW':
-        return 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400';
-      default:
-        return undefined;
-    }
-  };
-
-  const formatUsd = (val: number): string =>
-    new Intl.NumberFormat('en-US', { 
-      style: 'currency', 
-      currency: 'USD',
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(val);
-
-  const formatHealthFactor = (factor: number): string => {
-    if (factor === Infinity) return '∞';
-    return factor.toFixed(2);
-  };
-
-  const getHealthColor = (factor: number): string => {
-    if (factor === Infinity) return 'text-emerald-400';
-    if (factor < 1.1) return 'text-red-400';
-    if (factor < 1.5) return 'text-amber-400';
-    return 'text-emerald-400';
   };
 
   // Handle error state

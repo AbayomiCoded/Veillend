@@ -128,10 +128,8 @@ export const Grid: React.FC<GridProps> = ({
     xl: "gap-8",
   };
 
-  // Handle both number and object for columns
   const getColumnsClass = () => {
     if (typeof columns === "number") {
-      // Default responsive behavior for number
       const colMap: Record<number, string> = {
         1: "grid-cols-1",
         2: "grid-cols-1 md:grid-cols-2",
@@ -143,14 +141,12 @@ export const Grid: React.FC<GridProps> = ({
       return colMap[columns] || `grid-cols-${columns}`;
     }
 
-    // Object-based responsive columns
     const parts: string[] = [];
     if (columns.sm) parts.push(`grid-cols-${columns.sm}`);
     if (columns.md) parts.push(`md:grid-cols-${columns.md}`);
     if (columns.lg) parts.push(`lg:grid-cols-${columns.lg}`);
     if (columns.xl) parts.push(`xl:grid-cols-${columns.xl}`);
     
-    // Fallback to 1 column if no breakpoints specified
     if (parts.length === 0) return "grid-cols-1";
     
     return parts.join(" ");
@@ -170,7 +166,6 @@ export const Grid: React.FC<GridProps> = ({
   );
 };
 
-// For backward compatibility - responsive grid helper
 interface GridResponsiveProps {
   children: React.ReactNode;
   columns?: { sm?: number; md?: number; lg?: number; xl?: number };
@@ -212,11 +207,12 @@ export const GridResponsive: React.FC<GridResponsiveProps> = ({
   );
 };
 
-// Export all components as named exports and default
-export default {
+const LayoutComponents = {
   Container,
   Section,
   Flex,
   Grid,
   GridResponsive,
 };
+
+export default LayoutComponents;

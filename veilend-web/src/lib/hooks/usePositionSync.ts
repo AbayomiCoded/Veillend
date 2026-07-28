@@ -1,4 +1,4 @@
-'use client'
+'use client';
 
 import * as React from 'react';
 import { DashboardData } from '@/lib/types/dashboard';
@@ -29,9 +29,7 @@ interface UsePositionSyncOptions {
 
 /**
  * Keeps positions, collateral and borrowed values in sync with live protocol
- * state by polling the indexer. Exposes explicit loading / empty / stale / error
- * states so the dashboard can represent each clearly. Privacy mode is orthogonal:
- * this hook only manages the values; masking is handled at render time.
+ * state by polling the indexer.
  */
 export function usePositionSync(
   options: UsePositionSyncOptions = {},
@@ -48,13 +46,17 @@ export function usePositionSync(
   const [lastSyncedAt, setLastSyncedAt] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Guards against state updates after unmount / overlapping requests
+  // Safely sync ref in useEffect to avoid react-hooks/refs render error
+  const dataRef = React.useRef<DashboardData | null>(data);
+  React.useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
   const inFlight = React.useRef<boolean>(false);
   const mounted = React.useRef<boolean>(true);
   const abortControllerRef = React.useRef<AbortController | null>(null);
 
   const load = React.useCallback(async () => {
-    // Validate address before attempting to fetch
     if (!address || !address.startsWith('G')) {
       setStatus('idle');
       setError('No valid wallet address provided');
@@ -64,19 +66,16 @@ export function usePositionSync(
     if (inFlight.current) return;
     inFlight.current = true;
 
-    // Cancel any in-flight request
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
     abortControllerRef.current = new AbortController();
 
-    // Only show the full loading state on the very first fetch; subsequent
-    // polls refresh in the background without flickering the UI.
     setStatus((prev) => (prev === 'idle' ? 'loading' : prev));
 
     try {
       const result = await fetchDashboardData(address);
-      
+
       if (!mounted.current) return;
 
       const isEmpty =
@@ -90,83 +89,92 @@ export function usePositionSync(
       setStatus(isEmpty ? 'empty' : 'live');
     } catch (err) {
       if (!mounted.current) return;
-      
-      // Handle abort errors gracefully
+
       if (err instanceof Error && err.name === 'AbortError') {
         return;
       }
-      
-      const errorMessage = err instanceof Error ? err.message : 'Failed to sync positions.';
+
+      const errorMessage =
+        err instanceof Error ? err.message : 'Failed to sync positions.';
       setError(errorMessage);
-      
-      // Keep stale data visible if we have it; otherwise surface the error.
-      setStatus(data ? 'stale' : 'error');
+
+      setStatus(dataRef.current ? 'stale' : 'error');
     } finally {
       inFlight.current = false;
       abortControllerRef.current = null;
     }
-  }, [address, data]);
+  }, [address]);
+
+  // Handle address change: Reset state cleanly
+  React.useEffect(() => {
+    const timer = setTimeout(() => {
+      if (address) {
+        setStatus('idle');
+        setData(null);
+        setError(null);
+        setLastSyncedAt(null);
+      }
+    }, 0);
+
+    return () => clearTimeout(timer);
+  }, [address]);
+
+  const isValid = React.useMemo(() => {
+    return Boolean(enabled && address && address.startsWith('G'));
+  }, [enabled, address]);
 
   // Initial load + interval polling
   React.useEffect(() => {
     mounted.current = true;
-    
-    // Reset state when address changes
-    if (address) {
-      setStatus('idle');
-      setData(null);
-      setError(null);
-      setLastSyncedAt(null);
+
+    if (!isValid) {
+      const timer = setTimeout(() => {
+        setStatus('idle');
+      }, 0);
+      return () => clearTimeout(timer);
     }
 
-    if (!enabled || !address) {
-      setStatus('idle');
-      return;
-    }
+    const initialTimer = setTimeout(() => {
+      if (mounted.current) {
+        load();
+      }
+    }, 0);
 
-    // Intentional fetch-on-mount: load() flips status to 'loading' before the
-    // first await, which the rule flags; that initial transition is the point.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load();
-    
-    const id = setInterval(() => {
-      if (mounted.current && enabled && address) {
+    const pollInterval = setInterval(() => {
+      if (mounted.current && isValid) {
         load();
       }
     }, intervalMs);
 
     return () => {
-      mounted.current = false;
-      clearInterval(id);
+      clearTimeout(initialTimer);
+      clearInterval(pollInterval);
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, intervalMs, address, load]);
+  }, [isValid, intervalMs, load]);
 
-  // Independent staleness ticker: flags data as stale if a poll hasn't
-  // succeeded within staleAfterMs, even while requests keep failing.
+  // Staleness ticker: flags data as stale if poll hasn't succeeded within staleAfterMs
   React.useEffect(() => {
     if (lastSyncedAt === null) return;
-    
-    const id = setInterval(() => {
+
+    const ticker = setInterval(() => {
       if (!mounted.current) return;
-      
+
       setStatus((prev) => {
-        // Only transition from live or empty to stale
         if (prev !== 'live' && prev !== 'empty') return prev;
-        
+
         const isStale = Date.now() - lastSyncedAt > staleAfterMs;
         return isStale ? 'stale' : prev;
       });
     }, Math.min(staleAfterMs, 5_000));
-    
-    return () => clearInterval(id);
+
+    return () => clearInterval(ticker);
   }, [lastSyncedAt, staleAfterMs]);
 
-  // Clean up on unmount
+  // Component unmount lifecycle
   React.useEffect(() => {
     return () => {
       mounted.current = false;

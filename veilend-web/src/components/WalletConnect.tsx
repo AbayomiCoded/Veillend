@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Flex } from "@/components/Layout";
+// import { Flex } from "@/components/Layout";
 import { getWalletConnectionMessage, isFreighterInstalled } from "@/lib/stellar/wallet";
 
 interface WalletConnectProps {
