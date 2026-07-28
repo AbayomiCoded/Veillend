@@ -49,12 +49,26 @@ export function usePositionSync(
   const [error, setError] = React.useState<string | null>(null);
 
   // Guards against state updates after unmount / overlapping requests
-  const inFlight = React.useRef(false);
-  const mounted = React.useRef(true);
+  const inFlight = React.useRef<boolean>(false);
+  const mounted = React.useRef<boolean>(true);
+  const abortControllerRef = React.useRef<AbortController | null>(null);
 
   const load = React.useCallback(async () => {
+    // Validate address before attempting to fetch
+    if (!address || !address.startsWith('G')) {
+      setStatus('idle');
+      setError('No valid wallet address provided');
+      return;
+    }
+
     if (inFlight.current) return;
     inFlight.current = true;
+
+    // Cancel any in-flight request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
 
     // Only show the full loading state on the very first fetch; subsequent
     // polls refresh in the background without flickering the UI.
@@ -62,6 +76,7 @@ export function usePositionSync(
 
     try {
       const result = await fetchDashboardData(address);
+      
       if (!mounted.current) return;
 
       const isEmpty =
@@ -75,44 +90,92 @@ export function usePositionSync(
       setStatus(isEmpty ? 'empty' : 'live');
     } catch (err) {
       if (!mounted.current) return;
-      setError(err instanceof Error ? err.message : 'Failed to sync positions.');
+      
+      // Handle abort errors gracefully
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
+      
+      const errorMessage = err instanceof Error ? err.message : 'Failed to sync positions.';
+      setError(errorMessage);
+      
       // Keep stale data visible if we have it; otherwise surface the error.
       setStatus(data ? 'stale' : 'error');
     } finally {
       inFlight.current = false;
+      abortControllerRef.current = null;
     }
   }, [address, data]);
 
   // Initial load + interval polling
   React.useEffect(() => {
     mounted.current = true;
-    if (!enabled) return;
+    
+    // Reset state when address changes
+    if (address) {
+      setStatus('idle');
+      setData(null);
+      setError(null);
+      setLastSyncedAt(null);
+    }
+
+    if (!enabled || !address) {
+      setStatus('idle');
+      return;
+    }
 
     // Intentional fetch-on-mount: load() flips status to 'loading' before the
     // first await, which the rule flags; that initial transition is the point.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
-    const id = setInterval(load, intervalMs);
+    
+    const id = setInterval(() => {
+      if (mounted.current && enabled && address) {
+        load();
+      }
+    }, intervalMs);
+
     return () => {
       mounted.current = false;
       clearInterval(id);
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, intervalMs, address]);
+  }, [enabled, intervalMs, address, load]);
 
   // Independent staleness ticker: flags data as stale if a poll hasn't
   // succeeded within staleAfterMs, even while requests keep failing.
   React.useEffect(() => {
     if (lastSyncedAt === null) return;
+    
     const id = setInterval(() => {
       if (!mounted.current) return;
+      
       setStatus((prev) => {
+        // Only transition from live or empty to stale
         if (prev !== 'live' && prev !== 'empty') return prev;
-        return Date.now() - lastSyncedAt > staleAfterMs ? 'stale' : prev;
+        
+        const isStale = Date.now() - lastSyncedAt > staleAfterMs;
+        return isStale ? 'stale' : prev;
       });
     }, Math.min(staleAfterMs, 5_000));
+    
     return () => clearInterval(id);
   }, [lastSyncedAt, staleAfterMs]);
+
+  // Clean up on unmount
+  React.useEffect(() => {
+    return () => {
+      mounted.current = false;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
+  }, []);
 
   return {
     status,

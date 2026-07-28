@@ -138,26 +138,40 @@ export class DashboardClient {
     const totalBalanceUsd = totalDepositedUsd - totalBorrowedUsd;
 
     // Process transactions with real prices
-    const recentActivity = Array.isArray(transactions) 
-      ? transactions
-          .map((tx) => {
-            const amount = Number(tx.amount) / 1e7;
-            const price = prices[tx.assetAddress] || 0;
-            return {
-              id: tx.id,
-              action: this.mapTransactionType(tx.type),
-              assetSymbol: this.extractAssetSymbol(tx.assetAddress),
-              amount,
-              usdValue: amount * price,
-              timestamp: tx.timestamp,
-              status: 'COMPLETED' as const,
-              txHash: tx.txHash,
-            };
-          })
-          .filter((activity): activity is ActivityEvent => activity.usdValue > 0)
-          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-          .slice(0, 50)
-      : [];
+    let recentActivity: ActivityEvent[] = [];
+    
+    if (Array.isArray(transactions) && transactions.length > 0) {
+      const mappedActivities = transactions.map((tx) => {
+        const amount = Number(tx.amount) / 1e7;
+        const price = prices[tx.assetAddress] || 0;
+        const usdValue = amount * price;
+        
+        // Skip transactions with no value
+        if (usdValue <= 0) {
+          return null;
+        }
+        
+        // Create activity with proper status type
+        const activity: ActivityEvent = {
+          id: tx.id,
+          action: this.mapTransactionType(tx.type),
+          assetSymbol: this.extractAssetSymbol(tx.assetAddress),
+          amount,
+          usdValue,
+          timestamp: tx.timestamp,
+          status: 'COMPLETED', // All indexer transactions are completed
+          txHash: tx.txHash,
+        };
+        
+        return activity;
+      });
+      
+      // Filter out null values and assert the type
+      recentActivity = mappedActivities
+        .filter((activity): activity is ActivityEvent => activity !== null)
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        .slice(0, 50);
+    }
 
     return {
       portfolio: {
@@ -174,8 +188,11 @@ export class DashboardClient {
   }
 
   private extractAssetSymbol(assetAddress: string): string {
-    // Extract the last 4 characters of the address for display
-    // In production, this should map to actual asset codes
+    // Extract asset symbol from address
+    if (assetAddress.includes('USDC')) return 'USDC';
+    if (assetAddress.includes('XLM')) return 'XLM';
+    if (assetAddress.includes('BTC')) return 'BTC';
+    if (assetAddress.includes('ETH')) return 'ETH';
     return assetAddress.slice(-4);
   }
 
@@ -183,15 +200,19 @@ export class DashboardClient {
     const normalizedType = type.toUpperCase();
     switch (normalizedType) {
       case 'DEPOSIT':
+      case 'SUPPLY':
         return 'DEPOSIT';
       case 'BORROW':
         return 'BORROW';
       case 'REPAY':
+      case 'REPAYMENT':
         return 'REPAY';
       case 'WITHDRAW':
+      case 'WITHDRAWAL':
         return 'WITHDRAW';
       default:
-        return 'DEPOSIT'; // Default fallback
+        console.warn(`Unknown transaction type: ${type}, defaulting to DEPOSIT`);
+        return 'DEPOSIT';
     }
   }
 
