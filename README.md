@@ -66,17 +66,25 @@ All contract errors are typed via `VeilLendError` (`#[contracterror]`, `#[repr(u
 | Variant | Code | When it fires |
 |---------|------|---------------|
 | `AlreadyInitialized` | 1 | `__constructor` called when admin is already set |
-| `Unauthorized` | 2 | Non-admin caller on admin-only functions (`configure_asset`, `set_oracle_price`) |
+| `Unauthorized` | 2 | Non-admin caller on admin-only functions (`configure_asset`, `set_oracle_price`, `set_paused`, `update_asset_caps`, `record_protocol_fee`, `propose_admin`, `set_timelock`, `set_min_collateral_ratio`) |
 | `UnsupportedAsset` | 3 | Operation on an asset not yet configured via `configure_asset` |
 | `InvalidAmount` | 4 | Negative amount passed to `deposit`, `borrow`, `repay`, `withdraw` |
 | `InsufficientCollateral` | 5 | `borrow` or `withdraw` would push collateral ratio below minimum |
 | `InsufficientDeposit` | 6 | `withdraw` amount exceeds user's deposited balance |
 | `RepayTooLarge` | 7 | `repay` amount exceeds user's outstanding borrowed balance |
-| `InvalidCollateralRatio` | 8 | `__constructor` called with `min_collateral_ratio_bps < 10_000` (< 100%) |
+| `InvalidCollateralRatio` | 8 | `__constructor` or `set_min_collateral_ratio` called with `min_collateral_ratio_bps < 10_000` (< 100%) |
 | `NotInitialized` | 9 | Any function requiring admin called before `__constructor` |
 | `ZeroAmount` | 10 | Zero amount passed to `deposit`, `borrow`, `repay`, `withdraw` |
 | `OraclePriceMissing` | 11 | `borrow` or `withdraw` on an asset without a configured oracle price |
-| `ContractPaused` | 12 | Any state-changing function called while contract is paused |
+| `ContractPaused` | 12 | Deposit or borrow called while contract is paused |
+| `DepositCapExceeded` | 13 | Deposit would exceed the asset's deposit cap |
+| `BorrowCapExceeded` | 14 | Borrow would exceed the asset's borrow cap |
+| `InvalidCap` | 15 | Cap value that is neither `-1` (unlimited) nor positive |
+| `CircuitBreakerTriggered` | 16 | Circuit breaker triggered - asset temporarily paused |
+| `InsufficientReserve` | 17 | Reserve balance too low for the requested action |
+| `NoPendingAdmin` | 25 | `accept_admin` called with no pending proposal or a different address |
+| `TimelockNotElapsed` | 26 | `execute_pending_collateral_ratio` called before the timelock has elapsed |
+| `NoPendingRatioChange` | 27 | `execute_pending_collateral_ratio` called with no pending change |
 
 ### Error handling notes
 - Zero and negative amounts produce **different** errors (`ZeroAmount` vs `InvalidAmount`) so clients can distinguish them.
