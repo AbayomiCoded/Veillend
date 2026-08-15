@@ -9,6 +9,10 @@ const campaignEvents = [
 type CampaignEventName = (typeof campaignEvents)[number];
 
 type CampaignEventRequest = {
+  id?: string;
+  sessionId?: string;
+  ts?: string;
+  type?: CampaignEventName;
   event?: CampaignEventName;
   campaign?: string;
   timestamp?: string;
@@ -25,6 +29,37 @@ type SanitizedPayload = {
   interestArea?: string;
 };
 
+// Per-IP Rate Limiting (60 requests per 1 minute window)
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_REQUESTS = 60;
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+export function resetRateLimits(): void {
+  rateLimitStore.clear();
+}
+
+// In-Memory LRU Dedup Cache keyed on event ID
+const DEDUP_CACHE_MAX_SIZE = 10000;
+const dedupCache = new Map<string, number>();
+
+export function resetDedupCache(): void {
+  dedupCache.clear();
+}
+
+function isDuplicateEvent(id: string): boolean {
+  if (dedupCache.has(id)) {
+    return true;
+  }
+  if (dedupCache.size >= DEDUP_CACHE_MAX_SIZE) {
+    const firstKey = dedupCache.keys().next().value;
+    if (firstKey !== undefined) {
+      dedupCache.delete(firstKey);
+    }
+  }
+  dedupCache.set(id, Date.now());
+  return false;
+}
+
 function isCampaignEventName(event: unknown): event is CampaignEventName {
   return typeof event === 'string' && campaignEvents.includes(event as CampaignEventName);
 }
@@ -33,13 +68,10 @@ function sanitizeString(value: unknown, maxLength = 160) {
   if (typeof value !== 'string') {
     return undefined;
   }
-
   const trimmedValue = value.trim();
-
   if (!trimmedValue) {
     return undefined;
   }
-
   return trimmedValue.slice(0, maxLength);
 }
 
@@ -47,7 +79,6 @@ function sanitizePayload(payload: CampaignEventRequest['payload']): SanitizedPay
   if (!payload) {
     return {};
   }
-
   return {
     path: sanitizeString(payload.path),
     referrer: sanitizeString(payload.referrer, 240),
@@ -59,27 +90,115 @@ function sanitizePayload(payload: CampaignEventRequest['payload']): SanitizedPay
   };
 }
 
-export async function POST(request: Request) {
-  let body: CampaignEventRequest;
+function isAllowedOrigin(originHeader: string | null): boolean {
+  if (!originHeader) {
+    return true;
+  }
 
+  const configuredOrigin =
+    process.env.NEXT_PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN;
+  const defaultAllowed = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://veillend.app',
+  ];
+
+  if (configuredOrigin && originHeader === configuredOrigin) {
+    return true;
+  }
+
+  if (defaultAllowed.includes(originHeader)) {
+    return true;
+  }
+
+  try {
+    const parsedOrigin = new URL(originHeader);
+    if (
+      parsedOrigin.hostname === 'localhost' ||
+      parsedOrigin.hostname === '127.0.0.1'
+    ) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+export async function POST(request: Request) {
+  // 1. Check Origin Header Validation (403 if invalid)
+  const originHeader = request.headers.get('origin');
+  if (!isAllowedOrigin(originHeader)) {
+    return NextResponse.json({ error: 'Forbidden origin' }, { status: 403 });
+  }
+
+  // 2. Check Rate Limit by IP (429 if exceeded)
+  const clientIp =
+    request.headers.get('x-forwarded-for')?.split(',')[0].trim() ||
+    request.headers.get('x-real-ip') ||
+    '127.0.0.1';
+
+  const now = Date.now();
+  let ipRecord = rateLimitStore.get(clientIp);
+
+  if (!ipRecord || now > ipRecord.resetTime) {
+    ipRecord = { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitStore.set(clientIp, ipRecord);
+  } else {
+    ipRecord.count += 1;
+  }
+
+  if (ipRecord.count > RATE_LIMIT_MAX_REQUESTS) {
+    return NextResponse.json(
+      { error: 'Rate limit exceeded' },
+      {
+        status: 429,
+        headers: {
+          'Retry-After': '60',
+        },
+      }
+    );
+  }
+
+  // 3. Parse JSON Body
+  let body: CampaignEventRequest;
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
   }
 
-  if (!isCampaignEventName(body.event) || body.campaign !== 'grantfox-oss-stellar') {
+  const eventName = body.type || body.event;
+  const campaign = body.campaign || 'grantfox-oss-stellar';
+
+  if (!isCampaignEventName(eventName) || campaign !== 'grantfox-oss-stellar') {
     return NextResponse.json({ error: 'Unsupported campaign event' }, { status: 400 });
   }
 
+  const eventId = body.id || sanitizeString(body.id);
+  if (!eventId) {
+    return NextResponse.json({ error: 'Missing event ID' }, { status: 400 });
+  }
+
+  // 4. In-Memory Dedup Check (409 Conflict if duplicate)
+  if (isDuplicateEvent(eventId)) {
+    return NextResponse.json(
+      { error: 'Duplicate event ID', id: eventId },
+      { status: 409 }
+    );
+  }
+
   const analyticsEvent = {
-    event: body.event,
-    campaign: body.campaign,
-    timestamp: sanitizeString(body.timestamp) ?? new Date().toISOString(),
+    id: eventId,
+    sessionId: body.sessionId || 'unknown_session',
+    ts: body.ts || body.timestamp || new Date().toISOString(),
+    type: eventName,
     payload: sanitizePayload(body.payload),
   };
 
   console.info('[campaign-analytics]', analyticsEvent);
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, id: eventId });
 }
+
