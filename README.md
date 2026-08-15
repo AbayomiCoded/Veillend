@@ -167,7 +167,7 @@ The previous backend and migration documents remain available under `legacy/` wh
 ## 📜 License
 MIT
 
-## 🌟 Join the Drips Monthly Wave Contributor Program
+## 🌟 Join the Monthly Wave Contributor Program
 
 We're actively seeking contributors to help build VeilLend on Stellar! This is your opportunity to:
 
@@ -217,7 +217,6 @@ All contributors must adhere to the Code of Conduct and sign off commits for DCO
 - [Soroban Documentation](https://soroban.stellar.org/docs)
 - [Stellar Developer Docs](https://developers.stellar.org/docs)
 - Archived research: `legacy/docs`
-- [Drips Contributor Program](https://drips.network/contributors)
 - [Stellar Discord](https://discord.gg/stellardev)
 
 **Ready to contribute?** Start with the VeilLend Soroban contract in `/veilend-soroban` and help us build the future of private lending on Stellar! 🌟
