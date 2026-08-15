@@ -1,7 +1,8 @@
 import { IsString } from 'class-validator';
+import { IsStellarAddress } from '../../common/validators/is-stellar-address.validator';
 
 export class VerifyWalletDto {
-  @IsString()
+  @IsStellarAddress()
   walletAddress: string;
 
   @IsString()

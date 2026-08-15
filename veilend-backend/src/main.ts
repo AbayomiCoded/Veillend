@@ -1,5 +1,9 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import {
+  BadRequestException,
+  ValidationError,
+  ValidationPipe,
+} from '@nestjs/common';
 import { AppModule } from './app.module';
 import { AppLoggerService } from './common/logging/app-logger.service';
 import { AppConfigService } from './config/app-config.service';
@@ -13,6 +17,15 @@ async function bootstrap() {
     whitelist: true,
     forbidNonWhitelisted: true,
     transform: true,
+    // Default ValidationPipe sets exception.message to the generic
+    // "Bad Request Exception", hiding the actual constraint message from
+    // the ApiResponseDto.fail envelope. Surface it explicitly instead.
+    exceptionFactory: (errors: ValidationError[]) => {
+      const message = errors
+        .flatMap((error) => Object.values(error.constraints ?? {}))
+        .join('; ');
+      return new BadRequestException(message || 'Validation failed');
+    },
   }));
   
   const config = app.get(AppConfigService);
