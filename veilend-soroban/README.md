@@ -13,6 +13,8 @@ The contract currently provides an initial VeilLend lending scaffold with:
 - protocol fee tracking separated from user position balances
 - basic `deposit`, `borrow`, `repay`, and `withdraw` state transitions
 - typed contract events for key lending actions
+- a multi-admin set (`AdminSet`) with `add_admin`/`remove_admin` (any one of N admins can act)
+- a propose/execute/cancel timelock on privileged mutations (configurable `set_timelock_ledgers`)
 - queryable contract and storage-schema metadata for migration safety
 
 This is a protocol foundation, not the full privacy implementation yet. Token transfers, price oracles, liquidation logic, and shielded proof verification still need to be added in follow-up iterations.
@@ -148,16 +150,16 @@ Schema `VLENDV3` uses these keys:
 
 | Durability | Key | Value |
 | :--- | :--- | :--- |
-| Instance | `Admin` | `Address` |
-| Instance | `PendingAdmin` | `Address` |
+| Instance | `AdminSet` | `Vec<Address>` |
+| Instance | `TimelockLedgers` | `u32` |
+| Instance | `NextActionId` | `u64` |
+| Instance | `PendingAction(u64)` | `PendingAction { kind, payload, executable_at_ledger: u32, proposer: Address }` |
 | Instance | `MinCollateralRatioBps` | `u32` |
-| Instance | `PendingMinCollateralRatioBps` | `PendingMinCollateralRatio { new_ratio_bps: u32, executable_timestamp: u64 }` |
-| Instance | `AdminTimelockSeconds` | `u32` |
 | Persistent | `SupportedAsset(Address)` | `bool` |
 | Persistent | `Position(Address, Address)` | `Position { deposited: i128, borrowed: i128 }` |
 | Persistent | `OraclePrice(Address)` | `i128` |
 
-The two-step admin transfer uses `propose_admin(current_admin, new_admin)` followed by `accept_admin(new_admin)` signed by the new admin. `set_min_collateral_ratio` applies immediately when `AdminTimelockSeconds` is `0` (the default) and is staged as a pending change that anyone can execute via `execute_pending_collateral_ratio` once the timelock has elapsed otherwise.
+The admin authority is a `Vec<Address>` (`AdminSet`): any one of N admins can act, and `add_admin`/`remove_admin` manage membership (with a last-admin lockout guard). Privileged mutations — `configure_asset`, `set_oracle_price`, `update_asset_caps`, `set_min_collateral_ratio`, pausing, and `record_protocol_fee` — follow a `propose_*` → `execute_*` (after the `TimelockLedgers` delay) → `cancel_*` flow, with `set_paused(false)` exempt so unpausing stays immediate.
 
 When changing the public interface, increment `CONTRACT_VERSION`. When changing a `DataKey` variant or any stored value shape, increment `STORAGE_SCHEMA_VERSION` and assign a new `STORAGE_SCHEMA_ID`. Keep this table in sync with the implementation.
 
