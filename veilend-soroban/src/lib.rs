@@ -73,6 +73,12 @@ pub enum DataKey {
     Paused,
     /// Time-based interest accrual indexes for an asset
     InterestState(Address),
+    /// Address proposed to take over admin control (two-step transfer)
+    PendingAdmin,
+    /// Timelocked minimum collateral ratio change awaiting execution
+    PendingMinCollateralRatioBps,
+    /// Delay in seconds applied to `set_min_collateral_ratio` (0 = immediate)
+    AdminTimelockSeconds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +115,16 @@ pub struct AssetCaps {
 pub struct AssetReserve {
     pub total_balance: i128,
     pub protocol_fees: i128,
+}
+
+/// A pending (timelocked) minimum collateral ratio change. Stored until
+/// `executable_timestamp` is reached, then applied by anyone via
+/// `execute_pending_collateral_ratio`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PendingMinCollateralRatio {
+    pub new_ratio_bps: u32,
+    pub executable_timestamp: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,6 +296,39 @@ pub struct CircuitBreakerEvent {
     pub paused: bool,
 }
 
+#[contractevent(topics = ["veillend", "admin_proposed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposed {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+}
+
+#[contractevent(topics = ["veillend", "admin_transferred"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+}
+
+#[contractevent(topics = ["veillend", "min_collateral_ratio_scheduled"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinCollateralRatioScheduled {
+    #[topic]
+    pub admin: Address,
+    pub new_ratio_bps: u32,
+    pub executable_timestamp: u64,
+}
+
+#[contractevent(topics = ["veillend", "min_collateral_ratio_applied"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinCollateralRatioApplied {
+    pub new_ratio_bps: u32,
+}
+
 #[contractevent(topics = ["veillend", "asset_reserve_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetReserveUpdated {
@@ -383,6 +432,12 @@ impl VeilLendContract {
             .instance()
             .set(&DataKey::TimelockLedgers, &DEFAULT_TIMELOCK_LEDGERS);
         env.storage().instance().set(&DataKey::NextActionId, &0u64);
+
+        // Default timelock is 0 (immediate) so contracts deployed before the
+        // timelock feature behave exactly as before.
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminTimelockSeconds, &0u32);
 
         // Initialize circuit breaker as not paused
         env.storage().persistent().set(&DataKey::Paused, &false);
@@ -968,6 +1023,185 @@ impl VeilLendContract {
             .get(&DataKey::MinCollateralRatioBps)
             .unwrap_or(15_000)
     }
+
+    /// Propose transferring admin control to `new_admin` (two-step transfer).
+    ///
+    /// Only the current admin may propose; the new admin must later call
+    /// `accept_admin` and sign to complete the transfer. This prevents a
+    /// mistyped address from bricking the protocol: `accept_admin` can only
+    /// be signed by the proposed address itself.
+    ///
+    /// # Arguments
+    /// * `current_admin` - The current admin address (must match stored admin)
+    /// * `new_admin` - The address being proposed as the next admin
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
+        let stored_admin = Self::admin(env.clone());
+        if current_admin != stored_admin {
+            panic_with_error!(&env, VeilLendError::Unauthorized);
+        }
+
+        current_admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+
+        AdminProposed {
+            from: current_admin,
+            to: new_admin,
+        }
+        .publish(&env);
+    }
+
+    /// Complete a pending admin transfer. Callable only by the proposed
+    /// `new_admin` (its signature is required). Returns the previous admin.
+    ///
+    /// # Arguments
+    /// * `new_admin` - The address that was proposed via `propose_admin`
+    ///
+    /// # Returns
+    /// * `Address` - The old (outgoing) admin address
+    pub fn accept_admin(env: Env, new_admin: Address) -> Address {
+        let pending_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::NoPendingAdmin));
+
+        if pending_admin != new_admin {
+            panic_with_error!(&env, VeilLendError::NoPendingAdmin);
+        }
+
+        new_admin.require_auth();
+
+        let old_admin = Self::admin(env.clone());
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        AdminTransferred {
+            from: old_admin.clone(),
+            to: new_admin,
+        }
+        .publish(&env);
+
+        old_admin
+    }
+
+    /// Returns the address awaiting admin transfer, if any.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// Configure the delay applied to future `set_min_collateral_ratio`
+    /// calls. `0` (the default) applies ratio changes immediately; a
+    /// positive value schedules them for `now + seconds`.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must match stored admin)
+    /// * `seconds` - The timelock delay in seconds (0 = immediate)
+    pub fn set_timelock(env: Env, admin: Address, seconds: u32) {
+        let stored_admin = Self::admin(env.clone());
+        if admin != stored_admin {
+            panic_with_error!(&env, VeilLendError::Unauthorized);
+        }
+
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminTimelockSeconds, &seconds);
+    }
+
+    /// The currently configured timelock (in seconds) applied to
+    /// `set_min_collateral_ratio` changes. `0` means immediate application.
+    pub fn admin_timelock_seconds(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminTimelockSeconds)
+            .unwrap_or(0)
+    }
+
+    /// Update the minimum collateral ratio (admin only).
+    ///
+    /// If a timelock is configured (`admin_timelock_seconds > 0`), the new
+    /// ratio is staged as pending and only takes effect once
+    /// `execute_pending_collateral_ratio` is called after the delay has
+    /// elapsed, giving users time to react. With the default timelock of
+    /// `0` the change applies immediately (backward compatible with previous
+    /// behavior).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must match stored admin)
+    /// * `new_ratio_bps` - The new minimum collateral ratio in basis points (>= 10_000)
+    pub fn set_min_collateral_ratio(env: Env, admin: Address, new_ratio_bps: u32) {
+        let stored_admin = Self::admin(env.clone());
+        if admin != stored_admin {
+            panic_with_error!(&env, VeilLendError::Unauthorized);
+        }
+
+        if new_ratio_bps < 10_000 {
+            panic_with_error!(&env, VeilLendError::InvalidCollateralRatio);
+        }
+
+        admin.require_auth();
+
+        let timelock_seconds = Self::admin_timelock_seconds(env.clone()) as u64;
+        if timelock_seconds == 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::MinCollateralRatioBps, &new_ratio_bps);
+
+            MinCollateralRatioApplied { new_ratio_bps }.publish(&env);
+        } else {
+            let executable_timestamp = env.ledger().timestamp() + timelock_seconds;
+            env.storage().instance().set(
+                &DataKey::PendingMinCollateralRatioBps,
+                &PendingMinCollateralRatio {
+                    new_ratio_bps,
+                    executable_timestamp,
+                },
+            );
+
+            MinCollateralRatioScheduled {
+                admin,
+                new_ratio_bps,
+                executable_timestamp,
+            }
+            .publish(&env);
+        }
+    }
+
+    /// The pending (timelocked) minimum collateral ratio change, if any.
+    pub fn pending_min_collateral_ratio(env: Env) -> Option<PendingMinCollateralRatio> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingMinCollateralRatioBps)
+    }
+
+    /// Apply a pending minimum collateral ratio change once its timelock has
+    /// elapsed. Callable by anyone — execution is not a privileged action.
+    pub fn execute_pending_collateral_ratio(env: Env) {
+        let pending: PendingMinCollateralRatio = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingMinCollateralRatioBps)
+            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::NoPendingRatioChange));
+
+        let now = env.ledger().timestamp();
+        if now < pending.executable_timestamp {
+            panic_with_error!(&env, VeilLendError::TimelockNotElapsed);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinCollateralRatioBps, &pending.new_ratio_bps);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingMinCollateralRatioBps);
+
+        MinCollateralRatioApplied {
+            new_ratio_bps: pending.new_ratio_bps,
+        }
+        .publish(&env);
+    }
 }
 
 impl VeilLendContract {
@@ -1475,6 +1709,7 @@ impl VeilLendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn test_position_creation() {
@@ -1584,5 +1819,28 @@ mod tests {
             VeilLendError::Unauthorized as u32,
             "NotInitialized and Unauthorized must be distinct error codes"
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_constructor_requires_admin_auth() {
+        // No mock_all_auths: the constructor must authenticate `admin` before
+        // touching storage, so it must fail without the admin's signature.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        VeilLendContract::__constructor(env, admin, 15_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_constructor_called_twice_panics_already_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        VeilLendContract::__constructor(env.clone(), admin.clone(), 15_000);
+        // Second initialization attempt must panic AlreadyInitialized.
+        VeilLendContract::__constructor(env, admin, 15_000);
     }
 }

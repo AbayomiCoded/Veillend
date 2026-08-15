@@ -28,7 +28,6 @@
       ]
     ],
     [],
-    [],
     []
   ],
   "ledger": {
@@ -140,16 +139,12 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "AdminSet"
+                              "symbol": "Admin"
                             }
                           ]
                         },
                         "val": {
-                          "vec": [
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                            }
-                          ]
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                         }
                       },
                       {
@@ -174,30 +169,6 @@
                         },
                         "val": {
                           "u32": 15000
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "NextActionId"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "0"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "TimelockLedgers"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u32": 50
                         }
                       }
                     ]
