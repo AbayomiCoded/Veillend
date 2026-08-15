@@ -184,6 +184,29 @@ model Admin {
   @@index([walletAddress])
 }
 
+// ─── Admin Audit Log ─────────────────────────────────────────────────────────
+
+enum AdminAction {
+  ADD_ADMIN
+  REMOVE_ADMIN
+  CONFIGURE_ASSET
+  SET_ORACLE_PRICE
+  SET_MIN_COLLATERAL_RATIO
+}
+
+model AdminAuditLog {
+  id            String      @id @default(uuid())
+  actorWallet   String                          // wallet address of the admin who performed the action
+  action        AdminAction
+  target        String?                         // the target of the action (e.g., wallet address, asset ID)
+  payload       Json?                           // additional data about the action
+  createdAt     DateTime    @default(now())
+
+  @@index([actorWallet])
+  @@index([action])
+  @@index([createdAt])
+}
+
 // ─── Indexer Checkpoint ──────────────────────────────────────────────────────
 
 // Singleton row (fixed id "global") tracking the Soroban event indexer's
