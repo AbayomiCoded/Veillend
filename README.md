@@ -77,6 +77,15 @@ All contract errors are typed via `VeilLendError` (`#[contracterror]`, `#[repr(u
 | `ZeroAmount` | 10 | Zero amount passed to `deposit`, `borrow`, `repay`, `withdraw` |
 | `OraclePriceMissing` | 11 | `borrow` or `withdraw` on an asset without a configured oracle price |
 | `ContractPaused` | 12 | Any state-changing function called while contract is paused |
+| `DepositCapExceeded` | 13 | Deposit would exceed the configured per-asset deposit cap |
+| `BorrowCapExceeded` | 14 | Borrow would exceed the configured per-asset borrow cap |
+| `InvalidCap` | 15 | Cap value is invalid (must be positive or -1 for unlimited) |
+| `CircuitBreakerTriggered` | 16 | Operation blocked by circuit breaker mechanism |
+| `InsufficientReserve` | 17 | Reserve balance too low for requested action |
+| `OraclePriceStale` | 21 | Oracle price has exceeded maximum age limit |
+| `OraclePriceChangeExceedsLimit` | 22 | Oracle price change exceeds maximum allowed volatility |
+| `OraclePriceBelowMin` | 23 | Oracle price is below minimum allowed bound |
+| `OraclePriceAboveMax` | 24 | Oracle price is above maximum allowed bound |
 
 ### Error handling notes
 - Zero and negative amounts produce **different** errors (`ZeroAmount` vs `InvalidAmount`) so clients can distinguish them.

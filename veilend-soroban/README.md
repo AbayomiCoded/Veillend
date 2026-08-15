@@ -136,25 +136,40 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ## Contract and storage schema metadata
 
+⚠️ **CRITICAL**: This storage schema metadata table MUST be kept in sync with the `DataKey` enum in `src/lib.rs`. Any mismatch will cause migration failures and data corruption.
+
 Call `contract_metadata()` on a deployed contract before writing a migration or an off-chain storage reader. The current contract shape is:
 
 | Metadata field | Current value | Meaning |
 | :--- | :--- | :--- |
-| `contract_version` | `1` | The public contract interface version. |
-| `storage_schema_version` | `1` | The version of serialized storage keys and values. |
-| `storage_schema_id` | `VLENDV1` | A compact, stable identifier for this storage layout. |
+| `contract_version` | `2` | The public contract interface version. |
+| `storage_schema_version` | `2` | The version of serialized storage keys and values. |
+| `storage_schema_id` | `VLENDV2` | A compact, stable identifier for this storage layout. |
 
-Schema `VLENDV1` uses these keys:
+Schema `VLENDV2` uses these keys:
 
 | Durability | Key | Value |
 | :--- | :--- | :--- |
 | Instance | `Admin` | `Address` |
 | Instance | `MinCollateralRatioBps` | `u32` |
+| Instance | `MaxOracleAge` | `u64` |
 | Persistent | `SupportedAsset(Address)` | `bool` |
-| Persistent | `Position(Address, Address)` | `Position { deposited: i128, borrowed: i128 }` |
+| Persistent | `AssetReserve(Address)` | `AssetReserve { total_balance: i128, protocol_fees: i128 }` |
+| Persistent | `Position(Address, Address)` | `Position { deposited: i128, borrowed: i128, supply_index_snapshot: i128, borrow_index_snapshot: i128 }` |
 | Persistent | `OraclePrice(Address)` | `i128` |
+| Persistent | `DepositCap(Address)` | `i128` |
+| Persistent | `BorrowCap(Address)` | `i128` |
+| Persistent | `TotalDeposited(Address)` | `i128` |
+| Persistent | `TotalBorrowed(Address)` | `i128` |
+| Persistent | `Paused` | `bool` |
+| Persistent | `InterestState(Address)` | `InterestState { supply_index: i128, borrow_index: i128, last_accrual_timestamp: u64 }` |
+| Persistent | `OracleLastUpdated(Address)` | `u64` |
+| Persistent | `OraclePrevPrice(Address)` | `i128` |
+| Persistent | `OracleMaxChangeBps(Address)` | `u32` |
+| Persistent | `OracleMinPrice(Address)` | `i128` |
+| Persistent | `OracleMaxPrice(Address)` | `i128` |
 
-When changing the public interface, increment `CONTRACT_VERSION`. When changing a `DataKey` variant or any stored value shape, increment `STORAGE_SCHEMA_VERSION` and assign a new `STORAGE_SCHEMA_ID`. Keep this table in sync with the implementation.
+When changing the public interface, increment `CONTRACT_VERSION`. When changing a `DataKey` variant or any stored value shape, increment `STORAGE_SCHEMA_VERSION` and assign a new `STORAGE_SCHEMA_ID`. **Keep this table in sync with the implementation** — any drift will break migrations and off-chain readers.
 
 ## Development Workflow
 
