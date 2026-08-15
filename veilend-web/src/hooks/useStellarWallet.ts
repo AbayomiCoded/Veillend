@@ -1,8 +1,19 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { isWalletAuthenticated, getAuthenticatedWallet, clearAuthSession, createAuthSession } from "@/lib/stellar/auth";
-import { connectFreighter, isFreighterInstalled, disconnectWallet } from "@/lib/stellar/wallet";
+import {
+  validateStoredSession,
+  clearAuthSession,
+  createAuthSession,
+  requestAuthNonce,
+  verifyAuthSignature,
+} from "@/lib/stellar/auth";
+import {
+  connectFreighter,
+  isFreighterInstalled,
+  disconnectWallet,
+  signMessage,
+} from "@/lib/stellar/wallet";
 
 export interface WalletState {
   address: string | null;
@@ -31,24 +42,32 @@ export function useStellarWallet(): WalletState & WalletActions {
     error: null,
   });
 
-  // Check authentication status and Freighter installation on mount
+  // On mount: check Freighter installation and reconcile any stored session
+  // against the backend. Forged / stale records are cleared (auto-logout).
   useEffect(() => {
-    const initializeWallet = () => {
+    let cancelled = false;
+
+    const initializeWallet = async () => {
       const installed = isFreighterInstalled();
-      const isAuth = isWalletAuthenticated();
-      const address = getAuthenticatedWallet();
+      const session = await validateStoredSession();
+
+      if (cancelled) return;
 
       setState((prev) => ({
         ...prev,
         isInstalled: installed,
-        address: isAuth ? address : null,
-        publicKey: isAuth ? address : null,
-        isConnected: isAuth && !!address,
-        isAuthenticated: isAuth && !!address,
+        address: session?.address ?? null,
+        publicKey: session?.publicKey ?? null,
+        isConnected: session !== null,
+        isAuthenticated: session !== null,
       }));
     };
 
     initializeWallet();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const connect = useCallback(async (): Promise<boolean> => {
@@ -59,13 +78,27 @@ export function useStellarWallet(): WalletState & WalletActions {
     try {
       const wallet = await connectFreighter();
 
-      // Create auth session
-      createAuthSession(wallet.address, wallet.publicKey);
+      // Challenge-response: only the backend can authorise the session.
+      const nonce = await requestAuthNonce(wallet.address);
+      const signature = await signMessage(nonce, wallet.publicKey);
+
+      if (!signature) {
+        throw new Error("Signature was not submitted; authentication cancelled.");
+      }
+
+      const verification = await verifyAuthSignature(
+        wallet.address,
+        nonce,
+        signature
+      );
+
+      // Persist ONLY after the backend confirmed the signature.
+      const session = createAuthSession(wallet.address, verification);
 
       setState((prev) => ({
         ...prev,
-        address: wallet.address,
-        publicKey: wallet.publicKey,
+        address: session.address,
+        publicKey: session.publicKey,
         isConnected: true,
         isAuthenticated: true,
         isLoading: false,
