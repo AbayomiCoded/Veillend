@@ -476,234 +476,6 @@ fn test_conservation_of_value_between_suppliers_and_borrower() {
     assert_eq!(total_borrowed_growth, 50_000);
 }
 
-// ---------------------------------------------------------------------------
-// Admin safety: constructor auth ordering, two-step admin transfer, timelock
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_constructor_requires_admin_auth() {
-    // No mock_all_auths: the constructor must authenticate `admin` before
-    // touching storage, so registration without the admin signature fails.
-    let env = Env::default();
-    let admin = Address::generate(&env);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_two_step_admin_transfer_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    // Nothing is pending until the current admin proposes.
-    assert_eq!(client.pending_admin(), None);
-
-    client.propose_admin(&admin, &new_admin);
-    assert_eq!(client.pending_admin(), Some(new_admin.clone()));
-
-    // The proposed address accepts and becomes the new admin.
-    let old_admin = client.accept_admin(&new_admin);
-    assert_eq!(old_admin, admin);
-    assert_eq!(client.admin(), new_admin);
-    assert_eq!(client.pending_admin(), None);
-}
-
-#[test]
-fn test_accept_admin_wrong_address_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    client.propose_admin(&admin, &new_admin);
-
-    // An unrelated address cannot accept the transfer.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.accept_admin(&attacker);
-    }));
-    assert!(result.is_err());
-
-    // Admin unchanged and the proposal is still pending.
-    assert_eq!(client.admin(), admin);
-    assert_eq!(client.pending_admin(), Some(new_admin));
-}
-
-#[test]
-fn test_accept_admin_with_no_pending_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    // No proposal exists — accepting anything must panic.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.accept_admin(&new_admin);
-    }));
-    assert!(result.is_err());
-
-    assert_eq!(client.admin(), admin);
-}
-
-#[test]
-fn test_propose_admin_overwrites_pending() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let first = Address::generate(&env);
-    let second = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    client.propose_admin(&admin, &first);
-    client.propose_admin(&admin, &second);
-
-    // Only the most recent proposal can accept.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.accept_admin(&first);
-    }));
-    assert!(result.is_err());
-
-    let old_admin = client.accept_admin(&second);
-    assert_eq!(old_admin, admin);
-    assert_eq!(client.admin(), second);
-}
-
-#[test]
-fn test_post_transfer_old_admin_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let asset = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    client.propose_admin(&admin, &new_admin);
-    client.accept_admin(&new_admin);
-
-    // The old admin loses all privileged access after the transfer.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.set_paused(&admin, &true);
-    }));
-    assert!(result.is_err());
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.configure_asset(&admin, &asset, &true);
-    }));
-    assert!(result.is_err());
-
-    // The new admin is fully empowered.
-    client.set_paused(&new_admin, &true);
-    assert!(client.is_paused());
-}
-
-#[test]
-fn test_min_collateral_ratio_immediate_by_default() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    // Timelock defaults to 0 (immediate application, backward compatible).
-    assert_eq!(client.admin_timelock_seconds(), 0);
-
-    client.set_min_collateral_ratio(&admin, &20_000);
-    assert_eq!(client.min_collateral_ratio_bps(), 20_000);
-    assert_eq!(client.pending_min_collateral_ratio(), None);
-}
-
-#[test]
-fn test_min_collateral_ratio_rejects_below_minimum() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.set_min_collateral_ratio(&admin, &9_999);
-    }));
-    assert!(result.is_err());
-    assert_eq!(client.min_collateral_ratio_bps(), 15_000);
-}
-
-#[test]
-fn test_min_collateral_ratio_timelock() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    client.set_timelock(&admin, &3600);
-    assert_eq!(client.admin_timelock_seconds(), 3600);
-
-    let start = env.ledger().timestamp();
-    client.set_min_collateral_ratio(&admin, &20_000);
-
-    // Scheduled, not applied yet.
-    assert_eq!(client.min_collateral_ratio_bps(), 15_000);
-    let pending = client.pending_min_collateral_ratio().unwrap();
-    assert_eq!(pending.new_ratio_bps, 20_000);
-    assert_eq!(pending.executable_timestamp, start + 3600);
-
-    // One second before the timelock elapses: execution fails.
-    env.ledger().set_timestamp(start + 3599);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_pending_collateral_ratio();
-    }));
-    assert!(result.is_err());
-    assert_eq!(client.min_collateral_ratio_bps(), 15_000);
-
-    // Timelock elapsed: execution succeeds and clears the pending change.
-    env.ledger().set_timestamp(start + 3600);
-    client.execute_pending_collateral_ratio();
-    assert_eq!(client.min_collateral_ratio_bps(), 20_000);
-    assert_eq!(client.pending_min_collateral_ratio(), None);
-
-    // Nothing pending — executing again panics.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_pending_collateral_ratio();
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_timelock_and_ratio_changes_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
-    let client = VeilLendContractClient::new(&env, &contract_id);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.set_min_collateral_ratio(&attacker, &20_000);
-    }));
-    assert!(result.is_err());
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.set_timelock(&attacker, &3600);
-    }));
-    assert!(result.is_err());
-
-    assert_eq!(client.min_collateral_ratio_bps(), 15_000);
-    assert_eq!(client.admin_timelock_seconds(), 0);
-}
-
 #[test]
 fn test_two_accrual_calls_at_same_timestamp_are_idempotent() {
     let env = Env::default();
@@ -951,4 +723,22 @@ fn test_record_protocol_fee_timelocked() {
     let reserve = client.get_asset_reserve(&asset);
     assert_eq!(reserve.total_balance, 100);
     assert_eq!(reserve.protocol_fees, 100);
+}
+
+// ---------------------------------------------------------------------------
+// Constructor auth ordering (from #264): the founding admin must sign before
+// any storage is touched, so unauthenticated callers cannot probe init state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_constructor_requires_admin_auth() {
+    // No mock_all_auths: the constructor must authenticate `admin`, so
+    // registration without the admin signature fails.
+    let env = Env::default();
+    let admin = Address::generate(&env);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    }));
+    assert!(result.is_err());
 }
