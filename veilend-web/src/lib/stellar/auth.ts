@@ -1,85 +1,43 @@
 /**
  * Stellar wallet authentication utilities
  *
- * Implements a real challenge-response handshake against the VeilLend
- * backend so localStorage sessions cannot be forged by page scripts:
- *
- *   1. POST /auth/nonce  -> backend issues a one-time random nonce
- *   2. wallet signs the nonce (SEP-53) via Freighter / Albedo / etc.
- *   3. POST /auth/verify -> backend verifies the Ed25519 signature and
- *      returns an access token; the backend is the authoritative verifier.
- *
- * Session keys are written to localStorage ONLY after step 3 succeeds, and
- * `validateStoredSession` reconciles any existing local record against the
- * backend session status on startup (auto-logout on disagreement).
+ * Implements a challenge-response handshake against the VeilLend
+ * backend using Next.js API routes to securely handle HttpOnly cookies.
  */
 
 import { Keypair } from "@stellar/stellar-sdk";
-
-export const AUTH_STORAGE_KEY = "veillend_auth";
-export const WALLET_ADDRESS_KEY = "veillend_wallet_address";
-
-const DEFAULT_API_URL = "http://localhost:3001";
 
 export interface AuthSession {
   address: string;
   publicKey: string;
   authenticated: boolean;
   sessionId?: string;
-  accessToken?: string;
   expiresAt?: string;
   lastVerifiedAt?: string;
 }
 
 export interface AuthVerificationResult {
-  accessToken: string;
+  accessToken?: string;
   sessionId?: string;
   expiresAt?: string;
 }
 
-export const getApiBaseUrl = (): string =>
-  process.env.NEXT_PUBLIC_API_URL || DEFAULT_API_URL;
-
-const getStorage = (): Storage | null => {
-  if (typeof window !== "undefined" && window.localStorage) {
-    return window.localStorage;
-  }
-  if (typeof localStorage !== "undefined") {
-    return localStorage;
-  }
-  return null;
-};
-
-const readSession = (storage: Storage): AuthSession | null => {
-  const raw = storage.getItem(AUTH_STORAGE_KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as AuthSession;
-  } catch {
-    return null;
-  }
-};
-
-const writeSession = (storage: Storage, session: AuthSession): void => {
-  storage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
-  storage.setItem(WALLET_ADDRESS_KEY, session.address);
-};
-
 /**
- * Clear the auth session (logout)
+ * Clear the auth session (logout) via API route
  */
-export const clearAuthSession = (): void => {
-  const storage = getStorage();
-  if (!storage) return;
-  storage.removeItem(AUTH_STORAGE_KEY);
-  storage.removeItem(WALLET_ADDRESS_KEY);
+export const clearAuthSession = async (): Promise<void> => {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  } catch (error) {
+    console.error('Failed to logout:', error);
+  }
 };
 
 /**
- * Request a fresh one-time nonce bound to the wallet address from the backend.
+ * Request a fresh one-time nonce bound to the wallet address via API route.
  */
 export const requestAuthNonce = async (address: string): Promise<string> => {
-  const response = await fetch(`${getApiBaseUrl()}/auth/nonce`, {
+  const response = await fetch('/api/auth/nonce', {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ walletAddress: address }),
@@ -98,42 +56,32 @@ export const requestAuthNonce = async (address: string): Promise<string> => {
 };
 
 /**
- * Submit the signed nonce to the backend. Only a positive response from the
- * backend authorizes the session.
+ * Submit the signed nonce via API route. The API route will verify the signature
+ * with the backend and set the HttpOnly session cookie.
  */
 export const verifyAuthSignature = async (
   address: string,
-  nonce: string,
   signature: string
 ): Promise<AuthVerificationResult> => {
-  const response = await fetch(`${getApiBaseUrl()}/auth/verify`, {
+  const response = await fetch('/api/auth/verify', {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ walletAddress: address, nonce, signature }),
+    body: JSON.stringify({ walletAddress: address, signature }),
   });
 
   if (!response.ok) {
     throw new Error(`Signature verification failed (HTTP ${response.status})`);
   }
 
-  const data = (await response.json()) as AuthVerificationResult;
-  if (!data?.accessToken) {
-    throw new Error("Backend did not return an access token");
-  }
-
-  return data;
+  return (await response.json()) as AuthVerificationResult;
 };
 
 /**
- * Introspect the backend session for a token. Returns the authenticated
- * wallet context, or null when the token is invalid / revoked.
+ * Introspect the backend session via API route.
+ * Automatically uses the HttpOnly cookie.
  */
-export const fetchSessionStatus = async (
-  accessToken: string
-): Promise<{ walletAddress: string } | null> => {
-  const response = await fetch(`${getApiBaseUrl()}/auth/session`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+export const fetchSessionStatus = async (): Promise<{ walletAddress: string } | null> => {
+  const response = await fetch('/api/auth/session');
 
   if (response.status === 401 || response.status === 403) {
     return null;
@@ -146,90 +94,73 @@ export const fetchSessionStatus = async (
 };
 
 /**
- * Persist a session locally. MUST only be called after the backend has
- * verified the signed challenge.
+ * Creates an in-memory session object
  */
 export const createAuthSession = (
   address: string,
   verification: AuthVerificationResult
 ): AuthSession => {
-  const session: AuthSession = {
+  return {
     address,
     publicKey: address,
     authenticated: true,
     sessionId: verification.sessionId,
-    accessToken: verification.accessToken,
     expiresAt: verification.expiresAt,
     lastVerifiedAt: new Date().toISOString(),
   };
-
-  const storage = getStorage();
-  if (storage) {
-    writeSession(storage, session);
-  }
-
-  return session;
 };
 
 /**
- * Startup integrity check. Any localStorage record that lacks a verified
- * token, has expired, or disagrees with the backend session status is
- * cleared so the UI falls back to "disconnected".
+ * Startup integrity check. Checks if the `veillend_has_session` marker cookie is present,
+ * and if so, validates the session via the backend.
  */
 export const validateStoredSession = async (): Promise<AuthSession | null> => {
-  const storage = getStorage();
-  if (!storage) return null;
-
-  const session = readSession(storage);
-  if (!session) {
-    // A stray wallet address without a verified session cannot be trusted.
-    storage.removeItem(WALLET_ADDRESS_KEY);
-    return null;
-  }
-
-  if (!session.authenticated || !session.accessToken) {
-    clearAuthSession();
-    return null;
-  }
-
-  if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-    clearAuthSession();
+  // Check for the non-HttpOnly marker cookie
+  const hasSession = document.cookie.includes('veillend_has_session=true');
+  
+  if (!hasSession) {
     return null;
   }
 
   try {
-    const remote = await fetchSessionStatus(session.accessToken);
-    if (!remote) {
-      // Backend no longer recognises this session (revoked / forged).
-      clearAuthSession();
-      return null;
-    }
-    if (remote.walletAddress && remote.walletAddress !== session.address) {
-      clearAuthSession();
+    const remote = await fetchSessionStatus();
+    if (!remote || !remote.walletAddress) {
+      await clearAuthSession();
       return null;
     }
 
-    const refreshed: AuthSession = {
-      ...session,
+    return {
+      address: remote.walletAddress,
+      publicKey: remote.walletAddress,
+      authenticated: true,
       lastVerifiedAt: new Date().toISOString(),
     };
-    writeSession(storage, refreshed);
-    return refreshed;
   } catch {
-    // Backend unreachable: keep the local session, local expiry still applies.
-    return session;
+    // If backend is unreachable, we could assume disconnected to be safe,
+    // or keep connected. We'll return null to be safe on invalid sessions.
+    return null;
   }
 };
 
 /**
  * Run the full challenge-response flow. Returns the authenticated session
- * only when the backend verified the signature, otherwise null (e.g. the
- * wallet did not submit a signature) or rejects.
+ * only when the API verified the signature.
  */
 export const challengeWalletAuth = async (
   address: string,
   signMessage: (message: string) => Promise<string | null>
 ): Promise<AuthSession | null> => {
+  // requestAuthNonce API route sets the nonce cookie implicitly
+  await requestAuthNonce(address);
+  // We need to fetch the nonce from somewhere to sign it!
+  // Wait, signMessage expects the nonce message to sign. Where do we get the nonce?
+  // Our requestAuthNonce returns the nonce!
+  
+  // Actually, wait, `challengeWalletAuth` is currently calling:
+  // const nonce = await requestAuthNonce(address);
+  // const signature = await signMessage(nonce);
+  
+  // So the nonce IS returned by `requestAuthNonce`. That's correct.
   const nonce = await requestAuthNonce(address);
   const signature = await signMessage(nonce);
 
@@ -237,7 +168,8 @@ export const challengeWalletAuth = async (
     return null;
   }
 
-  const verification = await verifyAuthSignature(address, nonce, signature);
+  // Verify only needs address and signature, the API route reads the nonce from the cookie
+  const verification = await verifyAuthSignature(address, signature);
   return createAuthSession(address, verification);
 };
 
