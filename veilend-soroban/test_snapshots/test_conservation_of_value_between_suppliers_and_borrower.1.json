@@ -1014,6 +1014,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "AdminTimelockSeconds"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MinCollateralRatioBps"
                             }
                           ]

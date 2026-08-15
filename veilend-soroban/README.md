@@ -140,19 +140,24 @@ Call `contract_metadata()` on a deployed contract before writing a migration or 
 
 | Metadata field | Current value | Meaning |
 | :--- | :--- | :--- |
-| `contract_version` | `1` | The public contract interface version. |
-| `storage_schema_version` | `1` | The version of serialized storage keys and values. |
-| `storage_schema_id` | `VLENDV1` | A compact, stable identifier for this storage layout. |
+| `contract_version` | `3` | The public contract interface version. |
+| `storage_schema_version` | `3` | The version of serialized storage keys and values. |
+| `storage_schema_id` | `VLENDV3` | A compact, stable identifier for this storage layout. |
 
-Schema `VLENDV1` uses these keys:
+Schema `VLENDV3` uses these keys:
 
 | Durability | Key | Value |
 | :--- | :--- | :--- |
 | Instance | `Admin` | `Address` |
+| Instance | `PendingAdmin` | `Address` |
 | Instance | `MinCollateralRatioBps` | `u32` |
+| Instance | `PendingMinCollateralRatioBps` | `PendingMinCollateralRatio { new_ratio_bps: u32, executable_timestamp: u64 }` |
+| Instance | `AdminTimelockSeconds` | `u32` |
 | Persistent | `SupportedAsset(Address)` | `bool` |
 | Persistent | `Position(Address, Address)` | `Position { deposited: i128, borrowed: i128 }` |
 | Persistent | `OraclePrice(Address)` | `i128` |
+
+The two-step admin transfer uses `propose_admin(current_admin, new_admin)` followed by `accept_admin(new_admin)` signed by the new admin. `set_min_collateral_ratio` applies immediately when `AdminTimelockSeconds` is `0` (the default) and is staged as a pending change that anyone can execute via `execute_pending_collateral_ratio` once the timelock has elapsed otherwise.
 
 When changing the public interface, increment `CONTRACT_VERSION`. When changing a `DataKey` variant or any stored value shape, increment `STORAGE_SCHEMA_VERSION` and assign a new `STORAGE_SCHEMA_ID`. Keep this table in sync with the implementation.
 
