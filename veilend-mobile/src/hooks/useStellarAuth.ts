@@ -47,7 +47,7 @@ export function useStellarAuth() {
     }
   };
 
-  const importWallet = async (secretKey: string) => {
+  const importWallet = async (secretKey: string): Promise<boolean> => {
     setLoading(true);
     setError(null);
     setGeneratedSecretKey(null);
@@ -55,18 +55,23 @@ export function useStellarAuth() {
       const keypair = Keypair.fromSecret(secretKey.trim());
       await SecureStore.setItemAsync(SECRET_KEY_STORE, keypair.secret());
       await authenticate(keypair);
+      return true;
     } catch (e: any) {
       setError(e?.message ?? 'Invalid secret key');
+      return false;
     } finally {
       setLoading(false);
     }
   };
 
-  return { 
-    loading, 
-    error, 
-    generateWallet, 
+  const clearGeneratedSecretKey = () => setGeneratedSecretKey(null);
+
+  return {
+    loading,
+    error,
+    generateWallet,
     importWallet,
     generatedSecretKey,
+    clearGeneratedSecretKey,
   };
 }
