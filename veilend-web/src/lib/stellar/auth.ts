@@ -12,6 +12,7 @@ export const AUTH_STORAGE_KEY = 'veillend_auth_session';
 export const WALLET_ADDRESS_KEY = 'veillend_wallet_address';
 
 export interface AuthSession {
+
   address: string;
   publicKey: string;
   authenticated: boolean;
@@ -19,6 +20,7 @@ export interface AuthSession {
   sessionId?: string;
   expiresAt?: string;
   lastVerifiedAt?: string;
+  
 }
 
 export interface AuthVerificationResult {
