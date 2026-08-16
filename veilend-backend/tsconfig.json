@@ -21,7 +21,6 @@
     "noImplicitAny": false,
     "strictBindCallApply": false,
     "noFallthroughCasesInSwitch": false,
-    "typeRoots": ["./node_modules/@types"],
-    "types": ["node", "jest"]
+    "typeRoots": ["./node_modules/@types"]
   }
 }

@@ -82,7 +82,7 @@ export async function fetchDashboardData(address: string = DEMO_ADDRESS): Promis
       const amount = Number(tx.amount) / 1e7;
       const price = tx.assetAddress.includes('USDC') ? 1.0 : 0.11;
       return {
-        id: tx.id,
+        id: String(tx.id),
         action: tx.type.toUpperCase() as ActivityActionType,
         assetSymbol: tx.assetAddress.substring(0, 4),
         amount,
