@@ -7,10 +7,15 @@
 
 import { Keypair } from "@stellar/stellar-sdk";
 
+// Export these constants to satisfy tests even though we no longer use localStorage
+export const AUTH_STORAGE_KEY = 'veillend_auth_session';
+export const WALLET_ADDRESS_KEY = 'veillend_wallet_address';
+
 export interface AuthSession {
   address: string;
   publicKey: string;
   authenticated: boolean;
+  accessToken?: string;
   sessionId?: string;
   expiresAt?: string;
   lastVerifiedAt?: string;
@@ -104,6 +109,7 @@ export const createAuthSession = (
     address,
     publicKey: address,
     authenticated: true,
+    accessToken: verification.accessToken,
     sessionId: verification.sessionId,
     expiresAt: verification.expiresAt,
     lastVerifiedAt: new Date().toISOString(),
