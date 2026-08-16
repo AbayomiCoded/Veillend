@@ -1017,3 +1017,95 @@ fn test_repay_then_withdraw_full_claim_after_accrual() {
     let reserve_after_withdraw = client.get_asset_reserve(&asset);
     assert_eq!(reserve_after_withdraw.total_balance, 60_000);
 }
+
+#[test]
+fn test_garbage_collect_zeroed_positions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    client.deposit(&user, &asset, &1000);
+    client.borrow(&user, &asset, &500);
+
+    client.repay(&user, &asset, &500);
+    client.withdraw(&user, &asset, &1000);
+
+    env.as_contract(&contract_id, || {
+        let key = veillend_contract::DataKey::Position(user.clone(), asset.clone());
+        assert!(!env.storage().persistent().has(&key));
+    });
+}
+
+#[test]
+fn test_re_enable_asset_preserves_caps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    update_asset_caps(&env, &client, &admin, &asset, &1_000_000, &500_000);
+
+    let action_id = client.propose_configure_asset(&admin, &asset, &false);
+    advance_ledgers(&env, DEFAULT_TIMELOCK);
+    client.execute_configure_asset(&admin, &action_id);
+
+    let action_id2 = client.propose_configure_asset(&admin, &asset, &true);
+    advance_ledgers(&env, DEFAULT_TIMELOCK);
+    client.execute_configure_asset(&admin, &action_id2);
+
+    let caps = client.get_asset_caps(&asset);
+    assert_eq!(caps.deposit_cap, 1_000_000);
+    assert_eq!(caps.borrow_cap, 500_000);
+}
+
+#[test]
+fn test_host_invariants_dust_accumulation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    client.deposit(&user1, &asset, &100_000);
+    client.deposit(&user2, &asset, &10_000);
+    client.borrow(&user2, &asset, &5_000);
+
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger().set_timestamp(ledger_timestamp + SECONDS_PER_YEAR / 12);
+
+    let position = client.get_position(&user2, &asset);
+    client.repay(&user2, &asset, &position.borrowed);
+    
+    let position2 = client.get_position(&user2, &asset);
+    client.withdraw(&user2, &asset, &position2.deposited);
+
+    let position3 = client.get_position(&user2, &asset);
+    assert_eq!(position3.deposited, 0);
+    assert_eq!(position3.borrowed, 0);
+
+    env.ledger().set_timestamp(ledger_timestamp + SECONDS_PER_YEAR / 6);
+    client.accrue_interest(&asset);
+
+    let total_deposited = client.get_total_deposited(&asset);
+    let total_borrowed = client.get_total_borrowed(&asset);
+    let u1_pos = client.get_position(&user1, &asset);
+
+    assert_eq!(total_deposited, u1_pos.deposited);
+    assert_eq!(total_borrowed, 0);
+}
