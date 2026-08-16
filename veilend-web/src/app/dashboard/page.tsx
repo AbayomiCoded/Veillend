@@ -20,6 +20,7 @@ import {
 } from './dashboard-cards';
 
 export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
 
 const title = 'Portfolio Dashboard';
 const description = 'Monitor private Stellar lending positions, deposits, borrowing, and recent VeilLend activity.';
