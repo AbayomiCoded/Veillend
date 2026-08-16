@@ -7,9 +7,14 @@ import request from 'supertest';
 
 import { AppController } from '../app.controller';
 import { AppService } from '../app.service';
+import { AppConfigService } from '../config/app-config.service';
 import { AuthController } from '../auth/auth.controller';
 import { AuthService } from '../auth/auth.service';
 import { createOriginCheckMiddleware } from '../middleware/origin-check';
+
+const mockAppConfigService = {
+  stellar: { network: 'testnet' },
+};
 
 // ── CORS origin-check middleware tests ────────────────────────────────────────
 
@@ -62,7 +67,10 @@ describe('CORS origin-check via supertest', () => {
   beforeAll(async () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AppController],
-      providers: [AppService],
+      providers: [
+        AppService,
+        { provide: AppConfigService, useValue: mockAppConfigService },
+      ],
     }).compile();
 
     app = module.createNestApplication();
