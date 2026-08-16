@@ -91,7 +91,7 @@ export async function simulateSorobanTransaction(
     // Perform RPC simulation
     const rpcServer = new StellarRpc.Server(DEFAULT_SOROBAN_RPC_URL);
 
-    let simResponse: any;
+    let simResponse: StellarRpc.Api.SimulateTransactionResponse;
     try {
       simResponse = await rpcServer.simulateTransaction(tx);
     } catch (rpcErr) {
@@ -113,7 +113,7 @@ export async function simulateSorobanTransaction(
 
     // Inspect simulation result for contract panic
     if (StellarRpc.Api.isSimulationError(simResponse)) {
-      const errorMsg = (simResponse as any).error || 'Simulation returned an error';
+      const errorMsg = simResponse.error || 'Simulation returned an error';
       const panicError = mapContractError(errorMsg);
 
       return {

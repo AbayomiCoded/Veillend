@@ -2,7 +2,7 @@ import { validateActionInput, ActionInput } from '../validation/schemas';
 import { simulateSorobanTransaction, SimulationResult } from '../stellar/simulation';
 import { signTransaction, isConnected } from '@stellar/freighter-api';
 import { getNetworkPassphrase, getHorizonUrl } from '../stellar/config';
-import { Horizon, TransactionBuilder } from '@stellar/stellar-sdk';
+import { Horizon, TransactionBuilder, Transaction } from '@stellar/stellar-sdk';
 import { mapContractError, MappedContractError } from './mapContractError';
 
 export interface ActionResponse {
@@ -85,7 +85,7 @@ export async function executeDeposit(
     if (typeof signResult === 'string') {
       signedXdr = signResult;
     } else if (signResult && typeof signResult === 'object' && 'signedTxXdr' in signResult) {
-      signedXdr = (signResult as any).signedTxXdr;
+      signedXdr = (signResult as { signedTxXdr: string }).signedTxXdr;
     } else {
       throw new Error('User cancelled transaction signing');
     }
@@ -100,9 +100,8 @@ export async function executeDeposit(
   const server = new Horizon.Server(getHorizonUrl());
 
   try {
-    const submitResult = await server.submitTransaction(
-      TransactionBuilder.fromXDR(signedXdr, getNetworkPassphrase()) as any,
-    );
+    const builtTx = TransactionBuilder.fromXDR(signedXdr, getNetworkPassphrase()) as unknown as Transaction;
+    const submitResult = await server.submitTransaction(builtTx);
 
     const txHash = submitResult.hash;
 

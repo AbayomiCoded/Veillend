@@ -11,6 +11,22 @@ export interface SupportedAsset {
   logoUrl?: string;
 }
 
+interface RawAssetItem {
+  symbol?: string;
+  code?: string;
+  name?: string;
+  contractId?: string;
+  assetAddress?: string;
+  decimals?: number;
+  priceUsd?: number;
+  price?: number;
+  walletBalance?: number;
+  depositedBalance?: number;
+  borrowedBalance?: number;
+  isSupported?: boolean;
+  logoUrl?: string;
+}
+
 const DEFAULT_SUPPORTED_ASSETS: SupportedAsset[] = [
   {
     symbol: 'USDC',
@@ -68,7 +84,11 @@ export async function fetchSupportedAssets(
   const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
   try {
-    const res = await fetch(`${baseUrl}/assets?supported=true`, {
+    const url = userAddress
+      ? `${baseUrl}/assets?supported=true&address=${encodeURIComponent(userAddress)}`
+      : `${baseUrl}/assets?supported=true`;
+
+    const res = await fetch(url, {
       headers: { 'Cache-Control': 'no-cache' },
     });
 
@@ -77,13 +97,13 @@ export async function fetchSupportedAssets(
     }
 
     const json = await res.json();
-    const assetsData = json.data || json.assets || json;
+    const assetsData: RawAssetItem[] = json.data || json.assets || json;
 
     if (!Array.isArray(assetsData) || assetsData.length === 0) {
       return DEFAULT_SUPPORTED_ASSETS;
     }
 
-    return assetsData.map((item: any, index: number) => {
+    return assetsData.map((item: RawAssetItem, index: number) => {
       const fallback = DEFAULT_SUPPORTED_ASSETS[index % DEFAULT_SUPPORTED_ASSETS.length];
       return {
         symbol: item.symbol || item.code || fallback.symbol,
@@ -98,7 +118,7 @@ export async function fetchSupportedAssets(
         logoUrl: item.logoUrl,
       };
     });
-  } catch (err) {
+  } catch {
     // Return fallback defaults when offline or during test execution
     return DEFAULT_SUPPORTED_ASSETS;
   }
