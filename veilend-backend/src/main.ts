@@ -10,7 +10,7 @@ import { AppConfigService } from './config/app-config.service';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
-  
+
   app.useLogger(app.get(AppLoggerService));
   
   app.useGlobalPipes(new ValidationPipe({

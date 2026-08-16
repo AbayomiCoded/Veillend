@@ -3,6 +3,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { fetchDashboardData } from '@/lib/api/dashboard';
+import { ActionTray } from '@/components/ActionTray';
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
@@ -10,13 +11,30 @@ export const dynamic = 'force-dynamic';
 
 // Helper to get wallet address from session/cookie
 async function getWalletAddress(): Promise<string | null> {
-  // In a production app, this would get the address from a secure session
-  // For now, we'll check for a wallet address in the headers
   const headersList = await headers();
-  const walletAddress = headersList.get('x-wallet-address');
+  // Using cookies from headers or next/headers (headers are already imported, we'll import cookies)
+  const { cookies } = await import('next/headers');
+  const cookieStore = await cookies();
+  const sessionCookie = cookieStore.get('veillend_session');
   
-  if (walletAddress && walletAddress.startsWith('G')) {
-    return walletAddress;
+  if (!sessionCookie || !sessionCookie.value) {
+    return null;
+  }
+  
+  try {
+    // Decode the JWT payload (the second part of the token)
+    const token = sessionCookie.value;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    const walletAddress = payload.walletAddress || payload.sub;
+    
+    if (walletAddress && walletAddress.startsWith('G')) {
+      return walletAddress;
+    }
+  } catch (error) {
+    console.error('Failed to parse session cookie:', error);
   }
   
   return null;
@@ -114,6 +132,7 @@ export default async function DashboardPage() {
                 Last updated: {new Date(portfolio.lastUpdated).toLocaleString()}
               </p>
             </div>
+            <ActionTray userAddress={walletAddress} portfolio={portfolio} />
           </Flex>
         </Section>
 

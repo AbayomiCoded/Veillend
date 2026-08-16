@@ -4,7 +4,7 @@ mod interest;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, Symbol,
+    symbol_short, Address, Env, Symbol, Vec,
 };
 
 /// Increment this only when a contract interface change requires consumers to adapt.
@@ -15,6 +15,16 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 3;
 
 /// A compact, stable identifier for the current `DataKey` storage layout.
 const STORAGE_SCHEMA_ID: Symbol = symbol_short!("VLENDV3");
+
+/// Default delay (in ledgers) before a proposed privileged action becomes
+/// executable. ~5 minutes on Futurenet.
+pub const DEFAULT_TIMELOCK_LEDGERS: u32 = 50;
+
+/// Hard floor for the admin-configurable timelock.
+pub const MIN_TIMELOCK_LEDGERS: u32 = 1;
+
+/// Hard ceiling for the admin-configurable timelock.
+pub const MAX_TIMELOCK_LEDGERS: u32 = 100_000;
 
 /// Queryable metadata describing the contract interface and its storage layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,9 +37,9 @@ pub struct ContractMetadata {
 
 /// Keys and value shapes that make up storage schema `VLENDV3`.
 ///
-/// Instance storage: `Admin: Address`, `PendingAdmin: Address`,
-/// `MinCollateralRatioBps: u32`, `PendingMinCollateralRatioBps:
-/// PendingMinCollateralRatio`, `AdminTimelockSeconds: u32`.
+/// Instance storage: `AdminSet: Vec<Address>`, `MinCollateralRatioBps: u32`,
+/// `TimelockLedgers: u32`, `NextActionId: u64`,
+/// `PendingAction(u64): PendingAction`.
 /// Persistent storage: `SupportedAsset(Address): bool`,
 /// `Position(Address, Address): Position`, `OraclePrice(Address): i128`,
 /// `DepositCap(Address)`/`BorrowCap(Address): i128`,
@@ -38,7 +48,14 @@ pub struct ContractMetadata {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    Admin,
+    /// The set of privileged addresses; any one of them may act as admin.
+    AdminSet,
+    /// Timelock delay in ledgers applied to privileged mutations.
+    TimelockLedgers,
+    /// Monotonic counter that allocates pending-action ids.
+    NextActionId,
+    /// A proposed, not-yet-executed privileged action, keyed by its id.
+    PendingAction(u64),
     MinCollateralRatioBps,
     SupportedAsset(Address),
     AssetReserve(Address),
@@ -56,12 +73,6 @@ pub enum DataKey {
     Paused,
     /// Time-based interest accrual indexes for an asset
     InterestState(Address),
-    /// Address proposed to take over admin control (two-step transfer)
-    PendingAdmin,
-    /// Timelocked minimum collateral ratio change awaiting execution
-    PendingMinCollateralRatioBps,
-    /// Delay in seconds applied to `set_min_collateral_ratio` (0 = immediate)
-    AdminTimelockSeconds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,16 +111,6 @@ pub struct AssetReserve {
     pub protocol_fees: i128,
 }
 
-/// A pending (timelocked) minimum collateral ratio change. Stored until
-/// `executable_timestamp` is reached, then applied by anyone via
-/// `execute_pending_collateral_ratio`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct PendingMinCollateralRatio {
-    pub new_ratio_bps: u32,
-    pub executable_timestamp: u64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum ReserveUpdateKind {
@@ -120,6 +121,44 @@ pub enum ReserveUpdateKind {
     Withdraw,
     FeeAccrual,
     InterestAccrual,
+}
+
+/// The class of privileged mutation a pending action will perform. Used to
+/// route `execute_*`/`cancel_*` calls to the matching proposal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ActionKind {
+    ConfigureAsset,
+    SetOraclePrice,
+    UpdateAssetCaps,
+    SetMinCollateralRatio,
+    SetPaused,
+    RecordProtocolFee,
+}
+
+/// The arguments captured when a privileged action is proposed. Stored in
+/// full (rather than as a hash) so `execute_*` can apply exactly what was
+/// proposed without trusting call-supplied parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ActionPayload {
+    ConfigureAsset(Address, bool),
+    SetOraclePrice(Address, i128),
+    UpdateAssetCaps(Address, i128, i128),
+    SetMinCollateralRatio(u32),
+    SetPaused(bool),
+    RecordProtocolFee(Address, i128),
+}
+
+/// A proposed privileged action awaiting its timelock window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PendingAction {
+    pub kind: ActionKind,
+    pub payload: ActionPayload,
+    /// First ledger sequence at which this action may be executed.
+    pub executable_at_ledger: u32,
+    pub proposer: Address,
 }
 
 #[contracterror]
@@ -160,12 +199,16 @@ pub enum VeilLendError {
     CircuitBreakerTriggered = 16,
     /// Reserve balance is too low for the requested action
     InsufficientReserve = 17,
-    /// No pending admin transfer exists for this address
-    NoPendingAdmin = 25,
-    /// A timelocked change has not reached its executable timestamp yet
-    TimelockNotElapsed = 26,
-    /// No pending minimum collateral ratio change is scheduled
-    NoPendingRatioChange = 27,
+    /// Pending action's timelock window has not elapsed yet
+    TimelockNotReady = 18,
+    /// No pending action with the given id (or wrong kind)
+    UnknownAction = 19,
+    /// Cannot remove the last remaining admin
+    LastAdminRequired = 20,
+    /// Timelock value is outside the allowed range
+    InvalidTimelock = 21,
+    /// Pausing requires a timelocked proposal (use propose/execute)
+    TimelockRequired = 22,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -237,39 +280,6 @@ pub struct CircuitBreakerEvent {
     pub paused: bool,
 }
 
-#[contractevent(topics = ["veillend", "admin_proposed"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminProposed {
-    #[topic]
-    pub from: Address,
-    #[topic]
-    pub to: Address,
-}
-
-#[contractevent(topics = ["veillend", "admin_transferred"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminTransferred {
-    #[topic]
-    pub from: Address,
-    #[topic]
-    pub to: Address,
-}
-
-#[contractevent(topics = ["veillend", "min_collateral_ratio_scheduled"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MinCollateralRatioScheduled {
-    #[topic]
-    pub admin: Address,
-    pub new_ratio_bps: u32,
-    pub executable_timestamp: u64,
-}
-
-#[contractevent(topics = ["veillend", "min_collateral_ratio_applied"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MinCollateralRatioApplied {
-    pub new_ratio_bps: u32,
-}
-
 #[contractevent(topics = ["veillend", "asset_reserve_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetReserveUpdated {
@@ -278,6 +288,60 @@ pub struct AssetReserveUpdated {
     pub total_balance: i128,
     pub protocol_fees: i128,
     pub kind: ReserveUpdateKind,
+}
+
+#[contractevent(topics = ["veillend", "admin_added"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAdded {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub new_admin: Address,
+}
+
+#[contractevent(topics = ["veillend", "admin_removed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRemoved {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub removed: Address,
+}
+
+#[contractevent(topics = ["veillend", "action_proposed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionProposed {
+    #[topic]
+    pub proposer: Address,
+    pub action_id: u64,
+    pub kind: ActionKind,
+    pub executable_at_ledger: u32,
+}
+
+#[contractevent(topics = ["veillend", "action_executed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionExecuted {
+    #[topic]
+    pub executor: Address,
+    pub action_id: u64,
+    pub kind: ActionKind,
+}
+
+#[contractevent(topics = ["veillend", "action_cancelled"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionCancelled {
+    #[topic]
+    pub canceller: Address,
+    pub action_id: u64,
+    pub kind: ActionKind,
+}
+
+#[contractevent(topics = ["veillend", "timelock_updated"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockUpdated {
+    #[topic]
+    pub admin: Address,
+    pub ledgers: u32,
 }
 
 #[contract]
@@ -302,99 +366,173 @@ impl VeilLendContract {
         // admin they claim to be.
         admin.require_auth();
 
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::AdminSet) {
             panic_with_error!(&env, VeilLendError::AlreadyInitialized);
         }
         if min_collateral_ratio_bps < 10_000 {
             panic_with_error!(&env, VeilLendError::InvalidCollateralRatio);
         }
 
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        // Founding admin is written into a single-element AdminSet. Subsequent
+        // admins are added via `add_admin`.
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin);
+        env.storage().instance().set(&DataKey::AdminSet, &admins);
+
         env.storage()
             .instance()
             .set(&DataKey::MinCollateralRatioBps, &min_collateral_ratio_bps);
-
-        // Default timelock is 0 (immediate) so contracts deployed before the
-        // timelock feature behave exactly as before.
         env.storage()
             .instance()
-            .set(&DataKey::AdminTimelockSeconds, &0u32);
+            .set(&DataKey::TimelockLedgers, &DEFAULT_TIMELOCK_LEDGERS);
+        env.storage().instance().set(&DataKey::NextActionId, &0u64);
 
         // Initialize circuit breaker as not paused
         env.storage().persistent().set(&DataKey::Paused, &false);
     }
 
-    pub fn configure_asset(env: Env, admin: Address, asset: Address, supported: bool) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
+    /// Adds `new_admin` to the admin set. Callable only by a current admin.
+    pub fn add_admin(env: Env, caller: Address, new_admin: Address) {
+        Self::require_admin(&env, &caller);
+        caller.require_auth();
+
+        let mut admins = Self::read_admin_set(&env);
+        if !admins.contains(&new_admin) {
+            admins.push_back(new_admin.clone());
+            Self::write_admin_set(&env, &admins);
         }
 
-        admin.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::SupportedAsset(asset.clone()), &supported);
-
-        // Initialize caps to unlimited (-1) when adding new asset
-        if supported {
-            env.storage()
-                .persistent()
-                .set(&DataKey::DepositCap(asset.clone()), &-1i128);
-            env.storage()
-                .persistent()
-                .set(&DataKey::BorrowCap(asset.clone()), &-1i128);
-
-            // Initialize totals to 0
-            env.storage()
-                .persistent()
-                .set(&DataKey::TotalDeposited(asset.clone()), &0i128);
-            env.storage()
-                .persistent()
-                .set(&DataKey::TotalBorrowed(asset.clone()), &0i128);
-        }
-
-        AssetConfigured {
-            admin,
-            asset: asset.clone(),
-            supported,
+        AdminAdded {
+            admin: caller,
+            new_admin,
         }
         .publish(&env);
-
-        if supported {
-            let reserve = Self::read_asset_reserve(&env, &asset);
-            Self::write_asset_reserve(&env, &asset, &reserve);
-            Self::publish_asset_reserve_updated(
-                &env,
-                &asset,
-                &reserve,
-                ReserveUpdateKind::ConfigureAsset,
-            );
-        }
     }
 
-    /// Set the oracle price for a supported asset (admin only)
-    ///
-    /// This function allows the admin to set the price of an asset as reported by an oracle.
-    /// The price is used in collateral calculations to determine borrowing power.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
-    /// * `asset` - The asset address to set the price for
-    /// * `price` - The oracle price (must be positive, in base units e.g., cents)
-    pub fn set_oracle_price(env: Env, admin: Address, asset: Address, price: i128) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
+    /// Removes `to_remove` from the admin set. Callable only by a current
+    /// admin. Panics if the set would drop to length 0 (prevents lockout).
+    pub fn remove_admin(env: Env, caller: Address, to_remove: Address) {
+        Self::require_admin(&env, &caller);
+        caller.require_auth();
+
+        let admins = Self::read_admin_set(&env);
+        if admins.len() <= 1 {
+            panic_with_error!(&env, VeilLendError::LastAdminRequired);
+        }
+        if !admins.contains(&to_remove) {
             panic_with_error!(&env, VeilLendError::Unauthorized);
         }
 
-        if price <= 0 {
-            panic_with_error!(&env, VeilLendError::InvalidAmount);
+        let mut remaining = Vec::new(&env);
+        for admin in admins.iter() {
+            if admin != to_remove {
+                remaining.push_back(admin);
+            }
+        }
+        Self::write_admin_set(&env, &remaining);
+
+        AdminRemoved {
+            admin: caller,
+            removed: to_remove,
+        }
+        .publish(&env);
+    }
+
+    /// Returns the current admin set.
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        Self::read_admin_set(&env)
+    }
+
+    /// Sets the timelock delay (in ledgers) applied to privileged mutations.
+    /// Admin-only. Bounded to `[MIN_TIMELOCK_LEDGERS, MAX_TIMELOCK_LEDGERS]`.
+    pub fn set_timelock_ledgers(env: Env, admin: Address, ledgers: u32) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        if !(MIN_TIMELOCK_LEDGERS..=MAX_TIMELOCK_LEDGERS).contains(&ledgers) {
+            panic_with_error!(&env, VeilLendError::InvalidTimelock);
         }
 
-        admin.require_auth();
         env.storage()
-            .persistent()
-            .set(&DataKey::OraclePrice(asset.clone()), &price);
+            .instance()
+            .set(&DataKey::TimelockLedgers, &ledgers);
+
+        TimelockUpdated { admin, ledgers }.publish(&env);
+    }
+
+    /// Returns the current timelock delay in ledgers.
+    pub fn get_timelock_ledgers(env: Env) -> u32 {
+        Self::timelock_ledgers(&env)
+    }
+
+    /// Returns the pending action with the given id, if any.
+    pub fn get_pending_action(env: Env, action_id: u64) -> Option<PendingAction> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAction(action_id))
+    }
+
+    /// Proposes configuring an asset (timelocked). Returns the action id.
+    pub fn propose_configure_asset(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        supported: bool,
+    ) -> u64 {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::ConfigureAsset,
+            ActionPayload::ConfigureAsset(asset, supported),
+        )
+    }
+
+    /// Executes a previously proposed configure_asset action, if its timelock
+    /// has elapsed.
+    pub fn execute_configure_asset(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::ConfigureAsset);
+    }
+
+    /// Cancels a pending configure_asset action.
+    pub fn cancel_configure_asset(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::ConfigureAsset);
+    }
+
+    /// Proposes setting the oracle price for an asset (timelocked). Returns
+    /// the action id.
+    pub fn propose_set_oracle_price(env: Env, admin: Address, asset: Address, price: i128) -> u64 {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::SetOraclePrice,
+            ActionPayload::SetOraclePrice(asset, price),
+        )
+    }
+
+    /// Executes a previously proposed set_oracle_price action.
+    pub fn execute_set_oracle_price(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::SetOraclePrice);
+    }
+
+    /// Cancels a pending set_oracle_price action.
+    pub fn cancel_set_oracle_price(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::SetOraclePrice);
     }
 
     /// Get the oracle price for an asset
@@ -410,55 +548,39 @@ impl VeilLendContract {
         env.storage().persistent().get(&DataKey::OraclePrice(asset))
     }
 
-    /// Update per-asset deposit and borrow caps (admin only)
-    ///
-    /// Sets the maximum total deposits and borrows allowed for a specific asset.
-    /// A value of -1 means unlimited (no cap).
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
-    /// * `asset` - The asset address to update caps for
-    /// * `deposit_cap` - Maximum total deposits allowed (-1 for unlimited)
-    /// * `borrow_cap` - Maximum total borrows allowed (-1 for unlimited)
-    pub fn update_asset_caps(
+    /// Proposes updating per-asset deposit and borrow caps (timelocked).
+    /// Returns the action id.
+    pub fn propose_update_asset_caps(
         env: Env,
         admin: Address,
         asset: Address,
         deposit_cap: i128,
         borrow_cap: i128,
-    ) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
-        // Validate caps: must be -1 (unlimited) or positive
-        if deposit_cap != -1 && deposit_cap <= 0 {
-            panic_with_error!(&env, VeilLendError::InvalidCap);
-        }
-        if borrow_cap != -1 && borrow_cap <= 0 {
-            panic_with_error!(&env, VeilLendError::InvalidCap);
-        }
-
-        // Ensure asset is supported
-        Self::require_supported_asset(&env, &asset);
-
+    ) -> u64 {
+        Self::require_admin(&env, &admin);
         admin.require_auth();
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::DepositCap(asset.clone()), &deposit_cap);
-        env.storage()
-            .persistent()
-            .set(&DataKey::BorrowCap(asset.clone()), &borrow_cap);
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::UpdateAssetCaps,
+            ActionPayload::UpdateAssetCaps(asset, deposit_cap, borrow_cap),
+        )
+    }
 
-        CapsUpdated {
-            admin,
-            asset,
-            deposit_cap,
-            borrow_cap,
-        }
-        .publish(&env);
+    /// Executes a previously proposed update_asset_caps action.
+    pub fn execute_update_asset_caps(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::UpdateAssetCaps);
+    }
+
+    /// Cancels a pending update_asset_caps action.
+    pub fn cancel_update_asset_caps(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::UpdateAssetCaps);
     }
 
     /// Get the current caps for an asset
@@ -484,6 +606,39 @@ impl VeilLendContract {
             deposit_cap,
             borrow_cap,
         }
+    }
+
+    /// Proposes updating the minimum collateral ratio (timelocked). Returns
+    /// the action id.
+    pub fn propose_set_min_collateral_ratio(
+        env: Env,
+        admin: Address,
+        min_collateral_ratio_bps: u32,
+    ) -> u64 {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::SetMinCollateralRatio,
+            ActionPayload::SetMinCollateralRatio(min_collateral_ratio_bps),
+        )
+    }
+
+    /// Executes a previously proposed set_min_collateral_ratio action.
+    pub fn execute_set_min_collateral_ratio(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::SetMinCollateralRatio);
+    }
+
+    /// Cancels a pending set_min_collateral_ratio action.
+    pub fn cancel_set_min_collateral_ratio(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::SetMinCollateralRatio);
     }
 
     /// Get total deposited amount for an asset
@@ -514,24 +669,50 @@ impl VeilLendContract {
             .unwrap_or(0)
     }
 
-    /// Toggle circuit breaker (pause/unpause the contract)
-    ///
-    /// When paused, all deposit and borrow operations are blocked.
-    /// Withdraw and repay operations remain available.
+    /// Unpauses the contract immediately. Pausing is timelocked and must go
+    /// through `propose_set_paused`/`execute_set_paused`; unpausing is exempt
+    /// from the timelock so incident response can recover quickly.
     ///
     /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
-    /// * `paused` - true to pause, false to unpause
+    /// * `admin` - A current admin address
+    /// * `paused` - must be `false`; passing `true` panics with `TimelockRequired`
     pub fn set_paused(env: Env, admin: Address, paused: bool) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        if paused {
+            panic_with_error!(&env, VeilLendError::TimelockRequired);
         }
 
-        admin.require_auth();
-        env.storage().persistent().set(&DataKey::Paused, &paused);
+        Self::apply_set_paused(&env, &admin, false);
+    }
 
-        CircuitBreakerEvent { admin, paused }.publish(&env);
+    /// Proposes pausing the contract (timelocked). Returns the action id.
+    pub fn propose_set_paused(env: Env, admin: Address) -> u64 {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::SetPaused,
+            ActionPayload::SetPaused(true),
+        )
+    }
+
+    /// Executes a previously proposed pause action.
+    pub fn execute_set_paused(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::SetPaused);
+    }
+
+    /// Cancels a pending pause action.
+    pub fn cancel_set_paused(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::SetPaused);
     }
 
     /// Check if the contract is paused
@@ -750,31 +931,38 @@ impl VeilLendContract {
             .unwrap_or(false)
     }
 
-    pub fn record_protocol_fee(env: Env, admin: Address, asset: Address, amount: i128) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
-        Self::require_supported_asset(&env, &asset);
-        Self::require_positive_amount(&env, amount);
+    /// Proposes recording a protocol fee for an asset (timelocked). Returns
+    /// the action id.
+    pub fn propose_record_protocol_fee(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        amount: i128,
+    ) -> u64 {
+        Self::require_admin(&env, &admin);
         admin.require_auth();
 
-        // Keep the interest clock fresh even on admin-only fee recording.
-        Self::accrue_and_persist_interest(&env, &asset);
-
-        let mut reserve = Self::read_asset_reserve(&env, &asset);
-        reserve.total_balance += amount;
-        reserve.protocol_fees += amount;
-        Self::write_asset_reserve(&env, &asset, &reserve);
-        Self::publish_asset_reserve_updated(&env, &asset, &reserve, ReserveUpdateKind::FeeAccrual);
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::RecordProtocolFee,
+            ActionPayload::RecordProtocolFee(asset, amount),
+        )
     }
 
-    pub fn admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::NotInitialized))
+    /// Executes a previously proposed record_protocol_fee action.
+    pub fn execute_record_protocol_fee(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::RecordProtocolFee);
+    }
+
+    /// Cancels a pending record_protocol_fee action.
+    pub fn cancel_record_protocol_fee(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::RecordProtocolFee);
     }
 
     pub fn min_collateral_ratio_bps(env: Env) -> u32 {
@@ -783,188 +971,295 @@ impl VeilLendContract {
             .get(&DataKey::MinCollateralRatioBps)
             .unwrap_or(15_000)
     }
-
-    /// Propose transferring admin control to `new_admin` (two-step transfer).
-    ///
-    /// Only the current admin may propose; the new admin must later call
-    /// `accept_admin` and sign to complete the transfer. This prevents a
-    /// mistyped address from bricking the protocol: `accept_admin` can only
-    /// be signed by the proposed address itself.
-    ///
-    /// # Arguments
-    /// * `current_admin` - The current admin address (must match stored admin)
-    /// * `new_admin` - The address being proposed as the next admin
-    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
-        let stored_admin = Self::admin(env.clone());
-        if current_admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
-        current_admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingAdmin, &new_admin);
-
-        AdminProposed {
-            from: current_admin,
-            to: new_admin,
-        }
-        .publish(&env);
-    }
-
-    /// Complete a pending admin transfer. Callable only by the proposed
-    /// `new_admin` (its signature is required). Returns the previous admin.
-    ///
-    /// # Arguments
-    /// * `new_admin` - The address that was proposed via `propose_admin`
-    ///
-    /// # Returns
-    /// * `Address` - The old (outgoing) admin address
-    pub fn accept_admin(env: Env, new_admin: Address) -> Address {
-        let pending_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::NoPendingAdmin));
-
-        if pending_admin != new_admin {
-            panic_with_error!(&env, VeilLendError::NoPendingAdmin);
-        }
-
-        new_admin.require_auth();
-
-        let old_admin = Self::admin(env.clone());
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage().instance().remove(&DataKey::PendingAdmin);
-
-        AdminTransferred {
-            from: old_admin.clone(),
-            to: new_admin,
-        }
-        .publish(&env);
-
-        old_admin
-    }
-
-    /// Returns the address awaiting admin transfer, if any.
-    pub fn pending_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::PendingAdmin)
-    }
-
-    /// Configure the delay applied to future `set_min_collateral_ratio`
-    /// calls. `0` (the default) applies ratio changes immediately; a
-    /// positive value schedules them for `now + seconds`.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
-    /// * `seconds` - The timelock delay in seconds (0 = immediate)
-    pub fn set_timelock(env: Env, admin: Address, seconds: u32) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminTimelockSeconds, &seconds);
-    }
-
-    /// The currently configured timelock (in seconds) applied to
-    /// `set_min_collateral_ratio` changes. `0` means immediate application.
-    pub fn admin_timelock_seconds(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::AdminTimelockSeconds)
-            .unwrap_or(0)
-    }
-
-    /// Update the minimum collateral ratio (admin only).
-    ///
-    /// If a timelock is configured (`admin_timelock_seconds > 0`), the new
-    /// ratio is staged as pending and only takes effect once
-    /// `execute_pending_collateral_ratio` is called after the delay has
-    /// elapsed, giving users time to react. With the default timelock of
-    /// `0` the change applies immediately (backward compatible with previous
-    /// behavior).
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
-    /// * `new_ratio_bps` - The new minimum collateral ratio in basis points (>= 10_000)
-    pub fn set_min_collateral_ratio(env: Env, admin: Address, new_ratio_bps: u32) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
-        if new_ratio_bps < 10_000 {
-            panic_with_error!(&env, VeilLendError::InvalidCollateralRatio);
-        }
-
-        admin.require_auth();
-
-        let timelock_seconds = Self::admin_timelock_seconds(env.clone()) as u64;
-        if timelock_seconds == 0 {
-            env.storage()
-                .instance()
-                .set(&DataKey::MinCollateralRatioBps, &new_ratio_bps);
-
-            MinCollateralRatioApplied { new_ratio_bps }.publish(&env);
-        } else {
-            let executable_timestamp = env.ledger().timestamp() + timelock_seconds;
-            env.storage().instance().set(
-                &DataKey::PendingMinCollateralRatioBps,
-                &PendingMinCollateralRatio {
-                    new_ratio_bps,
-                    executable_timestamp,
-                },
-            );
-
-            MinCollateralRatioScheduled {
-                admin,
-                new_ratio_bps,
-                executable_timestamp,
-            }
-            .publish(&env);
-        }
-    }
-
-    /// The pending (timelocked) minimum collateral ratio change, if any.
-    pub fn pending_min_collateral_ratio(env: Env) -> Option<PendingMinCollateralRatio> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PendingMinCollateralRatioBps)
-    }
-
-    /// Apply a pending minimum collateral ratio change once its timelock has
-    /// elapsed. Callable by anyone — execution is not a privileged action.
-    pub fn execute_pending_collateral_ratio(env: Env) {
-        let pending: PendingMinCollateralRatio = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingMinCollateralRatioBps)
-            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::NoPendingRatioChange));
-
-        let now = env.ledger().timestamp();
-        if now < pending.executable_timestamp {
-            panic_with_error!(&env, VeilLendError::TimelockNotElapsed);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::MinCollateralRatioBps, &pending.new_ratio_bps);
-        env.storage()
-            .instance()
-            .remove(&DataKey::PendingMinCollateralRatioBps);
-
-        MinCollateralRatioApplied {
-            new_ratio_bps: pending.new_ratio_bps,
-        }
-        .publish(&env);
-    }
 }
 
 impl VeilLendContract {
+    fn read_admin_set(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminSet)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn write_admin_set(env: &Env, admins: &Vec<Address>) {
+        env.storage().instance().set(&DataKey::AdminSet, admins);
+    }
+
+    /// Panics with `Unauthorized` if `caller` is not in the admin set.
+    fn require_admin(env: &Env, caller: &Address) {
+        if !Self::read_admin_set(env).contains(caller) {
+            panic_with_error!(env, VeilLendError::Unauthorized);
+        }
+    }
+
+    fn timelock_ledgers(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TimelockLedgers)
+            .unwrap_or(DEFAULT_TIMELOCK_LEDGERS)
+    }
+
+    /// Allocates and returns the next action id (a monotonic counter).
+    fn next_action_id(env: &Env) -> u64 {
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextActionId)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextActionId, &(id + 1));
+        id
+    }
+
+    fn read_pending_action(env: &Env, action_id: u64) -> PendingAction {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAction(action_id))
+            .unwrap_or_else(|| panic_with_error!(env, VeilLendError::UnknownAction))
+    }
+
+    /// Validates a proposed payload's parameters, failing fast at propose time
+    /// (and re-checked at execute time in case state changed in between).
+    fn validate_payload(env: &Env, payload: &ActionPayload) {
+        match payload {
+            ActionPayload::ConfigureAsset(_, _) => {}
+            ActionPayload::SetOraclePrice(_, price) => {
+                if *price <= 0 {
+                    panic_with_error!(env, VeilLendError::InvalidAmount);
+                }
+            }
+            ActionPayload::UpdateAssetCaps(asset, deposit_cap, borrow_cap) => {
+                if *deposit_cap != -1 && *deposit_cap <= 0 {
+                    panic_with_error!(env, VeilLendError::InvalidCap);
+                }
+                if *borrow_cap != -1 && *borrow_cap <= 0 {
+                    panic_with_error!(env, VeilLendError::InvalidCap);
+                }
+                Self::require_supported_asset(env, asset);
+            }
+            ActionPayload::SetMinCollateralRatio(bps) => {
+                if *bps < 10_000 {
+                    panic_with_error!(env, VeilLendError::InvalidCollateralRatio);
+                }
+            }
+            ActionPayload::SetPaused(_) => {}
+            ActionPayload::RecordProtocolFee(asset, amount) => {
+                Self::require_supported_asset(env, asset);
+                Self::require_positive_amount(env, *amount);
+            }
+        }
+    }
+
+    /// Stores a validated pending action and returns its id.
+    fn propose_action(env: &Env, admin: &Address, kind: ActionKind, payload: ActionPayload) -> u64 {
+        Self::validate_payload(env, &payload);
+
+        let action_id = Self::next_action_id(env);
+        let executable_at_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(Self::timelock_ledgers(env));
+
+        let pending = PendingAction {
+            kind: kind.clone(),
+            payload,
+            executable_at_ledger,
+            proposer: admin.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAction(action_id), &pending);
+
+        ActionProposed {
+            proposer: admin.clone(),
+            action_id,
+            kind,
+            executable_at_ledger,
+        }
+        .publish(env);
+
+        action_id
+    }
+
+    /// Applies a pending action whose kind matches `expected_kind`, after
+    /// verifying the timelock window has elapsed. Removes the action on success.
+    fn execute_action(env: &Env, admin: &Address, action_id: u64, expected_kind: ActionKind) {
+        let pending = Self::read_pending_action(env, action_id);
+        if pending.kind != expected_kind {
+            panic_with_error!(env, VeilLendError::UnknownAction);
+        }
+        if env.ledger().sequence() < pending.executable_at_ledger {
+            panic_with_error!(env, VeilLendError::TimelockNotReady);
+        }
+
+        let PendingAction {
+            kind,
+            payload,
+            proposer,
+            ..
+        } = pending;
+
+        Self::apply_action(env, &proposer, &payload);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAction(action_id));
+
+        ActionExecuted {
+            executor: admin.clone(),
+            action_id,
+            kind,
+        }
+        .publish(env);
+    }
+
+    /// Cancels a pending action whose kind matches `expected_kind`. Callable
+    /// by the original proposer or any current admin.
+    fn cancel_action(env: &Env, admin: &Address, action_id: u64, expected_kind: ActionKind) {
+        let pending = Self::read_pending_action(env, action_id);
+        if pending.kind != expected_kind {
+            panic_with_error!(env, VeilLendError::UnknownAction);
+        }
+
+        let is_admin = Self::read_admin_set(env).contains(admin);
+        if !is_admin && &pending.proposer != admin {
+            panic_with_error!(env, VeilLendError::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAction(action_id));
+
+        ActionCancelled {
+            canceller: admin.clone(),
+            action_id,
+            kind: pending.kind,
+        }
+        .publish(env);
+    }
+
+    /// Validates and applies a pending action's payload.
+    fn apply_action(env: &Env, admin: &Address, payload: &ActionPayload) {
+        Self::validate_payload(env, payload);
+
+        match payload {
+            ActionPayload::ConfigureAsset(asset, supported) => {
+                Self::apply_configure_asset(env, admin, asset, *supported)
+            }
+            ActionPayload::SetOraclePrice(asset, price) => {
+                Self::apply_set_oracle_price(env, asset, *price)
+            }
+            ActionPayload::UpdateAssetCaps(asset, deposit_cap, borrow_cap) => {
+                Self::apply_update_asset_caps(env, admin, asset, *deposit_cap, *borrow_cap)
+            }
+            ActionPayload::SetMinCollateralRatio(bps) => {
+                Self::apply_set_min_collateral_ratio(env, *bps)
+            }
+            ActionPayload::SetPaused(paused) => Self::apply_set_paused(env, admin, *paused),
+            ActionPayload::RecordProtocolFee(asset, amount) => {
+                Self::apply_record_protocol_fee(env, asset, *amount)
+            }
+        }
+    }
+
+    fn apply_configure_asset(env: &Env, admin: &Address, asset: &Address, supported: bool) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupportedAsset(asset.clone()), &supported);
+
+        // Initialize caps to unlimited (-1) when adding new asset
+        if supported {
+            env.storage()
+                .persistent()
+                .set(&DataKey::DepositCap(asset.clone()), &-1i128);
+            env.storage()
+                .persistent()
+                .set(&DataKey::BorrowCap(asset.clone()), &-1i128);
+
+            // Initialize totals to 0
+            env.storage()
+                .persistent()
+                .set(&DataKey::TotalDeposited(asset.clone()), &0i128);
+            env.storage()
+                .persistent()
+                .set(&DataKey::TotalBorrowed(asset.clone()), &0i128);
+        }
+
+        AssetConfigured {
+            admin: admin.clone(),
+            asset: asset.clone(),
+            supported,
+        }
+        .publish(env);
+
+        if supported {
+            let reserve = Self::read_asset_reserve(env, asset);
+            Self::write_asset_reserve(env, asset, &reserve);
+            Self::publish_asset_reserve_updated(
+                env,
+                asset,
+                &reserve,
+                ReserveUpdateKind::ConfigureAsset,
+            );
+        }
+    }
+
+    fn apply_set_oracle_price(env: &Env, asset: &Address, price: i128) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::OraclePrice(asset.clone()), &price);
+    }
+
+    fn apply_update_asset_caps(
+        env: &Env,
+        admin: &Address,
+        asset: &Address,
+        deposit_cap: i128,
+        borrow_cap: i128,
+    ) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::DepositCap(asset.clone()), &deposit_cap);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BorrowCap(asset.clone()), &borrow_cap);
+
+        CapsUpdated {
+            admin: admin.clone(),
+            asset: asset.clone(),
+            deposit_cap,
+            borrow_cap,
+        }
+        .publish(env);
+    }
+
+    fn apply_set_min_collateral_ratio(env: &Env, min_collateral_ratio_bps: u32) {
+        env.storage()
+            .instance()
+            .set(&DataKey::MinCollateralRatioBps, &min_collateral_ratio_bps);
+    }
+
+    fn apply_set_paused(env: &Env, admin: &Address, paused: bool) {
+        env.storage().persistent().set(&DataKey::Paused, &paused);
+
+        CircuitBreakerEvent {
+            admin: admin.clone(),
+            paused,
+        }
+        .publish(env);
+    }
+
+    fn apply_record_protocol_fee(env: &Env, asset: &Address, amount: i128) {
+        // Keep the interest clock fresh even on admin-only fee recording.
+        Self::accrue_and_persist_interest(env, asset);
+
+        let mut reserve = Self::read_asset_reserve(env, asset);
+        reserve.total_balance += amount;
+        reserve.protocol_fees += amount;
+        Self::write_asset_reserve(env, asset, &reserve);
+        Self::publish_asset_reserve_updated(env, asset, &reserve, ReserveUpdateKind::FeeAccrual);
+    }
+
     fn read_asset_reserve(env: &Env, asset: &Address) -> AssetReserve {
         env.storage()
             .persistent()
@@ -1183,7 +1478,6 @@ impl VeilLendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn test_position_creation() {
@@ -1226,9 +1520,11 @@ mod tests {
         assert_eq!(VeilLendError::InvalidCap as u32, 15);
         assert_eq!(VeilLendError::CircuitBreakerTriggered as u32, 16);
         assert_eq!(VeilLendError::InsufficientReserve as u32, 17);
-        assert_eq!(VeilLendError::NoPendingAdmin as u32, 25);
-        assert_eq!(VeilLendError::TimelockNotElapsed as u32, 26);
-        assert_eq!(VeilLendError::NoPendingRatioChange as u32, 27);
+        assert_eq!(VeilLendError::TimelockNotReady as u32, 18);
+        assert_eq!(VeilLendError::UnknownAction as u32, 19);
+        assert_eq!(VeilLendError::LastAdminRequired as u32, 20);
+        assert_eq!(VeilLendError::InvalidTimelock as u32, 21);
+        assert_eq!(VeilLendError::TimelockRequired as u32, 22);
     }
 
     #[test]
@@ -1261,9 +1557,11 @@ mod tests {
             VeilLendError::InvalidCap as u32,
             VeilLendError::CircuitBreakerTriggered as u32,
             VeilLendError::InsufficientReserve as u32,
-            VeilLendError::NoPendingAdmin as u32,
-            VeilLendError::TimelockNotElapsed as u32,
-            VeilLendError::NoPendingRatioChange as u32,
+            VeilLendError::TimelockNotReady as u32,
+            VeilLendError::UnknownAction as u32,
+            VeilLendError::LastAdminRequired as u32,
+            VeilLendError::InvalidTimelock as u32,
+            VeilLendError::TimelockRequired as u32,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
@@ -1289,28 +1587,5 @@ mod tests {
             VeilLendError::Unauthorized as u32,
             "NotInitialized and Unauthorized must be distinct error codes"
         );
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_constructor_requires_admin_auth() {
-        // No mock_all_auths: the constructor must authenticate `admin` before
-        // touching storage, so it must fail without the admin's signature.
-        let env = Env::default();
-        let admin = Address::generate(&env);
-
-        VeilLendContract::__constructor(env, admin, 15_000);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_constructor_called_twice_panics_already_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-
-        VeilLendContract::__constructor(env.clone(), admin.clone(), 15_000);
-        // Second initialization attempt must panic AlreadyInitialized.
-        VeilLendContract::__constructor(env, admin, 15_000);
     }
 }

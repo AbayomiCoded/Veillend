@@ -2,6 +2,7 @@ import axios from 'axios';
 import { useStore } from '../store/store';
 import { reportError } from './errorReporting';
 import { getRuntimePlatform } from './runtimePlatform';
+import ToastComponent from './toast';
 
 const platform = getRuntimePlatform();
 
@@ -48,6 +49,21 @@ api.interceptors.response.use(
         hasResponse: !!error?.response,
       },
     });
+
+    // Handle 401 - unauthorized session
+    if (status === 401) {
+      const store = useStore.getState();
+      // Prevent multiple logout operations from running concurrently
+      if (store.authLoading || store.lendingLoading || store.shieldedLoading) {
+        return Promise.reject(error);
+      }
+      store.logout();
+      ToastComponent.show({
+        type: 'error',
+        text1: 'Session expired',
+        text2: 'Please reconnect your wallet',
+      });
+    }
 
     return Promise.reject(error);
   }
