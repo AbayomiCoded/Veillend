@@ -11,7 +11,7 @@ const _delegate: {
 	_mockRoute: NavRoute;
 	isReady: () => boolean;
 	reset: (state: { index: number; routes: { name: string }[] }) => void;
-	getCurrentRoute: (() => NavRoute) | null;
+	getCurrentRoute: () => NavRoute;
 } = {
 	_nativeRef: null,
 	_mockRoute: null,
