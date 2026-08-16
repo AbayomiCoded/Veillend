@@ -1,11 +1,10 @@
 import { Module } from '@nestjs/common';
 import { TransactionsController } from './transactions.controller';
 import { TransactionsService } from './transactions.service';
-import { IndexerModule } from '../indexer/indexer.module';
-import { StellarModule } from '../stellar/stellar.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [StellarModule, IndexerModule],
+  imports: [AuthModule],
   controllers: [TransactionsController],
   providers: [TransactionsService],
   exports: [TransactionsService],

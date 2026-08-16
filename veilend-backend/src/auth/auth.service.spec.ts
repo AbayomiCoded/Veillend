@@ -86,6 +86,8 @@ describe('AuthService', () => {
 
   describe('verifyWallet', () => {
     it('throws UnauthorizedException when nonce is not found in DB', async () => {
+      walletService.verifySignature.mockReturnValue(true);
+      prisma.walletNonce.updateMany.mockResolvedValue({ count: 0 });
       prisma.walletNonce.findFirst.mockResolvedValue(null);
 
       await expect(
@@ -94,6 +96,8 @@ describe('AuthService', () => {
     });
 
     it('throws UnauthorizedException on replay (nonce already used)', async () => {
+      walletService.verifySignature.mockReturnValue(true);
+      prisma.walletNonce.updateMany.mockResolvedValue({ count: 0 });
       prisma.walletNonce.findFirst.mockResolvedValue({
         id: 'n-1',
         used: true,
@@ -106,6 +110,8 @@ describe('AuthService', () => {
     });
 
     it('throws GoneException when nonce has expired', async () => {
+      walletService.verifySignature.mockReturnValue(true);
+      prisma.walletNonce.updateMany.mockResolvedValue({ count: 0 });
       prisma.walletNonce.findFirst.mockResolvedValue({
         id: 'n-1',
         used: false,
@@ -123,29 +129,59 @@ describe('AuthService', () => {
       });
     });
 
-    it('throws UnauthorizedException on invalid signature', async () => {
-      prisma.walletNonce.findFirst.mockResolvedValue({
-        id: 'n-1',
-        used: false,
-        expiresAt: new Date(Date.now() + 60_000),
-      });
+    it('throws UnauthorizedException on invalid signature without burning the nonce', async () => {
       walletService.verifySignature.mockReturnValue(false);
 
       await expect(
         service.verifyWallet('GABC', 'nonce', 'sig'),
       ).rejects.toThrow(UnauthorizedException);
 
+      expect(prisma.walletNonce.updateMany).not.toHaveBeenCalled();
       expect(prisma.user.upsert).not.toHaveBeenCalled();
     });
 
-    it('marks nonce used, upserts user, and creates session on success', async () => {
+    it('mints exactly one session under concurrent identical verifications', async () => {
+      walletService.verifySignature.mockReturnValue(true);
+      // Simulate the DB: the first request claims the nonce, the second is too late.
+      prisma.walletNonce.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
       prisma.walletNonce.findFirst.mockResolvedValue({
         id: 'n-1',
-        used: false,
+        used: true,
         expiresAt: new Date(Date.now() + 60_000),
       });
+      prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
+      jwtService.sign.mockReturnValue('signed-token');
+      const exp = Math.floor(Date.now() / 1000) + 604800;
+      jwtService.decode.mockReturnValue({ exp });
+      prisma.session.create.mockResolvedValue({
+        id: 'session-1',
+        expiresAt: new Date(exp * 1000),
+      });
+
+      const results = await Promise.allSettled([
+        service.verifyWallet('GABC', 'nonce', 'sig'),
+        service.verifyWallet('GABC', 'nonce', 'sig'),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter(
+        (r): r is PromiseRejectedResult => r.status === 'rejected',
+      );
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0].reason as Error).message).toBe(
+        'Nonce has already been used - request a new challenge',
+      );
+      expect(prisma.session.create).toHaveBeenCalledTimes(1);
+      expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
+    });
+
+    it('claims the nonce atomically, then upserts user and creates session on success', async () => {
       walletService.verifySignature.mockReturnValue(true);
-      prisma.walletNonce.update.mockResolvedValue({});
+      prisma.walletNonce.updateMany.mockResolvedValue({ count: 1 });
       prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
       jwtService.sign.mockReturnValue('signed-token');
       const exp = Math.floor(Date.now() / 1000) + 604800;
@@ -157,8 +193,13 @@ describe('AuthService', () => {
 
       const result = await service.verifyWallet('GABC', 'nonce', 'sig');
 
-      expect(prisma.walletNonce.update).toHaveBeenCalledWith({
-        where: { id: 'n-1' },
+      expect(prisma.walletNonce.updateMany).toHaveBeenCalledWith({
+        where: {
+          walletAddress: 'GABC',
+          nonce: 'nonce',
+          used: false,
+          expiresAt: { gt: expect.any(Date) as Date },
+        },
         data: { used: true },
       });
       expect(prisma.user.upsert).toHaveBeenCalledWith({

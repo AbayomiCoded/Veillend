@@ -1,201 +1,74 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
-import { HorizonService } from '../stellar/horizon.service';
-import { IndexerRepository } from '../indexer/indexer.repository';
-import { ServiceResponse } from '../stellar/types';
-
-export interface TransactionRecord {
-  id: string;
-  type: 'deposit' | 'withdraw' | 'borrow' | 'repay' | 'transfer';
-  amount: number;
-  asset: string;
-  timestamp: string;
-  status: string;
-  txHash: string;
-  ledger?: number;
-}
-
-export interface GetTransactionsOptions {
-  cursor?: string;
-  limit?: number;
-}
-
-export interface PaginatedTransactionsResponse {
-  records: TransactionRecord[];
-  nextCursor: string | null;
-}
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { PageDto } from '../common/dto/page.dto';
+import { PageMetaDto } from '../common/dto/page-meta.dto';
+import { formatRawAmount } from '../common/utils/format-raw-amount';
+import { GetTransactionsQueryDto } from './dto/get-transactions-query.dto';
+import { TransactionRecordDto } from './dto/transaction-record.dto';
 
 @Injectable()
 export class TransactionsService {
   private readonly logger = new Logger(TransactionsService.name);
 
-  constructor(
-    private readonly horizonService: HorizonService,
-    private readonly indexerRepository: IndexerRepository,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
+  /**
+   * Reads the indexer's TransactionHistory table, which is derived from
+   * classified Soroban protocol events, rather than raw Horizon transaction
+   * history (which included unrelated ops like `change_trust`).
+   */
   async getTransactions(
     walletAddress: string,
-    options?: GetTransactionsOptions,
-  ): Promise<ServiceResponse<PaginatedTransactionsResponse>> {
-    try {
-      const limit =
-        typeof options?.limit === 'number' && !isNaN(options.limit)
-          ? Math.min(Math.max(Math.floor(options.limit), 1), 200)
-          : 50;
+    query: GetTransactionsQueryDto,
+  ): Promise<PageDto<TransactionRecordDto>> {
+    const user = await this.prisma.user.findUnique({
+      where: { walletAddress },
+    });
 
-      let cursorPayload: { timestamp: string; id: string } | null = null;
-      if (options?.cursor) {
-        try {
-          const json = Buffer.from(options.cursor, 'base64').toString('utf8');
-          const parsed = JSON.parse(json) as unknown;
-          if (
-            parsed &&
-            typeof parsed === 'object' &&
-            'timestamp' in parsed &&
-            'id' in parsed &&
-            typeof (parsed as Record<string, unknown>).timestamp === 'string' &&
-            typeof (parsed as Record<string, unknown>).id === 'string' &&
-            !isNaN(
-              Date.parse(
-                (parsed as Record<string, unknown>).timestamp as string,
-              ),
-            )
-          ) {
-            cursorPayload = parsed as { timestamp: string; id: string };
-          } else {
-            throw new Error('Invalid cursor structure');
-          }
-        } catch {
-          throw new BadRequestException('Invalid cursor');
-        }
-      }
-
-      // Fetch authoritative protocol transactions from Indexer repository
-      const indexerTxs =
-        await this.indexerRepository.getTransactions(walletAddress);
-      const indexerRecords: TransactionRecord[] = indexerTxs.map((tx) => ({
-        id: tx.id,
-        type: tx.type,
-        amount: parseFloat(tx.amount) || 0,
-        asset: tx.assetAddress,
-        timestamp: tx.timestamp,
-        status: 'success',
-        txHash: tx.txHash,
-        ledger: tx.ledger,
-      }));
-
-      const indexerTxHashes = new Set(
-        indexerRecords.map((r) => r.txHash).filter(Boolean),
+    if (!user) {
+      throw new NotFoundException(
+        `No indexed data found for wallet ${walletAddress}`,
       );
-
-      // Fetch raw Horizon payments/transfers as fallback on-chain activity
-      let horizonRecords: TransactionRecord[] = [];
-      try {
-        const client = this.horizonService.getClient();
-        const txs = await client
-          .transactions()
-          .forAccount(walletAddress)
-          .limit(200)
-          .order('desc')
-          .call();
-
-        horizonRecords = txs.records
-          .filter((tx) => !indexerTxHashes.has(tx.hash))
-          .map((tx) => {
-            let type: TransactionRecord['type'] = 'transfer';
-            let amount = 0;
-            let asset = 'XLM';
-
-            if (tx.operations && tx.operations.length > 0) {
-              const op = tx.operations[0] as Record<string, unknown>;
-              const opType = op.type as string | undefined;
-              if (opType === 'payment') {
-                type = 'transfer';
-                const rawAmount = op.amount;
-                amount =
-                  typeof rawAmount === 'string' ? parseFloat(rawAmount) : 0;
-                const rawAssetCode = op.asset_code;
-                asset = typeof rawAssetCode === 'string' ? rawAssetCode : 'XLM';
-              }
-            }
-
-            return {
-              id: tx.id,
-              type,
-              amount,
-              asset,
-              timestamp: tx.created_at,
-              status: tx.successful ? 'success' : 'failed',
-              txHash: tx.hash,
-            };
-          });
-      } catch (horizonError: unknown) {
-        const msg =
-          horizonError instanceof Error
-            ? horizonError.message
-            : String(horizonError);
-        this.logger.warn(
-          `Horizon transactions lookup omitted/failed for ${walletAddress}: ${msg}`,
-        );
-      }
-
-      // Merge indexer rows and non-duplicate Horizon rows
-      const merged = [...indexerRecords, ...horizonRecords];
-
-      // Enforce stable sort key: (timestamp DESC, id ASC)
-      merged.sort((a, b) => {
-        const timeA = new Date(a.timestamp).getTime();
-        const timeB = new Date(b.timestamp).getTime();
-        if (timeB !== timeA) {
-          return timeB - timeA;
-        }
-        return a.id.localeCompare(b.id);
-      });
-
-      // Apply cursor filtering if provided
-      let filtered = merged;
-      if (cursorPayload) {
-        const cTime = new Date(cursorPayload.timestamp).getTime();
-        filtered = merged.filter((item) => {
-          const itemTime = new Date(item.timestamp).getTime();
-          if (itemTime < cTime) return true;
-          if (itemTime === cTime && item.id > cursorPayload.id) return true;
-          return false;
-        });
-      }
-
-      const hasMore = filtered.length > limit;
-      const pageRecords = hasMore ? filtered.slice(0, limit) : filtered;
-
-      let nextCursor: string | null = null;
-      if (hasMore && pageRecords.length > 0) {
-        const last = pageRecords[pageRecords.length - 1];
-        nextCursor = Buffer.from(
-          JSON.stringify({ timestamp: last.timestamp, id: last.id }),
-          'utf8',
-        ).toString('base64');
-      }
-
-      return {
-        success: true,
-        data: {
-          records: pageRecords,
-          nextCursor,
-        },
-      };
-    } catch (error: unknown) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-      const message =
-        error instanceof Error ? error.message : 'Failed to fetch transactions';
-      this.logger.warn(
-        `Transaction fetch failed for ${walletAddress}: ${message}`,
-      );
-      return {
-        success: false,
-        error: { message, code: 'TRANSACTIONS_FETCH_ERROR', rawError: error },
-      };
     }
+
+    const where = {
+      userId: user.id,
+      ...(query.type ? { type: query.type } : {}),
+    };
+
+    const [records, itemCount] = await Promise.all([
+      this.prisma.transactionHistory.findMany({
+        where,
+        include: { asset: true },
+        take: query.take,
+        skip: query.skip,
+        orderBy: {
+          createdAt: query.order.toLowerCase() as 'asc' | 'desc',
+        },
+      }),
+      this.prisma.transactionHistory.count({ where }),
+    ]);
+
+    const data: TransactionRecordDto[] = records.map((tx) => ({
+      id: tx.id,
+      type: tx.type,
+      status: tx.status,
+      amount: formatRawAmount(tx.amountRaw, tx.asset.decimals),
+      amountUsd: Number(tx.amountUsd),
+      assetCode: tx.asset.code,
+      assetSymbol: tx.asset.symbol,
+      txHash: tx.txHash,
+      ledgerSequence: tx.ledgerSequence,
+      sorobanEventId: tx.sorobanEventId,
+      createdAt: tx.createdAt,
+      confirmedAt: tx.confirmedAt,
+    }));
+
+    this.logger.debug(
+      `Fetched ${data.length}/${itemCount} transaction(s) for ${walletAddress}`,
+    );
+
+    const pageMetaDto = new PageMetaDto({ pageOptionsDto: query, itemCount });
+    return new PageDto(data, pageMetaDto);
   }
 }

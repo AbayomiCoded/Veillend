@@ -22,6 +22,9 @@ import { WalletConnect } from "@/components/WalletConnect"
 import { WalletStatus } from "@/components/WalletStatus"
 import { ActionTray } from "@/components/ActionTray"
 
+export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
+
 export default function VeilLendDashboard() {
   const { isConnected, isAuthenticated, address } = useWallet();
   // Global simulation states to demonstrate acceptance criteria loading/empty loops

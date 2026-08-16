@@ -61,46 +61,16 @@ export class AuthService {
    * Verify a signed nonce and issue a session.
    *
    * Replay protection:
-   *  1. The nonce must exist in the DB for this wallet address.
-   *  2. The nonce must not have been used before.
-   *  3. The nonce must not have expired.
-   *  4. The signature over the nonce must be valid.
-   *  5. The nonce is atomically marked as used.
+   *  1. The signature over the nonce must be valid (invalid signatures do
+   *     not burn nonces).
+   *  2. The nonce is claimed with a single atomic conditional update that
+   *     gates on `used = false AND expiresAt > NOW`. Under concurrency only
+   *     one request can claim the nonce; the rest observe zero affected rows
+   *     and are rejected.
+   *  3. A claimed nonce is used to upsert the user and create a session.
    */
   async verifyWallet(walletAddress: string, nonce: string, signature: string) {
-    // 1. Look up the nonce
-    const storedNonce = await this.prisma.walletNonce.findFirst({
-      where: { walletAddress, nonce },
-      orderBy: { expiresAt: 'desc' },
-    });
-
-    if (!storedNonce) {
-      this.logger.warn(`Verify failed: unknown nonce for ${walletAddress}`);
-      throw new UnauthorizedException('Invalid or unknown nonce');
-    }
-
-    // 2. Check one-time-use
-    if (storedNonce.used) {
-      this.logger.warn(
-        `Replay attempt detected for ${walletAddress} (nonce already used)`,
-      );
-      throw new UnauthorizedException(
-        'Nonce has already been used - request a new challenge',
-      );
-    }
-
-    // 3. Check expiry
-    if (new Date() > storedNonce.expiresAt) {
-      this.logger.warn(`Expired nonce presented for ${walletAddress}`);
-      // Mark it used so it can't be retried even if the clock changes
-      await this.prisma.walletNonce.update({
-        where: { id: storedNonce.id },
-        data: { used: true },
-      });
-      throw new GoneException('Nonce has expired - request a new challenge');
-    }
-
-    // 4. Verify the wallet signature
+    // 1. Signature must be valid before we consume the nonce.
     const valid = this.walletService.verifySignature(
       walletAddress,
       nonce,
@@ -108,16 +78,27 @@ export class AuthService {
     );
 
     if (!valid) {
+      this.logger.warn(`Verify failed: invalid signature for ${walletAddress}`);
       throw new UnauthorizedException('Invalid wallet signature');
     }
 
-    // 5. Atomically mark the nonce as used
-    await this.prisma.walletNonce.update({
-      where: { id: storedNonce.id },
+    // 2. Atomically claim the nonce. The WHERE clause is the authoritative
+    //    used/expiry gate, eliminating the TOCTOU race in a read-then-write.
+    const { count } = await this.prisma.walletNonce.updateMany({
+      where: {
+        walletAddress,
+        nonce,
+        used: false,
+        expiresAt: { gt: new Date() },
+      },
       data: { used: true },
     });
 
-    // 6. Upsert user & create session
+    if (count === 0) {
+      await this.handleNonceClaimFailure(walletAddress, nonce);
+    }
+
+    // 3. Upsert user & create session
     const user = await this.prisma.user.upsert({
       where: { walletAddress },
       create: { walletAddress },
@@ -146,6 +127,42 @@ export class AuthService {
       sessionId: session.id,
       expiresAt: session.expiresAt.toISOString(),
     };
+  }
+
+  /**
+   * Classify why an atomic nonce claim affected zero rows and throw the
+   * appropriate error. Runs only after the atomic update, so it is purely
+   * diagnostic — it never gates authentication.
+   */
+  private async handleNonceClaimFailure(
+    walletAddress: string,
+    nonce: string,
+  ): Promise<never> {
+    const storedNonce = await this.prisma.walletNonce.findFirst({
+      where: { walletAddress, nonce },
+      orderBy: { expiresAt: 'desc' },
+    });
+
+    if (!storedNonce) {
+      this.logger.warn(`Verify failed: unknown nonce for ${walletAddress}`);
+      throw new UnauthorizedException('Invalid or unknown nonce');
+    }
+
+    if (storedNonce.used) {
+      this.logger.warn(
+        `Replay attempt detected for ${walletAddress} (nonce already used)`,
+      );
+      throw new UnauthorizedException(
+        'Nonce has already been used - request a new challenge',
+      );
+    }
+
+    // Expired — mark it used so it can't be retried even if the clock changes.
+    await this.prisma.walletNonce.update({
+      where: { id: storedNonce.id },
+      data: { used: true },
+    });
+    throw new GoneException('Nonce has expired - request a new challenge');
   }
 
   /**
@@ -189,12 +206,10 @@ export class AuthService {
       await this.prisma.session.delete({ where: { id: sessionId } });
     } catch (error) {
       // Already revoked/gone - logout is idempotent. Anything else is a real failure.
-      if (
-        !(
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === 'P2025'
-        )
-      ) {
+      if (!(
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2025'
+      )) {
         throw error;
       }
     }

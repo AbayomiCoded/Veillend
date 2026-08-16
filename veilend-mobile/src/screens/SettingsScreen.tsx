@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -13,7 +13,6 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { useStore } from '../store/store';
-import { MOCK_USER } from '../data/mockData';
 import { shortenAddress } from '../utils/helpers';
 import Toast from '../utils/toast';
 import { WalletExportModal } from '../components/WalletExportModal';
@@ -41,11 +40,17 @@ export default function SettingsScreen({ navigation }: any) {
   const { secretKey, isBackupConfirmed } = useWalletSecurity();
   const [showExportModal, setShowExportModal] = useState(false);
 
-  const defaultUsername = address ? shortenAddress(address) : MOCK_USER.name;
+  const defaultUsername = address ? shortenAddress(address) : 'Guest';
   const username = profileName ?? defaultUsername;
   const avatarUri = profileImage ?? DEFAULT_PROFILE_IMAGE;
 
   const [tempName, setTempName] = useState(username);
+
+  // Keep the editor in sync when the store's profileName changes (e.g. after
+  // saveUsername) so dependent screens always read the same value.
+  useEffect(() => {
+    setTempName(username);
+  }, [username]);
 
   const pickImage = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
