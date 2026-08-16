@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { fetchDashboardData } from '@/lib/api/dashboard';
 import type { ActivityEvent, AssetBalance, DashboardData } from '@/lib/types/dashboard';
+import { HfBreakdownTooltip } from './hf-breakdown-tooltip';
 
 type DashboardResult =
   | { data: DashboardData; error: null }
@@ -96,18 +97,17 @@ export async function TotalBorrowedCard({ walletAddress }: { walletAddress: stri
   const result = await getDashboardResult(walletAddress);
   if (!result.data) return <CardError message={result.error} />;
 
-  const { healthFactor, totalBorrowedUsd } = result.data.portfolio;
+  const { healthFactor, totalBorrowedUsd, hfBreakdown, hfWarning } = result.data.portfolio;
   return (
     <Card>
       <CardHeader>
         <Flex justify="between" align="center">
           <CardTitle>Total Borrowed</CardTitle>
-          <Badge
-            variant={healthFactor < 1.1 && healthFactor !== Infinity ? 'destructive' : 'secondary'}
-            className={healthFactor >= 1.1 || healthFactor === Infinity ? 'bg-emerald-500/10 text-emerald-400' : undefined}
-          >
-            Health: {formatHealthFactor(healthFactor)}
-          </Badge>
+          <HfBreakdownTooltip
+            healthFactor={healthFactor}
+            hfBreakdown={hfBreakdown}
+            hfWarning={hfWarning}
+          />
         </Flex>
       </CardHeader>
       <CardContent>
@@ -170,13 +170,28 @@ async function AssetRow({
   return (
     <Flex justify="between" align="center" className="py-2 border-b border-border last:border-0">
       <Flex gap="md" align="center">
-        <div className={`flex h-10 w-10 items-center justify-center rounded-full font-bold ${borrowed ? 'bg-error/10 text-error' : 'bg-primary/10 text-primary'}`}>
-          {asset.assetSymbol.charAt(0)}
-        </div>
+        {/* Asset logo or initial badge */}
+        {asset.logoUrl ? (
+          <img
+            src={asset.logoUrl}
+            alt={asset.assetSymbol}
+            className="h-10 w-10 rounded-full object-cover"
+          />
+        ) : (
+          <div className={`flex h-10 w-10 items-center justify-center rounded-full font-bold ${borrowed ? 'bg-error/10 text-error' : 'bg-primary/10 text-primary'}`}>
+            {asset.assetSymbol.charAt(0)}
+          </div>
+        )}
         <div>
           <div className="font-semibold text-text">{asset.assetName}</div>
-          <div className="text-sm text-text-secondary">
+          <div
+            className="text-sm text-text-secondary"
+            title={asset.decimals !== undefined ? `${asset.assetSymbol} (${asset.decimals} decimals)` : undefined}
+          >
             {asset.balance.toLocaleString(undefined, { maximumFractionDigits: 4 })} {asset.assetSymbol}
+            {asset.decimals !== undefined && (
+              <span className="ml-1 text-xs opacity-50">({asset.decimals})</span>
+            )}
           </div>
         </div>
       </Flex>

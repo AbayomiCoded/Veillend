@@ -55,6 +55,7 @@ model Asset {
   logoUrl       String?
   isNative      Boolean  @default(false)
   isSupported   Boolean  @default(false)     // set by the indexer's 'asset_configured' event
+  minCollateralRatio Float?                    // per-asset LTV (0–1); null uses protocol default
   createdAt     DateTime @default(now())
 
   positions     Position[]
