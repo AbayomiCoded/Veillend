@@ -51,7 +51,7 @@
     "expo-doctor": "1.20.1",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.3.2",
-    "tsx": "^4.22.4",
+    "tsx": "^4.23.12",
     "typescript": "^5.9.3"
   }
 }
