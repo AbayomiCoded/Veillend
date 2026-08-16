@@ -18,6 +18,7 @@ import { ConfigureAssetDto } from './dto/configure-asset.dto';
 import { SetOraclePriceDto } from './dto/set-oracle-price.dto';
 import { SetMinCollateralRatioDto } from './dto/set-min-collateral-ratio.dto';
 import { AddAdminDto } from './dto/add-admin.dto';
+import { WalletAddressParamDto } from '../common/dto/wallet-address-param.dto';
 import { PageOptionsDto } from '../common/dto/page-options.dto';
 import type { Request } from 'express';
 
@@ -44,7 +45,7 @@ export class AdminController {
 
   @Delete('admins/:walletAddress')
   async removeAdmin(
-    @Param('walletAddress') walletAddress: string,
+    @Param() { walletAddress }: WalletAddressParamDto,
     @Req() req: RequestWithUser,
   ) {
     return await this.adminService.removeAdmin(
