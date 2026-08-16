@@ -71,6 +71,7 @@ export function useDashboardStore(initialData?: DashboardData | null): UseDashbo
             depositedAssets: [],
             borrowedAssets: [],
             lastUpdated: timestamp,
+            hfBreakdown: [],
           };
           prevData = { portfolio: emptyPortfolio, recentActivity: [] };
         }
