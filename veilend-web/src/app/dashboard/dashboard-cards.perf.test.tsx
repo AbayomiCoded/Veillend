@@ -23,6 +23,7 @@ const dashboardData: DashboardData = {
     depositedAssets: [{ assetSymbol: 'USDC', assetName: 'USD Coin', balance: 2000, usdValue: 2000 }],
     borrowedAssets: [],
     lastUpdated: new Date().toISOString(),
+    hfBreakdown: [],
   },
   recentActivity: [],
 };
