@@ -20,7 +20,7 @@ export const ActionInputSchema = z.object({
   userAddress: StellarAddressSchema,
   assetSymbol: AssetSymbolSchema,
   assetAddress: z.string().min(1, 'Asset address is required'),
-  amount: z.number({ invalid_type_error: 'Amount must be a number' }).positive('Amount must be greater than zero'),
+  amount: z.number({ message: 'Amount must be a number' }).positive('Amount must be greater than zero'),
   availableBalance: z.number().min(0, 'Available balance cannot be negative'),
   depositedBalance: z.number().min(0).optional(),
   borrowedBalance: z.number().min(0).optional(),
