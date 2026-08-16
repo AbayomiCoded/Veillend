@@ -4,6 +4,7 @@ import { useStore, TransactionRecord } from '../store/store';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { shortenAddress, getCurrencySymbol } from '../utils/helpers';
+import { navigationRef } from '../navigation';
 import ProtocolStatusBanners from '../components/ProtocolStatusBanners';
 import { ListSkeleton } from '../components/Skeletons';
 
@@ -67,7 +68,9 @@ export default function DashboardScreen({ navigation }: any) {
   const handleLogout = () => {
     setProfileVisible(false);
     logout();
-    navigation.replace('ConnectWallet');
+    // Fully reset the navigation stack to avoid navigator-scope issues
+    // (ConnectWallet lives on the root stack, not inside the tab navigator).
+    navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
   };
 
   const handleStatusRetry = () => {
