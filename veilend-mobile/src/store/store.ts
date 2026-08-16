@@ -277,6 +277,9 @@ export const useStore = create<StoreState>(
         currency: 'USD',
         notificationsEnabled: true,
         sessionRestored: true,
+        authLoading: false,
+        lendingLoading: false,
+        shieldedLoading: false,
       });
       // Clear ALL persisted keys to prevent stale data on next launch
       try {
@@ -288,6 +291,7 @@ export const useStore = create<StoreState>(
         SecureStore.deleteItemAsync(PERSIST_KEYS.secretKey);
         SecureStore.deleteItemAsync(PERSIST_KEYS.currency);
         SecureStore.deleteItemAsync(PERSIST_KEYS.notificationsEnabled);
+        SecureStore.deleteItemAsync(PERSIST_KEYS.backupConfirmed);
       } catch (e) {
         // ignore persistence errors
       }
