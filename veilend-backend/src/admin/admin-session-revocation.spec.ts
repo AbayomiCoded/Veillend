@@ -122,7 +122,7 @@ describe('Admin Session Revocation Integration', () => {
     // Verify that JwtStrategy.validate() throws UnauthorizedException
 
     await expect(
-      jwtStrategy.validate(mockRequest, {
+      jwtStrategy.validate(mockRequest as never, {
         walletAddress: adminWallet,
         sub: mockUser.id,
       }),

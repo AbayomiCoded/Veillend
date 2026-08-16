@@ -29,7 +29,7 @@ export class AdminService {
           actorWallet,
           action: AdminAction.ADD_ADMIN,
           target: dto.walletAddress,
-          payload: dto,
+          payload: { walletAddress: dto.walletAddress },
         },
       });
 
