@@ -1,10 +1,11 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, ScrollView, StyleSheet, TouchableOpacity, Image, Modal, TouchableWithoutFeedback, Keyboard, Dimensions, FlatList, ActivityIndicator } from 'react-native';
+import { View, Text, ScrollView, StyleSheet, TouchableOpacity, Image, Modal, TouchableWithoutFeedback, Keyboard, Dimensions, FlatList, ActivityIndicator, RefreshControl } from 'react-native';
 import { useStore, TransactionRecord } from '../store/store';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { shortenAddress, getCurrencySymbol } from '../utils/helpers';
 import ProtocolStatusBanners from '../components/ProtocolStatusBanners';
+import OfflineBanner from '../components/OfflineBanner';
 import { ListSkeleton } from '../components/Skeletons';
 
 const { width } = Dimensions.get('window');
@@ -38,9 +39,13 @@ export default function DashboardScreen({ navigation }: any) {
     transactions,
     transactionsLoading,
     pendingTransactions,
+    refreshDashboard,
+    isOnline,
   } = useStore();
   const [initialLoad, setInitialLoad] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshAbortRef = useRef<AbortController | null>(null);
   const allTransactions = [...pendingTransactions, ...transactions];
   
   // Profile Menu State
@@ -89,6 +94,26 @@ export default function DashboardScreen({ navigation }: any) {
     // and transactions are fetched concurrently by the store.
     hydrateDashboard().finally(() => setInitialLoad(false));
   }, []);
+
+  // Cancel any in-flight pull-to-refresh work when the screen unmounts.
+  useEffect(() => {
+    return () => refreshAbortRef.current?.abort();
+  }, []);
+
+  const handleRefresh = async () => {
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
+    setRefreshing(true);
+    try {
+      await refreshDashboard(controller.signal);
+    } catch (e) {
+      // refreshDashboard aggregates failures into dashboardError; keep the
+      // spinner from getting stuck if an unexpected error escapes.
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const ServiceButton = ({ icon, label, onPress }: any) => (
     <TouchableOpacity style={styles.serviceBtn} onPress={onPress}>
@@ -159,7 +184,18 @@ export default function DashboardScreen({ navigation }: any) {
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView
+      style={styles.container}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
+          tintColor="#A855F7"
+          colors={['#A855F7']}
+          progressBackgroundColor="#1A1A1A"
+        />
+      }
+    >
       {/* Header */}
       <View style={styles.header}>
         <View>
@@ -185,6 +221,7 @@ export default function DashboardScreen({ navigation }: any) {
         walletConnected={Boolean(address && authToken)}
         lastSyncedAt={lastProtocolSyncAt}
         isRefreshing={protocolStatusLoading}
+        isOnline={isOnline}
         onReconnect={handleLogout}
         onRetrySync={handleStatusRetry}
       />
@@ -215,6 +252,7 @@ export default function DashboardScreen({ navigation }: any) {
           <View style={styles.modalOverlay}>
             <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
               <View style={styles.modalContent}>
+                <OfflineBanner />
                 <View style={styles.modalHeader}>
                   <Text style={styles.modalTitle}>Profile</Text>
                   <TouchableOpacity onPress={() => setProfileVisible(false)}>

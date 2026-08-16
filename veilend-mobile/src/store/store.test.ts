@@ -34,6 +34,9 @@ beforeEach(async () => {
     shieldedLoading: false,
     currentNetwork: 'testnet',
     lastProtocolSyncAt: null,
+    isOnline: true,
+    networkType: null,
+    isInternetReachable: null,
     balance: 0,
     collateralValue: 0,
     borrowedValue: 0,
@@ -64,9 +67,7 @@ describe('Backend-backed dashboard data (issue #315)', () => {
     assert.equal(Array.isArray(s.supportedAssets), true);
     assert.equal(Array.isArray(s.positions), true);
     assert.equal(Array.isArray(s.pendingTransactions), true);
-  });
-
-  it('hydrateDashboard is a no-op without a connected wallet', async () => {
+  });  it('hydrateDashboard is a no-op without a connected wallet', async () => {
     useStore.setState({ address: null });
     await useStore.getState().hydrateDashboard();
     const s = useStore.getState();
@@ -307,5 +308,94 @@ describe('shieldedLoading state (issue #59)', () => {
   it('should have shieldedLoading in store for App.tsx', () => {
     assert.equal(typeof useStore.getState().shieldedLoading, 'boolean');
     assert.equal(useStore.getState().shieldedLoading, false);
+  });
+});
+
+describe('Network state (issue #304)', () => {
+  it('defaults to online before NetInfo resolves', () => {
+    const s = useStore.getState();
+    assert.equal(s.isOnline, true);
+    assert.equal(s.networkType, null);
+    assert.equal(s.isInternetReachable, null);
+  });
+
+  it('setNetworkState writes the connectivity snapshot', () => {
+    useStore.getState().setNetworkState({
+      isOnline: false,
+      networkType: 'wifi',
+      isInternetReachable: false,
+    });
+    const s = useStore.getState();
+    assert.equal(s.isOnline, false);
+    assert.equal(s.networkType, 'wifi');
+    assert.equal(s.isInternetReachable, false);
+  });
+});
+
+describe('refreshDashboard (issue #304)', () => {
+  it('exposes the refreshDashboard action', () => {
+    assert.equal(typeof useStore.getState().refreshDashboard, 'function');
+  });
+
+  it('is a no-op without a connected wallet', async () => {
+    let getCalls = 0;
+    (api as any).get = async () => {
+      getCalls += 1;
+      return { data: {} };
+    };
+    useStore.setState({ address: null });
+    await useStore.getState().refreshDashboard();
+    assert.equal(getCalls, 0);
+    assert.equal(useStore.getState().dashboardLoading, false);
+  });
+
+  it('refetches portfolio and transactions concurrently', async () => {
+    const calls: string[] = [];
+    (api as any).get = async (url: string) => {
+      calls.push(url);
+      return { data: {} };
+    };
+    useStore.setState({ address: 'GABC123', authToken: 'tok' });
+    await useStore.getState().refreshDashboard();
+    assert.deepEqual(calls.sort(), [
+      '/portfolios/GABC123',
+      '/transactions/GABC123',
+    ]);
+    const s = useStore.getState();
+    assert.equal(s.dashboardLoading, false);
+    assert.equal(s.dashboardError, null);
+  });
+
+  it('aggregates failures into dashboardError', async () => {
+    (api as any).get = async () => {
+      throw new Error('boom');
+    };
+    useStore.setState({ address: 'GABC123', authToken: 'tok' });
+    await useStore.getState().refreshDashboard();
+    const s = useStore.getState();
+    assert.equal(s.dashboardLoading, false);
+    assert.ok(s.dashboardError && s.dashboardError.includes('boom'));
+  });
+
+  it('clears in-flight work when the AbortSignal fires', async () => {
+    useStore.setState({ address: 'GABC123', authToken: 'tok' });
+    let aborted = false;
+    (api as any).get = (_url: string, config?: any) =>
+      new Promise((_resolve, reject) => {
+        config?.signal?.addEventListener?.('abort', () => {
+          aborted = true;
+          const e: any = new Error('canceled');
+          e.name = 'CanceledError';
+          reject(e);
+        });
+      });
+    const controller = new AbortController();
+    const refresh = useStore.getState().refreshDashboard(controller.signal);
+    controller.abort();
+    await refresh;
+    assert.equal(aborted, true);
+    const s = useStore.getState();
+    assert.equal(s.dashboardLoading, false);
+    assert.equal(s.dashboardError, null);
   });
 });
