@@ -1,6 +1,7 @@
-use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::events::Event;
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::{Address, Env};
-use veillend_contract::{VeilLendContract, VeilLendContractClient};
+use veillend_contract::{InterestAccrued, VeilLendContract, VeilLendContractClient};
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
 const DEFAULT_TIMELOCK: u32 = 50;
@@ -512,6 +513,72 @@ fn test_two_accrual_calls_at_same_timestamp_are_idempotent() {
     assert_eq!(
         client.get_total_borrowed(&asset),
         total_borrowed_after_first
+    );
+}
+
+#[test]
+fn test_interest_accrued_event_emission_and_values() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &1_000_000);
+    client.borrow(&user, &asset, &asset, &500_000);
+
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger()
+        .set_timestamp(ledger_timestamp + SECONDS_PER_YEAR);
+
+    client.accrue_interest(&asset);
+
+    // 50% utilization: borrow_rate = 12% APR, supply_rate = 6% APR. After one
+    // year the borrow index grows 1.0 -> 1.12 and the supply index grows
+    // 1.0 -> 1.06, accruing 60_000 to both borrowers and suppliers.
+    let expected = InterestAccrued {
+        asset: asset.clone(),
+        interest_to_suppliers: 60_000,
+        interest_to_borrowers: 60_000,
+        supply_index_before: 1_000_000_000,
+        borrow_index_before: 1_000_000_000,
+        supply_index_after: 1_060_000_000,
+        borrow_index_after: 1_120_000_000,
+        timestamp: ledger_timestamp + SECONDS_PER_YEAR,
+    };
+    let expected_topics = expected.topics(&env);
+    let expected_data = expected.data(&env);
+
+    let events = env.events().all();
+    let mut interest_accrued_count = 0u32;
+    for (_, topics, data) in events.iter() {
+        if topics == expected_topics && data == expected_data {
+            interest_accrued_count += 1;
+        }
+    }
+    assert_eq!(
+        interest_accrued_count, 1,
+        "expected exactly one InterestAccrued event with matching values"
+    );
+
+    // A second accrual at the same timestamp accrues zero interest, so the
+    // guard must skip storage writes and emit no InterestAccrued event.
+    client.accrue_interest(&asset);
+
+    let second_events = env.events().all();
+    let mut second_interest_accrued_count = 0u32;
+    for (_, topics, data) in second_events.iter() {
+        if topics == expected_topics && data == expected_data {
+            second_interest_accrued_count += 1;
+        }
+    }
+    assert_eq!(
+        second_interest_accrued_count, 0,
+        "no InterestAccrued event should be emitted when interest is zero"
     );
 }
 

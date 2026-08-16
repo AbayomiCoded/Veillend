@@ -324,6 +324,20 @@ pub struct AssetReserveUpdated {
     pub kind: ReserveUpdateKind,
 }
 
+#[contractevent(topics = ["veillend", "interest_accrued"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterestAccrued {
+    #[topic]
+    pub asset: Address,
+    pub interest_to_suppliers: i128,
+    pub interest_to_borrowers: i128,
+    pub supply_index_before: i128,
+    pub borrow_index_before: i128,
+    pub supply_index_after: i128,
+    pub borrow_index_after: i128,
+    pub timestamp: u64,
+}
+
 #[contractevent(topics = ["veillend", "admin_added"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminAdded {
@@ -1655,9 +1669,29 @@ impl VeilLendContract {
     /// against up-to-date totals and totals never drift from reality.
     fn accrue_and_persist_interest(env: &Env, asset: &Address) -> InterestState {
         let state = Self::read_interest_state(env, asset);
+        let now = env.ledger().timestamp();
+
+        // Explicit idempotency guard: when the ledger clock has not advanced
+        // since the last *persisted* accrual there is nothing to accrue. Return
+        // the stored state without touching storage so repeated same-timestamp
+        // calls produce no writes and no InterestAccrued events.
+        //
+        // The guard only applies to an already-persisted state. A missing
+        // InterestState entry anchors `last_accrual_timestamp` at `now` (see
+        // `read_interest_state`); on that first touch we deliberately fall
+        // through and persist the anchor below, otherwise every later call
+        // would keep re-anchoring to the current time and interest would never
+        // accrue.
+        let already_persisted = env
+            .storage()
+            .persistent()
+            .has(&DataKey::InterestState(asset.clone()));
+        if already_persisted && now <= state.last_accrual_timestamp {
+            return state;
+        }
+
         let total_supplied = Self::get_total_deposited(env.clone(), asset.clone());
         let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
-        let now = env.ledger().timestamp();
 
         let result = interest::compute_accrual(&state, total_supplied, total_borrowed, now);
 
@@ -1681,6 +1715,24 @@ impl VeilLendContract {
                 &DataKey::TotalBorrowed(asset.clone()),
                 &(total_borrowed + result.interest_to_borrowers),
             );
+        }
+
+        // Publish a per-asset interest accrual event only when interest
+        // actually accrued, so indexers and portfolio dashboards can attribute
+        // interest to a specific asset and ledger. Zero-interest accruals
+        // (no elapsed time, or no utilization) emit nothing.
+        if result.interest_to_suppliers != 0 || result.interest_to_borrowers != 0 {
+            InterestAccrued {
+                asset: asset.clone(),
+                interest_to_suppliers: result.interest_to_suppliers,
+                interest_to_borrowers: result.interest_to_borrowers,
+                supply_index_before: state.supply_index,
+                borrow_index_before: state.borrow_index,
+                supply_index_after: result.state.supply_index,
+                borrow_index_after: result.state.borrow_index,
+                timestamp: now,
+            }
+            .publish(env);
         }
 
         result.state
