@@ -85,6 +85,9 @@ pub enum DataKey {
     OracleMaxPrice(Address),
     /// Protocol-wide maximum oracle age in seconds
     MaxOracleAge,
+    /// Admin-configured upper bound on single-call protocol fees, in bps.
+    /// 0 (default / never set) means the bound is disabled.
+    MaxProtocolFeeBps,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +232,17 @@ pub enum VeilLendError {
     OraclePriceBelowMin = 25,
     /// Oracle price is above maximum allowed price
     OraclePriceAboveMax = 26,
+    /// Cannot disable an asset that still has active deposited or borrowed balances.
+    /// Disabling such an asset would permanently trap user funds because every
+    /// lending entrypoint calls require_supported_asset.
+    AssetHasActivePositions = 27,
+    /// Proposed cap is below the current outstanding total for that asset.
+    /// Setting a cap below the live total creates an immediately-violated
+    /// invariant and could block users from repaying or withdrawing.
+    CapBelowOutstanding = 28,
+    /// The requested protocol fee exceeds the admin-configured max_protocol_fee_bps
+    /// limit. Without this bound an admin could drain user funds disguised as fees.
+    ProtocolFeeExceedsLimit = 29,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -1078,6 +1092,37 @@ impl VeilLendContract {
         Self::cancel_action(&env, &admin, action_id, ActionKind::RecordProtocolFee);
     }
 
+    /// Sets the maximum protocol fee that may be recorded in a single
+    /// `record_protocol_fee` call, expressed as basis points of the asset's
+    /// net reserve (total_balance − protocol_fees).
+    ///
+    /// - `bps = 0` (the default if this function is never called) **disables**
+    ///   the bound entirely, preserving backward-compatible behaviour for any
+    ///   deployment that has not opted in to fee caps.
+    /// - Maximum settable value is 5000 (50 %).  Values above 5000 are rejected
+    ///   with `InvalidCap` (reusing the existing cap-validation error rather than
+    ///   introducing a new code for a closely related concept).
+    ///
+    /// This is an immediate (non-timelocked) admin-only setter, matching the
+    /// same pattern as `set_timelock_ledgers`.
+    pub fn set_max_protocol_fee_bps(env: Env, admin: Address, bps: u32) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        // 5000 bps = 50%; anything higher is treated as misconfiguration.
+        // InvalidCap is reused here (rather than a new error code) because this
+        // is semantically identical to setting an invalid asset cap: both are
+        // admin-supplied bounds that fall outside the allowed range.
+        const MAX_FEE_BPS: u32 = 5_000;
+        if bps > MAX_FEE_BPS {
+            panic_with_error!(&env, VeilLendError::InvalidCap);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxProtocolFeeBps, &bps);
+    }
+
     pub fn min_collateral_ratio_bps(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -1276,6 +1321,18 @@ impl VeilLendContract {
     }
 
     fn apply_configure_asset(env: &Env, admin: &Address, asset: &Address, supported: bool) {
+        // Guard: refuse to disable an asset that still has active user balances.
+        // If we allowed this, every lending entrypoint would call
+        // require_supported_asset and immediately panic, permanently trapping
+        // any funds deposited or borrowed against this asset.
+        if !supported {
+            let total_deposited = Self::get_total_deposited(env.clone(), asset.clone());
+            let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
+            if total_deposited != 0 || total_borrowed != 0 {
+                panic_with_error!(env, VeilLendError::AssetHasActivePositions);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::SupportedAsset(asset.clone()), &supported);
@@ -1398,6 +1455,25 @@ impl VeilLendContract {
         deposit_cap: i128,
         borrow_cap: i128,
     ) {
+        // Guard: refuse to set a cap below the current outstanding total.
+        // Setting deposit_cap < total_deposited (or borrow_cap < total_borrowed)
+        // creates an immediately-violated invariant: the protocol would report
+        // that users have more outstanding than the cap allows, and could block
+        // repayments or withdrawals indirectly.  -1 is the "unlimited" sentinel
+        // and is always allowed regardless of outstanding totals.
+        if deposit_cap != -1 {
+            let total_deposited = Self::get_total_deposited(env.clone(), asset.clone());
+            if deposit_cap < total_deposited {
+                panic_with_error!(env, VeilLendError::CapBelowOutstanding);
+            }
+        }
+        if borrow_cap != -1 {
+            let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
+            if borrow_cap < total_borrowed {
+                panic_with_error!(env, VeilLendError::CapBelowOutstanding);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::DepositCap(asset.clone()), &deposit_cap);
@@ -1435,6 +1511,26 @@ impl VeilLendContract {
         Self::accrue_and_persist_interest(env, asset);
 
         let mut reserve = Self::read_asset_reserve(env, asset);
+
+        // Guard: if the admin has configured a max_protocol_fee_bps cap, enforce
+        // it.  A value of 0 (the default) means the bound is disabled, preserving
+        // backward-compatible behaviour for deployments that never call
+        // set_max_protocol_fee_bps.  Without this guard an admin could record
+        // arbitrarily large "fees" that drain the net reserve and effectively
+        // steal deposited user funds.
+        let max_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxProtocolFeeBps)
+            .unwrap_or(0);
+        if max_bps != 0 {
+            let net_reserve = reserve.total_balance - reserve.protocol_fees;
+            let max_allowed = net_reserve * max_bps as i128 / 10_000;
+            if amount > max_allowed {
+                panic_with_error!(env, VeilLendError::ProtocolFeeExceedsLimit);
+            }
+        }
+
         reserve.total_balance += amount;
         reserve.protocol_fees += amount;
         Self::write_asset_reserve(env, asset, &reserve);
@@ -1736,6 +1832,9 @@ mod tests {
         assert_eq!(VeilLendError::OraclePriceChangeExceedsLimit as u32, 24);
         assert_eq!(VeilLendError::OraclePriceBelowMin as u32, 25);
         assert_eq!(VeilLendError::OraclePriceAboveMax as u32, 26);
+        assert_eq!(VeilLendError::AssetHasActivePositions as u32, 27);
+        assert_eq!(VeilLendError::CapBelowOutstanding as u32, 28);
+        assert_eq!(VeilLendError::ProtocolFeeExceedsLimit as u32, 29);
     }
 
     #[test]
@@ -1777,6 +1876,9 @@ mod tests {
             VeilLendError::OraclePriceChangeExceedsLimit as u32,
             VeilLendError::OraclePriceBelowMin as u32,
             VeilLendError::OraclePriceAboveMax as u32,
+            VeilLendError::AssetHasActivePositions as u32,
+            VeilLendError::CapBelowOutstanding as u32,
+            VeilLendError::ProtocolFeeExceedsLimit as u32,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
