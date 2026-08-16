@@ -123,11 +123,11 @@ fn test_update_asset_caps() {
     assert!(result.is_err());
 
     // Test borrow cap
-    client.borrow(&user, &asset, &500);
+    client.borrow(&user, &asset, &asset, &500);
     assert_eq!(client.get_total_borrowed(&asset), 500);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.borrow(&user, &asset, &1);
+        client.borrow(&user, &asset, &asset, &1);
     }));
     assert!(result.is_err());
 }
@@ -157,14 +157,14 @@ fn test_circuit_breaker_pause() {
 
     // Borrow should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.borrow(&user, &asset, &100);
+        client.borrow(&user, &asset, &asset, &100);
     }));
     assert!(result.is_err());
 
     // Unpause is immediate, then deposit and borrow
     client.set_paused(&admin, &false);
     client.deposit(&user, &asset, &1000);
-    client.borrow(&user, &asset, &500);
+    client.borrow(&user, &asset, &asset, &500);
     pause(&env, &client, &admin);
 
     // Repay should still work (user can reduce debt)
@@ -172,7 +172,7 @@ fn test_circuit_breaker_pause() {
     assert_eq!(client.get_total_borrowed(&asset), 0);
 
     // Withdraw should still work (user can remove collateral)
-    client.withdraw(&user, &asset, &1000);
+    client.withdraw(&user, &asset, &asset, &1000);
     assert_eq!(client.get_total_deposited(&asset), 0);
 }
 
@@ -233,16 +233,16 @@ fn test_deposit_and_borrow_with_caps() {
     assert!(result.is_err());
 
     // User1 borrows 500
-    client.borrow(&user1, &asset, &500);
+    client.borrow(&user1, &asset, &asset, &500);
     assert_eq!(client.get_total_borrowed(&asset), 500);
 
     // User2 borrows 500 (now at 1000 cap)
-    client.borrow(&user2, &asset, &500);
+    client.borrow(&user2, &asset, &asset, &500);
     assert_eq!(client.get_total_borrowed(&asset), 1000);
 
     // User2 tries to borrow more - should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.borrow(&user2, &asset, &1);
+        client.borrow(&user2, &asset, &asset, &1);
     }));
     assert!(result.is_err());
 }
@@ -268,7 +268,7 @@ fn test_unlimited_caps() {
     assert_eq!(client.get_total_deposited(&asset), 1000000);
 
     // Should be able to borrow large amounts (if collateral allows)
-    client.borrow(&user, &asset, &500000);
+    client.borrow(&user, &asset, &asset, &500000);
     assert_eq!(client.get_total_borrowed(&asset), 500000);
 }
 
@@ -352,7 +352,7 @@ fn test_deposit_then_borrow_then_time_advances_grows_debt_matching_formula() {
     // 50% utilization: borrow_rate = 200 + (5000 * 2000 / 10000) = 1200 bps (12% APR)
     // supply_rate = 1200 * 5000 / 10000 = 600 bps (6% APR)
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let ledger_timestamp = env.ledger().timestamp();
     env.ledger()
@@ -377,7 +377,7 @@ fn test_accrue_interest_grows_indexes_with_no_position_touch() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let before = client.get_interest_state(&asset);
     assert_eq!(before.supply_index, 1_000_000_000);
@@ -410,7 +410,7 @@ fn test_repay_and_withdraw_operate_on_accrued_amounts() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let ledger_timestamp = env.ledger().timestamp();
     env.ledger()
@@ -428,7 +428,7 @@ fn test_repay_and_withdraw_operate_on_accrued_amounts() {
     assert_eq!(position.borrowed, 0);
 
     // With no outstanding debt, the full accrued deposit can be withdrawn.
-    client.withdraw(&user, &asset, &1_060_000);
+    client.withdraw(&user, &asset, &asset, &1_060_000);
     let position = client.get_position(&user, &asset);
     assert_eq!(position.deposited, 0);
 }
@@ -458,7 +458,7 @@ fn test_conservation_of_value_between_suppliers_and_borrower() {
     // Borrower: deposits their own collateral, then borrows against it
     // (750_000 * 10_000 >= 500_000 * 15_000, exactly at the 150% minimum).
     client.deposit(&borrower, &asset, &750_000);
-    client.borrow(&borrower, &asset, &500_000);
+    client.borrow(&borrower, &asset, &asset, &500_000);
 
     let total_deposited_before = client.get_total_deposited(&asset);
     let total_borrowed_before = client.get_total_borrowed(&asset);
@@ -489,7 +489,7 @@ fn test_two_accrual_calls_at_same_timestamp_are_idempotent() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let ledger_timestamp = env.ledger().timestamp();
     env.ledger()
@@ -796,7 +796,7 @@ fn test_oracle_staleness_blocks_collateral_check() {
 
     // Deposit and borrow should work initially
     client.deposit(&user, &asset, &1000);
-    client.borrow(&user, &asset, &500);
+    client.borrow(&user, &asset, &asset, &500);
 
     // Advance time beyond max age (2 hours)
     let ledger_timestamp = env.ledger().timestamp();
@@ -804,13 +804,13 @@ fn test_oracle_staleness_blocks_collateral_check() {
 
     // Try to withdraw - should fail due to stale price
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.withdraw(&user, &asset, &100);
+        client.withdraw(&user, &asset, &asset, &100);
     }));
     assert!(result.is_err());
 
     // Try to borrow more - should also fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.borrow(&user, &asset, &100);
+        client.borrow(&user, &asset, &asset, &100);
     }));
     assert!(result.is_err());
 
@@ -920,7 +920,7 @@ fn test_accrue_interest_syncs_reserve_total_balance() {
 
     // 50% utilization: borrow_rate = 12% APR, supply_rate = 6% APR.
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let ledger_timestamp = env.ledger().timestamp();
     env.ledger()
@@ -961,7 +961,7 @@ fn test_withdraw_after_implicit_accrual_uses_synced_reserve() {
     set_oracle_price(&env, &client, &admin, &asset, &1);
 
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let ledger_timestamp = env.ledger().timestamp();
     env.ledger()
@@ -970,7 +970,7 @@ fn test_withdraw_after_implicit_accrual_uses_synced_reserve() {
     // No explicit accrue_interest call - withdraw() must accrue internally
     // and sync the reserve before its balance check.
     client.repay(&user, &asset, &560_000);
-    client.withdraw(&user, &asset, &1_060_000);
+    client.withdraw(&user, &asset, &asset, &1_060_000);
 
     let position = client.get_position(&user, &asset);
     assert_eq!(position.deposited, 0);
@@ -993,7 +993,7 @@ fn test_repay_then_withdraw_full_claim_after_accrual() {
     set_oracle_price(&env, &client, &admin, &asset, &1);
 
     client.deposit(&user, &asset, &1_000_000);
-    client.borrow(&user, &asset, &500_000);
+    client.borrow(&user, &asset, &asset, &500_000);
 
     let ledger_timestamp = env.ledger().timestamp();
     env.ledger()
@@ -1008,7 +1008,7 @@ fn test_repay_then_withdraw_full_claim_after_accrual() {
     assert_eq!(reserve_after_repay.total_balance, 1_120_000);
     assert!(reserve_after_repay.total_balance >= 1_060_000);
 
-    client.withdraw(&user, &asset, &1_060_000);
+    client.withdraw(&user, &asset, &asset, &1_060_000);
 
     let position = client.get_position(&user, &asset);
     assert_eq!(position.deposited, 0);
@@ -1061,7 +1061,7 @@ fn test_configure_asset_disable_blocked_while_deposit_active() {
     assert!(client.is_asset_supported(&asset));
 
     // User withdraws the full amount.
-    client.withdraw(&user, &asset, &1_000);
+    client.withdraw(&user, &asset, &asset, &1_000);
     assert_eq!(client.get_total_deposited(&asset), 0);
 
     // Disable attempt must now succeed (no active positions remain).
@@ -1091,7 +1091,7 @@ fn test_configure_asset_disable_blocked_while_borrow_active() {
 
     // Deposit enough collateral, then borrow.
     client.deposit(&user, &asset, &2_000);
-    client.borrow(&user, &asset, &1_000);
+    client.borrow(&user, &asset, &asset, &1_000);
     assert_eq!(client.get_total_borrowed(&asset), 1_000);
 
     // Disable attempt must panic because active borrows exist.
@@ -1114,7 +1114,7 @@ fn test_configure_asset_disable_blocked_while_borrow_active() {
     );
 
     // User also withdraws the remaining deposit.
-    client.withdraw(&user, &asset, &2_000);
+    client.withdraw(&user, &asset, &asset, &2_000);
     assert_eq!(client.get_total_deposited(&asset), 0);
 
     // Now both totals are zero — disable must succeed.
@@ -1274,7 +1274,7 @@ fn test_update_borrow_cap_below_outstanding_panics() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &2_000);
-    client.borrow(&user, &asset, &1_000);
+    client.borrow(&user, &asset, &asset, &1_000);
     assert_eq!(client.get_total_borrowed(&asset), 1_000);
 
     let result = try_update_caps(&env, &client, &admin, &asset, -1, 500);
@@ -1298,7 +1298,7 @@ fn test_update_borrow_cap_equal_to_outstanding_succeeds() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &2_000);
-    client.borrow(&user, &asset, &1_000);
+    client.borrow(&user, &asset, &asset, &1_000);
 
     let result = try_update_caps(&env, &client, &admin, &asset, -1, 1_000);
     assert!(
@@ -1322,7 +1322,7 @@ fn test_update_borrow_cap_above_outstanding_succeeds() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &2_000);
-    client.borrow(&user, &asset, &1_000);
+    client.borrow(&user, &asset, &asset, &1_000);
 
     let result = try_update_caps(&env, &client, &admin, &asset, -1, 2_000);
     assert!(
@@ -1346,7 +1346,7 @@ fn test_update_borrow_cap_unlimited_always_succeeds() {
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
     client.deposit(&user, &asset, &2_000);
-    client.borrow(&user, &asset, &1_000);
+    client.borrow(&user, &asset, &asset, &1_000);
 
     let result = try_update_caps(&env, &client, &admin, &asset, -1, -1);
     assert!(
@@ -1511,5 +1511,146 @@ fn test_set_max_protocol_fee_bps_requires_admin_auth() {
     assert!(
         result.is_err(),
         "non-admin must not be able to call set_max_protocol_fee_bps"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-asset collateralization tests (issue #262)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cross_asset_borrow_insufficient_collateral() {
+    // Proving test: collateral and debt values must come from the prices of
+    // DIFFERENT assets. X has price 1 and Y has price 2. A user deposits
+    // 10_000 X (collateral value 10_000) and tries to borrow 4_000 Y (debt
+    // value 8_000). At a 15_000 bps minimum the required collateral is
+    // 12_000, so this must fail with InsufficientCollateral — the old
+    // same-price model priced both sides with one asset and would not catch
+    // this.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset_x = Address::generate(&env);
+    let asset_y = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset_x);
+    configure_asset(&env, &client, &admin, &asset_y);
+    set_oracle_price(&env, &client, &admin, &asset_x, &1);
+    set_oracle_price(&env, &client, &admin, &asset_y, &2);
+
+    client.deposit(&user, &asset_x, &10_000);
+
+    // Seed Y liquidity so the borrow reaches the collateral check instead of
+    // failing earlier on InsufficientReserve.
+    let supplier = Address::generate(&env);
+    client.deposit(&supplier, &asset_y, &100_000);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.borrow(&user, &asset_y, &asset_x, &4_000);
+    }));
+    assert!(
+        result.is_err(),
+        "cross-asset borrow must fail: 10_000 collateral < 12_000 required"
+    );
+}
+
+#[test]
+fn test_cross_asset_borrow_at_exactly_min_ratio_succeeds() {
+    // (a) Deposit A (price 1), borrow B (price 2) at exactly 150%.
+    // collateral = 300 * 1 = 300, debt = 100 * 2 = 200 → ratio 150%.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset_a = Address::generate(&env);
+    let asset_b = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset_a);
+    configure_asset(&env, &client, &admin, &asset_b);
+    set_oracle_price(&env, &client, &admin, &asset_a, &1);
+    set_oracle_price(&env, &client, &admin, &asset_b, &2);
+
+    let supplier = Address::generate(&env);
+    client.deposit(&supplier, &asset_b, &1_000);
+    client.deposit(&user, &asset_a, &300);
+
+    client.borrow(&user, &asset_b, &asset_a, &100);
+
+    let position = client.get_position(&user, &asset_b);
+    assert_eq!(position.borrowed, 100);
+}
+
+#[test]
+fn test_cross_asset_borrow_below_min_ratio_fails() {
+    // (b) Deposit A (price 1), try to borrow B (price 2) at 149%.
+    // collateral = 298 * 1 = 298, debt = 100 * 2 = 200 → ratio 149%.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset_a = Address::generate(&env);
+    let asset_b = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset_a);
+    configure_asset(&env, &client, &admin, &asset_b);
+    set_oracle_price(&env, &client, &admin, &asset_a, &1);
+    set_oracle_price(&env, &client, &admin, &asset_b, &2);
+
+    let supplier = Address::generate(&env);
+    client.deposit(&supplier, &asset_b, &1_000);
+    client.deposit(&user, &asset_a, &298);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.borrow(&user, &asset_b, &asset_a, &100);
+    }));
+    assert!(
+        result.is_err(),
+        "cross-asset borrow at 149% must fail with InsufficientCollateral"
+    );
+}
+
+#[test]
+fn test_cross_asset_withdraw_that_breaks_ratio_panics() {
+    // (c) Deposit A (price 1), borrow B (price 2) at 200%, then withdraw A
+    // down to exactly 150% (succeeds); a further withdraw that would drop
+    // the ratio to 149% must panic with InsufficientCollateral.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset_a = Address::generate(&env);
+    let asset_b = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset_a);
+    configure_asset(&env, &client, &admin, &asset_b);
+    set_oracle_price(&env, &client, &admin, &asset_a, &1);
+    set_oracle_price(&env, &client, &admin, &asset_b, &2);
+
+    let supplier = Address::generate(&env);
+    client.deposit(&supplier, &asset_b, &1_000);
+
+    // collateral = 400 * 1 = 400, debt = 100 * 2 = 200 → ratio 200%.
+    client.deposit(&user, &asset_a, &400);
+    client.borrow(&user, &asset_b, &asset_a, &100);
+
+    // Withdraw 100 A → collateral 300, debt 200 → exactly 150% (succeeds).
+    client.withdraw(&user, &asset_a, &asset_b, &100);
+
+    // Withdraw 2 more A → collateral 298, debt 200 → 149% (must panic).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.withdraw(&user, &asset_a, &asset_b, &2);
+    }));
+    assert!(
+        result.is_err(),
+        "withdraw that drops the cross-asset ratio to 149% must panic"
     );
 }
