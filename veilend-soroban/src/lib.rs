@@ -4,17 +4,17 @@ mod interest;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, Symbol,
+    symbol_short, Address, Env, Symbol, Vec,
 };
 
 /// Increment this only when a contract interface change requires consumers to adapt.
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 /// Increment this only when the serialized `DataKey` or stored value layout changes.
-pub const STORAGE_SCHEMA_VERSION: u32 = 2;
+pub const STORAGE_SCHEMA_VERSION: u32 = 3;
 
 /// A compact, stable identifier for the current `DataKey` storage layout.
-const STORAGE_SCHEMA_ID: Symbol = symbol_short!("VLENDV2");
+const STORAGE_SCHEMA_ID: Symbol = symbol_short!("VLENDV3");
 
 /// Queryable metadata describing the contract interface and its storage layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,9 +25,11 @@ pub struct ContractMetadata {
     pub storage_schema_id: Symbol,
 }
 
-/// Keys and value shapes that make up storage schema `VLENDV2`.
+/// Keys and value shapes that make up storage schema `VLENDV3`.
 ///
-/// Instance storage: `Admin: Address`, `MinCollateralRatioBps: u32`, `MaxOracleAge: u64`.
+/// Instance storage: `AdminSet: Map<Address, bool>`, `MinCollateralRatioBps: u32`,
+/// `TimelockLedgers: u64`, `NextActionId: u64`,
+/// `PendingAction(u64): PendingAction`, `MaxOracleAge: u64`.
 /// Persistent storage: `SupportedAsset(Address): bool`,
 /// `Position(Address, Address): Position`, `OraclePrice(Address): i128`,
 /// `DepositCap(Address)`/`BorrowCap(Address): i128`,
@@ -38,7 +40,14 @@ pub struct ContractMetadata {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    Admin,
+    /// The set of privileged addresses; any one of them may act as admin.
+    AdminSet,
+    /// Timelock delay in ledgers applied to privileged mutations.
+    TimelockLedgers,
+    /// Monotonic counter that allocates pending-action ids.
+    NextActionId,
+    /// A proposed, not-yet-executed privileged action, keyed by its id.
+    PendingAction(u64),
     MinCollateralRatioBps,
     SupportedAsset(Address),
     AssetReserve(Address),
@@ -156,14 +165,24 @@ pub enum VeilLendError {
     CircuitBreakerTriggered = 16,
     /// Reserve balance is too low for the requested action
     InsufficientReserve = 17,
+    /// Pending action's timelock window has not elapsed yet
+    TimelockNotReady = 18,
+    /// No pending action with the given id (or wrong kind)
+    UnknownAction = 19,
+    /// Cannot remove the last remaining admin
+    LastAdminRequired = 20,
+    /// Timelock value is outside the allowed range
+    InvalidTimelock = 21,
+    /// Pausing requires a timelocked proposal (use propose/execute)
+    TimelockRequired = 22,
     /// Oracle price is stale (exceeded maximum age)
-    OraclePriceStale = 21,
+    OraclePriceStale = 23,
     /// Oracle price change exceeds maximum allowed change
-    OraclePriceChangeExceedsLimit = 22,
+    OraclePriceChangeExceedsLimit = 24,
     /// Oracle price is below minimum allowed price
-    OraclePriceBelowMin = 23,
+    OraclePriceBelowMin = 25,
     /// Oracle price is above maximum allowed price
-    OraclePriceAboveMax = 24,
+    OraclePriceAboveMax = 26,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -245,6 +264,15 @@ pub struct AssetReserveUpdated {
     pub kind: ReserveUpdateKind,
 }
 
+#[contractevent(topics = ["veillend", "admin_added"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAdded {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub new_admin: Address,
+}
+
 #[contract]
 pub struct VeilLendContract;
 
@@ -262,15 +290,23 @@ impl VeilLendContract {
     }
 
     pub fn __constructor(env: Env, admin: Address, min_collateral_ratio_bps: u32) {
-        if env.storage().instance().has(&DataKey::Admin) {
+        // Authenticate first, before any storage read or write, so random
+        // callers cannot probe initialization state without signing as the
+        // admin they claim to be.
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::AdminSet) {
             panic_with_error!(&env, VeilLendError::AlreadyInitialized);
         }
         if min_collateral_ratio_bps < 10_000 {
             panic_with_error!(&env, VeilLendError::InvalidCollateralRatio);
         }
 
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        // Founding admin is written into a single-element AdminSet.
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin);
+        env.storage().instance().set(&DataKey::AdminSet, &admins);
+
         env.storage()
             .instance()
             .set(&DataKey::MinCollateralRatioBps, &min_collateral_ratio_bps);
@@ -284,12 +320,26 @@ impl VeilLendContract {
             .set(&DataKey::MaxOracleAge, &86400u64);
     }
 
-    pub fn configure_asset(env: Env, admin: Address, asset: Address, supported: bool) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
+    /// Adds `new_admin` to the admin set. Callable only by a current admin.
+    pub fn add_admin(env: Env, caller: Address, new_admin: Address) {
+        Self::require_admin(&env, &caller);
+        caller.require_auth();
+
+        let mut admins = Self::read_admin_set(&env);
+        if !admins.contains(&new_admin) {
+            admins.push_back(new_admin.clone());
+            Self::write_admin_set(&env, &admins);
         }
 
+        AdminAdded {
+            admin: caller,
+            new_admin,
+        }
+        .publish(&env);
+    }
+
+    pub fn configure_asset(env: Env, admin: Address, asset: Address, supported: bool) {
+        Self::require_admin(&env, &admin);
         admin.require_auth();
         env.storage()
             .persistent()
@@ -339,20 +389,16 @@ impl VeilLendContract {
     /// Enforces staleness tracking, volatility limits, and absolute bounds.
     ///
     /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
+    /// * `admin` - The admin address (must be in admin set)
     /// * `asset` - The asset address to set the price for
     /// * `price` - The oracle price (must be positive, in base units e.g., cents)
     pub fn set_oracle_price(env: Env, admin: Address, asset: Address, price: i128) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
 
         if price <= 0 {
             panic_with_error!(&env, VeilLendError::InvalidAmount);
         }
-
-        admin.require_auth();
 
         // Get current price for volatility checking
         let current_price_opt = env
@@ -470,14 +516,10 @@ impl VeilLendContract {
     /// Default is 86400 seconds (1 day).
     ///
     /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
+    /// * `admin` - The admin address (must be in admin set)
     /// * `seconds` - Maximum age in seconds
     pub fn set_max_oracle_age(env: Env, admin: Address, seconds: u64) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
+        Self::require_admin(&env, &admin);
         admin.require_auth();
         env.storage()
             .instance()
@@ -501,15 +543,11 @@ impl VeilLendContract {
     /// A value of 0 disables the check.
     ///
     /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
+    /// * `admin` - The admin address (must be in admin set)
     /// * `asset` - The asset address
     /// * `max_bps` - Maximum change in basis points (0 to disable)
     pub fn set_oracle_max_change_bps(env: Env, admin: Address, asset: Address, max_bps: u32) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
+        Self::require_admin(&env, &admin);
         Self::require_supported_asset(&env, &asset);
         admin.require_auth();
         env.storage()
@@ -522,7 +560,7 @@ impl VeilLendContract {
     /// Sets minimum and maximum allowed prices for an asset.
     ///
     /// # Arguments
-    /// * `admin` - The admin address (must match stored admin)
+    /// * `admin` - The admin address (must be in admin set)
     /// * `asset` - The asset address
     /// * `min` - Minimum allowed price
     /// * `max` - Maximum allowed price
@@ -533,11 +571,7 @@ impl VeilLendContract {
         min: i128,
         max: i128,
     ) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
+        Self::require_admin(&env, &admin);
         Self::require_supported_asset(&env, &asset);
         admin.require_auth();
 
@@ -566,10 +600,7 @@ impl VeilLendContract {
         deposit_cap: i128,
         borrow_cap: i128,
     ) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin);
 
         // Validate caps: must be -1 (unlimited) or positive
         if deposit_cap != -1 && deposit_cap <= 0 {
@@ -662,11 +693,7 @@ impl VeilLendContract {
     /// * `admin` - The admin address (must match stored admin)
     /// * `paused` - true to pause, false to unpause
     pub fn set_paused(env: Env, admin: Address, paused: bool) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
-
+        Self::require_admin(&env, &admin);
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Paused, &paused);
 
@@ -890,10 +917,7 @@ impl VeilLendContract {
     }
 
     pub fn record_protocol_fee(env: Env, admin: Address, asset: Address, amount: i128) {
-        let stored_admin = Self::admin(env.clone());
-        if admin != stored_admin {
-            panic_with_error!(&env, VeilLendError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin);
 
         Self::require_supported_asset(&env, &asset);
         Self::require_positive_amount(&env, amount);
@@ -909,13 +933,6 @@ impl VeilLendContract {
         Self::publish_asset_reserve_updated(&env, &asset, &reserve, ReserveUpdateKind::FeeAccrual);
     }
 
-    pub fn admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::NotInitialized))
-    }
-
     pub fn min_collateral_ratio_bps(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -925,6 +942,24 @@ impl VeilLendContract {
 }
 
 impl VeilLendContract {
+    fn read_admin_set(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminSet)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn write_admin_set(env: &Env, admins: &Vec<Address>) {
+        env.storage().instance().set(&DataKey::AdminSet, admins);
+    }
+
+    /// Panics with `Unauthorized` if `caller` is not in the admin set.
+    fn require_admin(env: &Env, caller: &Address) {
+        if !Self::read_admin_set(env).contains(caller) {
+            panic_with_error!(env, VeilLendError::Unauthorized);
+        }
+    }
+
     fn read_asset_reserve(env: &Env, asset: &Address) -> AssetReserve {
         env.storage()
             .persistent()
@@ -1203,19 +1238,24 @@ mod tests {
         assert_eq!(VeilLendError::InvalidCap as u32, 15);
         assert_eq!(VeilLendError::CircuitBreakerTriggered as u32, 16);
         assert_eq!(VeilLendError::InsufficientReserve as u32, 17);
-        assert_eq!(VeilLendError::OraclePriceStale as u32, 21);
-        assert_eq!(VeilLendError::OraclePriceChangeExceedsLimit as u32, 22);
-        assert_eq!(VeilLendError::OraclePriceBelowMin as u32, 23);
-        assert_eq!(VeilLendError::OraclePriceAboveMax as u32, 24);
+        assert_eq!(VeilLendError::TimelockNotReady as u32, 18);
+        assert_eq!(VeilLendError::UnknownAction as u32, 19);
+        assert_eq!(VeilLendError::LastAdminRequired as u32, 20);
+        assert_eq!(VeilLendError::InvalidTimelock as u32, 21);
+        assert_eq!(VeilLendError::TimelockRequired as u32, 22);
+        assert_eq!(VeilLendError::OraclePriceStale as u32, 23);
+        assert_eq!(VeilLendError::OraclePriceChangeExceedsLimit as u32, 24);
+        assert_eq!(VeilLendError::OraclePriceBelowMin as u32, 25);
+        assert_eq!(VeilLendError::OraclePriceAboveMax as u32, 26);
     }
 
     #[test]
     fn test_contract_metadata_identifies_current_storage_shape() {
         let metadata = VeilLendContract::contract_metadata(Env::default());
 
-        assert_eq!(metadata.contract_version, 2);
-        assert_eq!(metadata.storage_schema_version, 2);
-        assert_eq!(metadata.storage_schema_id, symbol_short!("VLENDV2"));
+        assert_eq!(metadata.contract_version, 3);
+        assert_eq!(metadata.storage_schema_version, 3);
+        assert_eq!(metadata.storage_schema_id, symbol_short!("VLENDV3"));
     }
 
     #[test]
@@ -1239,6 +1279,11 @@ mod tests {
             VeilLendError::InvalidCap as u32,
             VeilLendError::CircuitBreakerTriggered as u32,
             VeilLendError::InsufficientReserve as u32,
+            VeilLendError::TimelockNotReady as u32,
+            VeilLendError::UnknownAction as u32,
+            VeilLendError::LastAdminRequired as u32,
+            VeilLendError::InvalidTimelock as u32,
+            VeilLendError::TimelockRequired as u32,
             VeilLendError::OraclePriceStale as u32,
             VeilLendError::OraclePriceChangeExceedsLimit as u32,
             VeilLendError::OraclePriceBelowMin as u32,

@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
 import { useStore } from '../store/store';
 import * as SecureStoreShim from '../utils/secureStoreShim';
+import api from '../utils/api';
+
+// Stub the network so optimistic lending tests never hit the real backend.
+// The store holds a live reference to this axios instance, so patching the
+// method here intercepts every request.
+(api as any).get = async () => ({ data: {} });
+(api as any).post = async () => ({ data: {} });
 
 const flushPersistence = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -27,6 +34,117 @@ beforeEach(async () => {
     shieldedLoading: false,
     currentNetwork: 'testnet',
     lastProtocolSyncAt: null,
+    balance: 0,
+    collateralValue: 0,
+    borrowedValue: 0,
+    availableToBorrow: 0,
+    healthFactor: 0,
+    assetBalances: [],
+    transactions: [],
+    transactionsLoading: false,
+    transactionsError: null,
+    supportedAssets: [],
+    assetsLoading: false,
+    assetsError: null,
+    positions: [],
+    positionsLoading: false,
+    positionsError: null,
+    dashboardLoading: false,
+    dashboardError: null,
+    pendingTransactions: [],
+  });
+});
+
+describe('Backend-backed dashboard data (issue #315)', () => {
+  it('exposes supported assets, positions, and dashboard hydration actions', () => {
+    const s = useStore.getState();
+    assert.equal(typeof s.fetchSupportedAssets, 'function');
+    assert.equal(typeof s.fetchPositions, 'function');
+    assert.equal(typeof s.hydrateDashboard, 'function');
+    assert.equal(Array.isArray(s.supportedAssets), true);
+    assert.equal(Array.isArray(s.positions), true);
+    assert.equal(Array.isArray(s.pendingTransactions), true);
+  });
+
+  it('hydrateDashboard is a no-op without a connected wallet', async () => {
+    useStore.setState({ address: null });
+    await useStore.getState().hydrateDashboard();
+    const s = useStore.getState();
+    assert.equal(s.dashboardLoading, false);
+    assert.equal(s.dashboardError, null);
+  });
+
+  it('hydrateDashboard fetches assets, portfolio, positions and transactions', async () => {
+    const calls: string[] = [];
+    (api as any).get = async (url: string, config?: any) => {
+      calls.push(`${url}${config?.params?.supported ? '?supported=true' : ''}`);
+      return { data: {} };
+    };
+    useStore.setState({ address: 'GABC123', authToken: 'tok' });
+    await useStore.getState().hydrateDashboard();
+    assert.deepEqual(calls.sort(), [
+      '/assets?supported=true',
+      '/indexer/positions/GABC123',
+      '/portfolios/GABC123',
+      '/transactions/GABC123',
+    ]);
+    const s = useStore.getState();
+    assert.equal(s.dashboardLoading, false);
+    assert.equal(s.dashboardError, null);
+  });
+});
+
+describe('Optimistic lending with rollback (issue #315)', () => {
+  it('deposit pushes a PENDING transaction and bumps the balance optimistically', async () => {
+    useStore.setState({ address: 'GABC123', authToken: 'tok', balance: 100 });
+    const depositPromise = useStore.getState().deposit({ amount: '50', asset: 'XLM' });
+
+    // Optimistic state is applied synchronously before confirmation.
+    const optimistic = useStore.getState();
+    assert.equal(optimistic.pendingTransactions.length, 1);
+    assert.equal(optimistic.pendingTransactions[0].status, 'PENDING');
+    assert.equal(optimistic.pendingTransactions[0].type, 'deposit');
+    assert.equal(optimistic.pendingTransactions[0].asset, 'XLM');
+    assert.equal(optimistic.balance, 150);
+
+    const res = await depositPromise;
+    assert.equal(res.status, 'CONFIRMED');
+
+    const after = useStore.getState();
+    const tx = after.pendingTransactions.find((t) => t.id === res.id);
+    assert.equal(tx?.status, 'CONFIRMED');
+    // Authoritative portfolio refresh (stubbed empty) upgrades the balance.
+    assert.equal(after.balance, 0);
+  });
+
+  it('withdraw applies a negative optimistic delta', async () => {
+    useStore.setState({ address: 'GABC123', authToken: 'tok', balance: 100 });
+    const withdrawPromise = useStore.getState().withdraw({ amount: '25', asset: 'XLM' });
+    assert.equal(useStore.getState().balance, 75);
+    await withdrawPromise;
+    assert.equal(useStore.getState().balance, 0);
+  });
+
+  it('rejects when no wallet is connected without mutating state', async () => {
+    useStore.setState({ address: null, authToken: null, balance: 10 });
+    await assert.rejects(
+      () => useStore.getState().deposit({ amount: '5', asset: 'XLM' }),
+      /Connect your wallet/,
+    );
+    const s = useStore.getState();
+    assert.equal(s.pendingTransactions.length, 0);
+    assert.equal(s.balance, 10);
+  });
+
+  it('rejects invalid amounts without mutating state', async () => {
+    useStore.setState({ address: 'GABC123', authToken: 'tok', balance: 10 });
+    await assert.rejects(
+      () => useStore.getState().deposit({ amount: '0', asset: 'XLM' }),
+      /valid amount/,
+    );
+    const s = useStore.getState();
+    assert.equal(s.pendingTransactions.length, 0);
+    assert.equal(s.balance, 10);
   });
 });
 
@@ -84,8 +202,8 @@ describe('Profile customization persistence (issue #60)', () => {
     setProfileName('Veil User');
     await flushPersistence();
 
-    expect(useStore.getState().profileName).toBe('Veil User');
-    await expect(SecureStoreShim.getItemAsync('profileName')).resolves.toBe('Veil User');
+    assert.equal(useStore.getState().profileName, 'Veil User');
+    assert.equal(await SecureStoreShim.getItemAsync('profileName'), 'Veil User');
   });
 
   it('should persist profile image when set', async () => {
@@ -93,8 +211,8 @@ describe('Profile customization persistence (issue #60)', () => {
     setProfileImage('file:///avatar.png');
     await flushPersistence();
 
-    expect(useStore.getState().profileImage).toBe('file:///avatar.png');
-    await expect(SecureStoreShim.getItemAsync('profileImage')).resolves.toBe('file:///avatar.png');
+    assert.equal(useStore.getState().profileImage, 'file:///avatar.png');
+    assert.equal(await SecureStoreShim.getItemAsync('profileImage'), 'file:///avatar.png');
   });
 
   it('logout should clear persisted profile customization', async () => {
@@ -106,10 +224,10 @@ describe('Profile customization persistence (issue #60)', () => {
     logout();
     await flushPersistence();
 
-    expect(useStore.getState().profileName).toBeNull();
-    expect(useStore.getState().profileImage).toBeNull();
-    await expect(SecureStoreShim.getItemAsync('profileName')).resolves.toBeNull();
-    await expect(SecureStoreShim.getItemAsync('profileImage')).resolves.toBeNull();
+    assert.equal(useStore.getState().profileName, null);
+    assert.equal(useStore.getState().profileImage, null);
+    assert.equal(await SecureStoreShim.getItemAsync('profileName'), null);
+    assert.equal(await SecureStoreShim.getItemAsync('profileImage'), null);
   });
 });
 
