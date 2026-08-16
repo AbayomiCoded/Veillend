@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { Request, Response, NextFunction } from 'express';
 import request from 'supertest';
 
 import { AppController } from '../app.controller';
@@ -17,23 +18,25 @@ describe('createOriginCheckMiddleware', () => {
   const middleware = createOriginCheckMiddleware(allowlist);
 
   it('blocks an unlisted origin with 403', () => {
-    const req = { headers: { origin: 'http://evil.com' } } as any;
-    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() } as any;
-    const next = jest.fn();
+    const statusMock = jest.fn().mockReturnThis();
+    const jsonMock = jest.fn();
+    const req = { headers: { origin: 'http://evil.com' } } as unknown as Request;
+    const res = { status: statusMock, json: jsonMock } as unknown as Response;
+    const next = jest.fn() as NextFunction;
 
     middleware(req, res, next);
 
-    expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith({
+    expect(statusMock).toHaveBeenCalledWith(403);
+    expect(jsonMock).toHaveBeenCalledWith({
       message: 'Forbidden: Origin not allowed',
     });
     expect(next).not.toHaveBeenCalled();
   });
 
   it('passes requests with no Origin header', () => {
-    const req = { headers: {} } as any;
-    const res = {} as any;
-    const next = jest.fn();
+    const req = { headers: {} } as unknown as Request;
+    const res = {} as unknown as Response;
+    const next = jest.fn() as NextFunction;
 
     middleware(req, res, next);
 
@@ -41,9 +44,11 @@ describe('createOriginCheckMiddleware', () => {
   });
 
   it('passes requests from an allowlisted origin', () => {
-    const req = { headers: { origin: 'http://localhost:3000' } } as any;
-    const res = {} as any;
-    const next = jest.fn();
+    const req = {
+      headers: { origin: 'http://localhost:3000' },
+    } as unknown as Request;
+    const res = {} as unknown as Response;
+    const next = jest.fn() as NextFunction;
 
     middleware(req, res, next);
 

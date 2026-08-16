@@ -65,7 +65,9 @@ export class HealthService {
       const result = await this.horizon.getClient().root();
       return {
         status: 'up',
-        coreLatestLedger: (result as any).core_latest_ledger ?? null,
+        coreLatestLedger:
+          (result as unknown as { core_latest_ledger?: number })
+            .core_latest_ledger ?? null,
         latencyMs: Date.now() - start,
       };
     } catch {

@@ -22,7 +22,7 @@ describe('SSR Auth Security - Issue #270', () => {
         }
         return undefined;
       },
-    } as ReturnType<typeof cookies>;
+    } as unknown as Awaited<ReturnType<typeof cookies>>;
 
     // Extract wallet address from cookie (simulating the getWalletAddress function)
     const session = mockCookieStore.get('veillend_session')?.value;
@@ -42,7 +42,7 @@ describe('SSR Auth Security - Issue #270', () => {
         }
         return undefined;
       },
-    } as ReturnType<typeof cookies>;
+    } as unknown as Awaited<ReturnType<typeof cookies>>;
 
     const session = mockCookieStore.get('veillend_session')?.value;
     expect(session).toBeUndefined();

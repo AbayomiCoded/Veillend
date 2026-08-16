@@ -3,6 +3,20 @@ import { INestApplication, HttpStatus } from '@nestjs/common';
 import request from 'supertest';
 import { HealthController } from './health.controller';
 import { HealthService } from './health.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { SorobanRpcService } from '../stellar/soroban-rpc.service';
+import { HorizonService } from '../stellar/horizon.service';
+
+// ── Typed response body ───────────────────────────────────────────────────────
+
+interface HealthBody {
+  status: string;
+  components: {
+    prisma: { status: string };
+    sorobanRpc: { status: string };
+    horizon: { status: string };
+  };
+}
 
 // ── Minimal stubs ─────────────────────────────────────────────────────────────
 
@@ -46,13 +60,13 @@ async function createApp(
   })
     .overrideProvider(HealthService)
     .useFactory({
-      factory: (prisma, soroban, horizon) =>
-        new HealthService(prisma, soroban, horizon),
-      inject: [
-        'PrismaService',
-        'SorobanRpcService',
-        'HorizonService',
-      ],
+      factory: (prisma: unknown, soroban: unknown, horizon: unknown) =>
+        new HealthService(
+          prisma as PrismaService,
+          soroban as SorobanRpcService,
+          horizon as HorizonService,
+        ),
+      inject: ['PrismaService', 'SorobanRpcService', 'HorizonService'],
     })
     .compile();
 
@@ -75,10 +89,11 @@ describe('HealthController', () => {
 
     it('returns 200 with status ok', async () => {
       const res = await request(app.getHttpServer()).get('/health').expect(200);
-      expect(res.body.status).toBe('ok');
-      expect(res.body.components.prisma.status).toBe('up');
-      expect(res.body.components.sorobanRpc.status).toBe('up');
-      expect(res.body.components.horizon.status).toBe('up');
+      const body = res.body as HealthBody;
+      expect(body.status).toBe('ok');
+      expect(body.components.prisma.status).toBe('up');
+      expect(body.components.sorobanRpc.status).toBe('up');
+      expect(body.components.horizon.status).toBe('up');
     });
   });
 
@@ -93,9 +108,10 @@ describe('HealthController', () => {
 
     it('returns 200 with status degraded', async () => {
       const res = await request(app.getHttpServer()).get('/health').expect(200);
-      expect(res.body.status).toBe('degraded');
-      expect(res.body.components.prisma.status).toBe('down');
-      expect(res.body.components.sorobanRpc.status).toBe('up');
+      const body = res.body as HealthBody;
+      expect(body.status).toBe('degraded');
+      expect(body.components.prisma.status).toBe('down');
+      expect(body.components.sorobanRpc.status).toBe('up');
     });
   });
 
@@ -112,7 +128,8 @@ describe('HealthController', () => {
       const res = await request(app.getHttpServer())
         .get('/health')
         .expect(HttpStatus.SERVICE_UNAVAILABLE);
-      expect(res.body.status).toBe('degraded');
+      const body = res.body as HealthBody;
+      expect(body.status).toBe('degraded');
     });
   });
 
