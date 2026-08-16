@@ -742,3 +742,161 @@ fn test_constructor_requires_admin_auth() {
     }));
     assert!(result.is_err());
 }
+
+// ============================================================================
+// Oracle Safety Rail Tests (Issue #263)
+// ============================================================================
+
+#[test]
+fn test_oracle_staleness_tracking() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    client.add_admin(&admin, &admin);
+    configure_asset(&env, &client, &admin, &asset);
+
+    // Set initial price
+    client.set_oracle_price(&admin, &asset, &100);
+
+    // Check price with age - should be 0 seconds old
+    let (price, age) = client.get_oracle_price_with_age(&asset).unwrap();
+    assert_eq!(price, 100);
+    assert_eq!(age, 0);
+
+    // Advance time by 1 hour
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger().set_timestamp(ledger_timestamp + 3600);
+
+    // Check again - should be 3600 seconds old
+    let (price, age) = client.get_oracle_price_with_age(&asset).unwrap();
+    assert_eq!(price, 100);
+    assert_eq!(age, 3600);
+}
+
+#[test]
+fn test_oracle_staleness_blocks_collateral_check() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    client.add_admin(&admin, &admin);
+    configure_asset(&env, &client, &admin, &asset);
+    client.set_oracle_price(&admin, &asset, &100);
+
+    // Set max age to 1 hour
+    client.set_max_oracle_age(&admin, &3600);
+
+    // Deposit and borrow should work initially
+    client.deposit(&user, &asset, &1000);
+    client.borrow(&user, &asset, &500);
+
+    // Advance time beyond max age (2 hours)
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger().set_timestamp(ledger_timestamp + 7200);
+
+    // Try to withdraw - should fail due to stale price
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.withdraw(&user, &asset, &100);
+    }));
+    assert!(result.is_err());
+
+    // Try to borrow more - should also fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.borrow(&user, &asset, &100);
+    }));
+    assert!(result.is_err());
+
+    // Repay should still work
+    client.repay(&user, &asset, &500);
+}
+
+#[test]
+fn test_oracle_max_change_bps_blocks_excessive_volatility() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    client.add_admin(&admin, &admin);
+    configure_asset(&env, &client, &admin, &asset);
+
+    // Set initial price to 100
+    client.set_oracle_price(&admin, &asset, &100);
+
+    // Set max change to 500 bps (5%)
+    client.set_oracle_max_change_bps(&admin, &asset, &500);
+
+    // Try to set price to 106 (6% increase) - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_oracle_price(&admin, &asset, &106);
+    }));
+    assert!(result.is_err());
+
+    // Set price to 105 (5% increase) - should succeed
+    client.set_oracle_price(&admin, &asset, &105);
+    assert_eq!(client.get_oracle_price(&asset), Some(105));
+
+    // Set price to 100 (from 105, ~4.76% decrease) - should succeed
+    client.set_oracle_price(&admin, &asset, &100);
+    assert_eq!(client.get_oracle_price(&asset), Some(100));
+
+    // Set price to 94 (6% decrease) - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_oracle_price(&admin, &asset, &94);
+    }));
+    assert!(result.is_err());
+
+    // Set price to 95 (5% decrease) - should succeed
+    client.set_oracle_price(&admin, &asset, &95);
+    assert_eq!(client.get_oracle_price(&asset), Some(95));
+}
+
+#[test]
+fn test_oracle_price_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    client.add_admin(&admin, &admin);
+    configure_asset(&env, &client, &admin, &asset);
+
+    // Set bounds: min=1, max=1000
+    client.set_oracle_price_bounds(&admin, &asset, &1, &1000);
+
+    // Try to set price below min - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_oracle_price(&admin, &asset, &0);
+    }));
+    assert!(result.is_err());
+
+    // Set price at min - should succeed
+    client.set_oracle_price(&admin, &asset, &1);
+    assert_eq!(client.get_oracle_price(&asset), Some(1));
+
+    // Try to set price above max - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_oracle_price(&admin, &asset, &1001);
+    }));
+    assert!(result.is_err());
+
+    // Set price at max - should succeed
+    client.set_oracle_price(&admin, &asset, &1000);
+    assert_eq!(client.get_oracle_price(&asset), Some(1000));
+
+    // Set price in middle - should succeed
+    client.set_oracle_price(&admin, &asset, &500);
+    assert_eq!(client.get_oracle_price(&asset), Some(500));
+}

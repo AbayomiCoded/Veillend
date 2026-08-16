@@ -87,6 +87,10 @@ All contract errors are typed via `VeilLendError` (`#[contracterror]`, `#[repr(u
 | `LastAdminRequired` | 20 | `remove_admin` would remove the last remaining admin |
 | `InvalidTimelock` | 21 | `set_timelock_ledgers` called with a value outside `1..=100_000` |
 | `TimelockRequired` | 22 | `set_paused(true)` called directly — pausing must go through `propose_set_paused`/`execute_set_paused` |
+| `OraclePriceStale` | 23 | Oracle price has exceeded maximum age limit |
+| `OraclePriceChangeExceedsLimit` | 24 | Oracle price change exceeds maximum allowed volatility |
+| `OraclePriceBelowMin` | 25 | Oracle price is below minimum allowed bound |
+| `OraclePriceAboveMax` | 26 | Oracle price is above maximum allowed bound |
 
 ### Error handling notes
 - Zero and negative amounts produce **different** errors (`ZeroAmount` vs `InvalidAmount`) so clients can distinguish them.

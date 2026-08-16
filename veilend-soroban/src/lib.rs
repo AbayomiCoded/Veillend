@@ -73,6 +73,18 @@ pub enum DataKey {
     Paused,
     /// Time-based interest accrual indexes for an asset
     InterestState(Address),
+    /// Timestamp when oracle price was last updated for an asset
+    OracleLastUpdated(Address),
+    /// Previous oracle price for volatility checking
+    OraclePrevPrice(Address),
+    /// Maximum allowed price change in basis points per update
+    OracleMaxChangeBps(Address),
+    /// Minimum allowed oracle price for an asset
+    OracleMinPrice(Address),
+    /// Maximum allowed oracle price for an asset
+    OracleMaxPrice(Address),
+    /// Protocol-wide maximum oracle age in seconds
+    MaxOracleAge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +221,14 @@ pub enum VeilLendError {
     InvalidTimelock = 21,
     /// Pausing requires a timelocked proposal (use propose/execute)
     TimelockRequired = 22,
+    /// Oracle price is stale (exceeded maximum age)
+    OraclePriceStale = 23,
+    /// Oracle price change exceeds maximum allowed change
+    OraclePriceChangeExceedsLimit = 24,
+    /// Oracle price is below minimum allowed price
+    OraclePriceBelowMin = 25,
+    /// Oracle price is above maximum allowed price
+    OraclePriceAboveMax = 26,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -546,6 +566,99 @@ impl VeilLendContract {
     /// * `Option<i128>` - The oracle price if set, None otherwise
     pub fn get_oracle_price(env: Env, asset: Address) -> Option<i128> {
         env.storage().persistent().get(&DataKey::OraclePrice(asset))
+    }
+
+    /// Sets the oracle price for an asset directly (admin only)
+    ///
+    /// Validates price bounds and max change limits before updating.
+    pub fn set_oracle_price(env: Env, admin: Address, asset: Address, price: i128) {
+        Self::require_admin(&env, &admin);
+        Self::require_supported_asset(&env, &asset);
+        admin.require_auth();
+
+        Self::apply_set_oracle_price(&env, &asset, price);
+    }
+
+    /// Get the oracle price with age in seconds
+    ///
+    /// Returns both the oracle price and how many seconds ago it was last updated.
+    pub fn get_oracle_price_with_age(env: Env, asset: Address) -> Option<(i128, u64)> {
+        let price = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OraclePrice(asset.clone()))?;
+        let last_updated = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleLastUpdated(asset.clone()))
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let age = now.saturating_sub(last_updated);
+        Some((price, age))
+    }
+
+    /// Set the protocol-wide maximum oracle age (admin only)
+    pub fn set_max_oracle_age(env: Env, admin: Address, seconds: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxOracleAge, &seconds);
+    }
+
+    /// Get the protocol-wide maximum oracle age
+    pub fn get_max_oracle_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxOracleAge)
+            .unwrap_or(86400)
+    }
+
+    /// Set maximum allowed price change per update for an asset (admin only)
+    pub fn set_oracle_max_change_bps(env: Env, admin: Address, asset: Address, max_bps: u32) {
+        Self::require_admin(&env, &admin);
+        Self::require_supported_asset(&env, &asset);
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::OracleMaxChangeBps(asset.clone()), &max_bps);
+    }
+
+    /// Get maximum allowed price change per update for an asset
+    pub fn get_oracle_max_change_bps(env: Env, asset: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleMaxChangeBps(asset))
+            .unwrap_or(0)
+    }
+
+    /// Set absolute price bounds for an asset (admin only)
+    pub fn set_oracle_price_bounds(env: Env, admin: Address, asset: Address, min: i128, max: i128) {
+        Self::require_admin(&env, &admin);
+        Self::require_supported_asset(&env, &asset);
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::OracleMinPrice(asset.clone()), &min);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OracleMaxPrice(asset.clone()), &max);
+    }
+
+    /// Get absolute price bounds for an asset
+    pub fn get_oracle_price_bounds(env: Env, asset: Address) -> (i128, i128) {
+        let min = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleMinPrice(asset.clone()))
+            .unwrap_or(0);
+        let max = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleMaxPrice(asset))
+            .unwrap_or(i128::MAX);
+        (min, max)
     }
 
     /// Proposes updating per-asset deposit and borrow caps (timelocked).
@@ -1205,9 +1318,77 @@ impl VeilLendContract {
     }
 
     fn apply_set_oracle_price(env: &Env, asset: &Address, price: i128) {
+        if price < 0 {
+            panic_with_error!(env, VeilLendError::InvalidAmount);
+        }
+
+        // Get current price for volatility checking
+        let current_price_opt = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::OraclePrice(asset.clone()));
+
+        // Check max change if configured (before bounds, check against current price)
+        if let Some(max_change_bps) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::OracleMaxChangeBps(asset.clone()))
+        {
+            if max_change_bps > 0 {
+                if let Some(current_price) = current_price_opt {
+                    if current_price > 0 {
+                        let change = if price > current_price {
+                            price - current_price
+                        } else {
+                            current_price - price
+                        };
+                        let change_bps = (change * 10_000) / current_price;
+                        if change_bps > max_change_bps as i128 {
+                            panic_with_error!(env, VeilLendError::OraclePriceChangeExceedsLimit);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check absolute price bounds if configured (after volatility check)
+        if let Some(min_price) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::OracleMinPrice(asset.clone()))
+        {
+            if price < min_price {
+                panic_with_error!(env, VeilLendError::OraclePriceBelowMin);
+            }
+        }
+
+        if let Some(max_price) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::OracleMaxPrice(asset.clone()))
+        {
+            if price > max_price {
+                panic_with_error!(env, VeilLendError::OraclePriceAboveMax);
+            }
+        }
+
+        // Store previous price for audit trail
+        if let Some(current_price) = current_price_opt {
+            env.storage()
+                .persistent()
+                .set(&DataKey::OraclePrevPrice(asset.clone()), &current_price);
+        }
+
+        // Set the new price
         env.storage()
             .persistent()
             .set(&DataKey::OraclePrice(asset.clone()), &price);
+
+        // Update timestamp
+        let now = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::OracleLastUpdated(asset.clone()), &now);
     }
 
     fn apply_update_asset_caps(
@@ -1465,6 +1646,24 @@ impl VeilLendContract {
             .get(&DataKey::OraclePrice(asset.clone()))
             .unwrap_or_else(|| panic_with_error!(env, VeilLendError::OraclePriceMissing));
 
+        // Check price staleness
+        if let Some(last_updated) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::OracleLastUpdated(asset.clone()))
+        {
+            let now = env.ledger().timestamp();
+            let max_age = env
+                .storage()
+                .instance()
+                .get(&DataKey::MaxOracleAge)
+                .unwrap_or(86400u64);
+
+            if now.saturating_sub(last_updated) > max_age {
+                panic_with_error!(env, VeilLendError::OraclePriceStale);
+            }
+        }
+
         // Calculate collateral value using oracle price
         let collateral_value = position.deposited * price;
         let borrowed_value = position.borrowed * price;
@@ -1525,6 +1724,10 @@ mod tests {
         assert_eq!(VeilLendError::LastAdminRequired as u32, 20);
         assert_eq!(VeilLendError::InvalidTimelock as u32, 21);
         assert_eq!(VeilLendError::TimelockRequired as u32, 22);
+        assert_eq!(VeilLendError::OraclePriceStale as u32, 23);
+        assert_eq!(VeilLendError::OraclePriceChangeExceedsLimit as u32, 24);
+        assert_eq!(VeilLendError::OraclePriceBelowMin as u32, 25);
+        assert_eq!(VeilLendError::OraclePriceAboveMax as u32, 26);
     }
 
     #[test]
@@ -1562,6 +1765,10 @@ mod tests {
             VeilLendError::LastAdminRequired as u32,
             VeilLendError::InvalidTimelock as u32,
             VeilLendError::TimelockRequired as u32,
+            VeilLendError::OraclePriceStale as u32,
+            VeilLendError::OraclePriceChangeExceedsLimit as u32,
+            VeilLendError::OraclePriceBelowMin as u32,
+            VeilLendError::OraclePriceAboveMax as u32,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
