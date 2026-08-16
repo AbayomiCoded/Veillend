@@ -1017,3 +1017,499 @@ fn test_repay_then_withdraw_full_claim_after_accrual() {
     let reserve_after_withdraw = client.get_asset_reserve(&asset);
     assert_eq!(reserve_after_withdraw.total_balance, 60_000);
 }
+fn disable_asset(
+    env: &Env,
+    client: &VeilLendContractClient,
+    admin: &Address,
+    asset: &Address,
+) -> Result<(), ()> {
+    let action_id = client.propose_configure_asset(admin, asset, &false);
+    advance_ledgers(env, DEFAULT_TIMELOCK);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_configure_asset(admin, &action_id);
+    }))
+    .map_err(|_| ())
+}
+
+#[test]
+fn test_configure_asset_disable_blocked_while_deposit_active() {
+    // A user deposits → admin attempts to disable → must panic with
+    // AssetHasActivePositions (27). After the user withdraws in full, the
+    // same disable attempt must succeed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    // Deposit 1 000 — now total_deposited != 0.
+    client.deposit(&user, &asset, &1_000);
+    assert_eq!(client.get_total_deposited(&asset), 1_000);
+
+    // Disable attempt must panic because active deposits exist.
+    let result = disable_asset(&env, &client, &admin, &asset);
+    assert!(
+        result.is_err(),
+        "expected panic with AssetHasActivePositions while deposit is outstanding"
+    );
+    // Asset is still marked supported — the flag must not have been flipped.
+    assert!(client.is_asset_supported(&asset));
+
+    // User withdraws the full amount.
+    client.withdraw(&user, &asset, &1_000);
+    assert_eq!(client.get_total_deposited(&asset), 0);
+
+    // Disable attempt must now succeed (no active positions remain).
+    let result = disable_asset(&env, &client, &admin, &asset);
+    assert!(
+        result.is_ok(),
+        "expected disable to succeed after all deposits withdrawn"
+    );
+    assert!(!client.is_asset_supported(&asset));
+}
+
+#[test]
+fn test_configure_asset_disable_blocked_while_borrow_active() {
+    // A user borrows → admin attempts to disable → must panic with
+    // AssetHasActivePositions (27). After the user repays in full, the same
+    // disable attempt must succeed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    // Deposit enough collateral, then borrow.
+    client.deposit(&user, &asset, &2_000);
+    client.borrow(&user, &asset, &1_000);
+    assert_eq!(client.get_total_borrowed(&asset), 1_000);
+
+    // Disable attempt must panic because active borrows exist.
+    let result = disable_asset(&env, &client, &admin, &asset);
+    assert!(
+        result.is_err(),
+        "expected panic with AssetHasActivePositions while borrow is outstanding"
+    );
+    assert!(client.is_asset_supported(&asset));
+
+    // User repays the full borrowed amount.
+    client.repay(&user, &asset, &1_000);
+    assert_eq!(client.get_total_borrowed(&asset), 0);
+
+    // Still has a deposit — disable must still be blocked.
+    let result = disable_asset(&env, &client, &admin, &asset);
+    assert!(
+        result.is_err(),
+        "expected panic while deposit still outstanding after repay"
+    );
+
+    // User also withdraws the remaining deposit.
+    client.withdraw(&user, &asset, &2_000);
+    assert_eq!(client.get_total_deposited(&asset), 0);
+
+    // Now both totals are zero — disable must succeed.
+    let result = disable_asset(&env, &client, &admin, &asset);
+    assert!(
+        result.is_ok(),
+        "expected disable to succeed after all borrows repaid and deposits withdrawn"
+    );
+    assert!(!client.is_asset_supported(&asset));
+}
+
+#[test]
+fn test_configure_asset_enable_unaffected_by_guardrail() {
+    // Enabling (supported=true) must never be blocked by the active-positions
+    // guard — the check is only on the disable path.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    // Enabling a fresh asset always works.
+    configure_asset(&env, &client, &admin, &asset);
+    assert!(client.is_asset_supported(&asset));
+}
+
+// ---------------------------------------------------------------------------
+// Guardrail tests — update_asset_caps below current outstanding
+// (fix/admin-action-guardrails: CapBelowOutstanding = 28)
+// ---------------------------------------------------------------------------
+
+/// Helper: propose and execute update_asset_caps, returning Ok(()) on success
+/// or Err if execution panicked.
+fn try_update_caps(
+    env: &Env,
+    client: &VeilLendContractClient,
+    admin: &Address,
+    asset: &Address,
+    deposit_cap: i128,
+    borrow_cap: i128,
+) -> Result<(), ()> {
+    let action_id = client.propose_update_asset_caps(admin, asset, &deposit_cap, &borrow_cap);
+    advance_ledgers(env, DEFAULT_TIMELOCK);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_update_asset_caps(admin, &action_id);
+    }))
+    .map_err(|_| ())
+}
+
+#[test]
+fn test_update_deposit_cap_below_outstanding_panics() {
+    // 2 000 currently deposited → setting deposit_cap to 1 000 must panic
+    // with CapBelowOutstanding (28).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+    assert_eq!(client.get_total_deposited(&asset), 2_000);
+
+    // Setting cap below current total must panic.
+    let result = try_update_caps(&env, &client, &admin, &asset, 1_000, -1);
+    assert!(
+        result.is_err(),
+        "expected CapBelowOutstanding when deposit_cap < total_deposited"
+    );
+}
+
+#[test]
+fn test_update_deposit_cap_equal_to_outstanding_succeeds() {
+    // 2 000 currently deposited → deposit_cap = 2 000 must succeed (equal is fine).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, 2_000, -1);
+    assert!(
+        result.is_ok(),
+        "setting deposit_cap equal to outstanding must succeed"
+    );
+    assert_eq!(client.get_asset_caps(&asset).deposit_cap, 2_000);
+}
+
+#[test]
+fn test_update_deposit_cap_above_outstanding_succeeds() {
+    // 2 000 currently deposited → deposit_cap = 3 000 must succeed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, 3_000, -1);
+    assert!(
+        result.is_ok(),
+        "setting deposit_cap above outstanding must succeed"
+    );
+    assert_eq!(client.get_asset_caps(&asset).deposit_cap, 3_000);
+}
+
+#[test]
+fn test_update_deposit_cap_unlimited_always_succeeds() {
+    // -1 (unlimited sentinel) must always be settable regardless of outstanding.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, -1, -1);
+    assert!(
+        result.is_ok(),
+        "setting deposit_cap to -1 (unlimited) must always succeed"
+    );
+    assert_eq!(client.get_asset_caps(&asset).deposit_cap, -1);
+}
+
+#[test]
+fn test_update_borrow_cap_below_outstanding_panics() {
+    // 1 000 currently borrowed → setting borrow_cap to 500 must panic
+    // with CapBelowOutstanding (28).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+    client.borrow(&user, &asset, &1_000);
+    assert_eq!(client.get_total_borrowed(&asset), 1_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, -1, 500);
+    assert!(
+        result.is_err(),
+        "expected CapBelowOutstanding when borrow_cap < total_borrowed"
+    );
+}
+
+#[test]
+fn test_update_borrow_cap_equal_to_outstanding_succeeds() {
+    // 1 000 currently borrowed → borrow_cap = 1 000 must succeed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+    client.borrow(&user, &asset, &1_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, -1, 1_000);
+    assert!(
+        result.is_ok(),
+        "setting borrow_cap equal to outstanding must succeed"
+    );
+    assert_eq!(client.get_asset_caps(&asset).borrow_cap, 1_000);
+}
+
+#[test]
+fn test_update_borrow_cap_above_outstanding_succeeds() {
+    // 1 000 currently borrowed → borrow_cap = 2 000 must succeed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+    client.borrow(&user, &asset, &1_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, -1, 2_000);
+    assert!(
+        result.is_ok(),
+        "setting borrow_cap above outstanding must succeed"
+    );
+    assert_eq!(client.get_asset_caps(&asset).borrow_cap, 2_000);
+}
+
+#[test]
+fn test_update_borrow_cap_unlimited_always_succeeds() {
+    // -1 (unlimited sentinel) must always be settable regardless of outstanding borrows.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &2_000);
+    client.borrow(&user, &asset, &1_000);
+
+    let result = try_update_caps(&env, &client, &admin, &asset, -1, -1);
+    assert!(
+        result.is_ok(),
+        "setting borrow_cap to -1 (unlimited) must always succeed"
+    );
+    assert_eq!(client.get_asset_caps(&asset).borrow_cap, -1);
+}
+
+// ---------------------------------------------------------------------------
+// Guardrail tests — record_protocol_fee bounds via set_max_protocol_fee_bps
+// (fix/admin-action-guardrails: ProtocolFeeExceedsLimit = 29)
+// ---------------------------------------------------------------------------
+
+/// Helper: propose and execute record_protocol_fee, returning Ok(()) on
+/// success or Err if execution panicked.
+fn try_record_fee(
+    env: &Env,
+    client: &VeilLendContractClient,
+    admin: &Address,
+    asset: &Address,
+    amount: i128,
+) -> Result<(), ()> {
+    let action_id = client.propose_record_protocol_fee(admin, asset, &amount);
+    advance_ledgers(env, DEFAULT_TIMELOCK);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_record_protocol_fee(admin, &action_id);
+    }))
+    .map_err(|_| ())
+}
+
+#[test]
+fn test_record_protocol_fee_backward_compat_no_cap_set() {
+    // When set_max_protocol_fee_bps has never been called (default 0),
+    // record_protocol_fee must behave exactly as before — any positive
+    // amount is accepted regardless of size, confirming backward compatibility.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+
+    // Record a small fee — must succeed without any cap.
+    let result = try_record_fee(&env, &client, &admin, &asset, 1);
+    assert!(
+        result.is_ok(),
+        "small fee with no cap configured must succeed"
+    );
+
+    // Record a very large fee — must also succeed (cap is disabled).
+    let result = try_record_fee(&env, &client, &admin, &asset, 1_000_000_000);
+    assert!(
+        result.is_ok(),
+        "large fee with no cap configured must succeed (backward compat)"
+    );
+
+    // Record another mid-range fee — all succeed.
+    let result = try_record_fee(&env, &client, &admin, &asset, 50_000);
+    assert!(
+        result.is_ok(),
+        "mid-range fee with no cap configured must succeed"
+    );
+}
+
+#[test]
+fn test_record_protocol_fee_exceeds_limit_panics() {
+    // set_max_protocol_fee_bps(500) = 5 %.  With net reserve of 100 000
+    // the max allowed single-call fee is exactly 5 000
+    // (100_000 * 500 / 10_000 = 5_000).  Requesting 5 001 must panic
+    // with ProtocolFeeExceedsLimit (29).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    // Build a net reserve of 100 000: total_balance = 100_000, protocol_fees = 0.
+    client.deposit(&user, &asset, &100_000);
+
+    // Enable the 5 % cap.
+    client.set_max_protocol_fee_bps(&admin, &500);
+
+    // 5 001 > 5 000 → must panic.
+    let result = try_record_fee(&env, &client, &admin, &asset, 5_001);
+    assert!(
+        result.is_err(),
+        "fee of 5_001 must be rejected when max is 5_000 (5 % of 100_000)"
+    );
+}
+
+#[test]
+fn test_record_protocol_fee_at_exact_limit_succeeds() {
+    // Boundary is inclusive (≤).  A fee of exactly 5 000 must succeed when
+    // net reserve is 100 000 and the cap is 500 bps (5 %)
+    // (100_000 * 500 / 10_000 = 5_000).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+    client.deposit(&user, &asset, &100_000);
+    client.set_max_protocol_fee_bps(&admin, &500);
+
+    // Exactly at the limit — must succeed.
+    let result = try_record_fee(&env, &client, &admin, &asset, 5_000);
+    assert!(
+        result.is_ok(),
+        "fee of exactly 5_000 must succeed (boundary is inclusive)"
+    );
+
+    let reserve = client.get_asset_reserve(&asset);
+    assert_eq!(reserve.protocol_fees, 5_000);
+}
+
+#[test]
+fn test_set_max_protocol_fee_bps_above_5000_panics() {
+    // Any value above 5 000 must be rejected immediately (uses InvalidCap).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_max_protocol_fee_bps(&admin, &5_001);
+    }));
+    assert!(
+        result.is_err(),
+        "set_max_protocol_fee_bps(5_001) must panic"
+    );
+
+    // The boundary value 5 000 must be accepted.
+    client.set_max_protocol_fee_bps(&admin, &5_000);
+}
+
+#[test]
+fn test_set_max_protocol_fee_bps_requires_admin_auth() {
+    // A non-admin caller must be rejected with Unauthorized.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_max_protocol_fee_bps(&attacker, &500);
+    }));
+    assert!(
+        result.is_err(),
+        "non-admin must not be able to call set_max_protocol_fee_bps"
+    );
+}
