@@ -35,15 +35,15 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
 
   try {
     const [positionsRes, transactionsRes, pricesRes] = await Promise.all([
-      backendFetch(`/indexer/positions/${address}`, { 
+      backendFetch(`/indexer/positions/${address}`, {
         next: { revalidate: 10 },
         headers: { 'Cache-Control': 'no-cache' }
       }),
-      backendFetch(`/indexer/transactions/${address}`, { 
+      backendFetch(`/indexer/transactions/${address}`, {
         next: { revalidate: 10 },
         headers: { 'Cache-Control': 'no-cache' }
       }),
-      backendFetch(`/oracle/prices`, { 
+      backendFetch(`/oracle/prices`, {
         next: { revalidate: 10 },
         headers: { 'Cache-Control': 'no-cache' }
       })
@@ -80,7 +80,7 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
     positions.forEach((pos: IndexerPosition) => {
       const deposited = Number(pos.depositedAmount) / 1e7;
       const borrowed = Number(pos.borrowedAmount) / 1e7;
-      
+
       // Use oracle price, fallback to 0 if not available
       const price = prices[pos.assetAddress] || 0;
 
@@ -108,14 +108,14 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
     });
 
     // Calculate health factor with proper LTV
-    const healthFactor = totalBorrowedUsd === 0 
-      ? Infinity 
+    const healthFactor = totalBorrowedUsd === 0
+      ? Infinity
       : Math.min((totalDepositedUsd * 0.8) / totalBorrowedUsd, 99.99);
-    
+
     const totalBalanceUsd = totalDepositedUsd - totalBorrowedUsd;
 
     // Map transactions with real prices
-    const recentActivity = Array.isArray(transactions) 
+    const recentActivity = Array.isArray(transactions)
       ? transactions
           .map((tx: IndexerTransaction) => {
             const amount = Number(tx.amount) / 1e7;
@@ -150,7 +150,7 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
     };
   } catch (error) {
     console.error('Dashboard API Error:', error);
-    
+
     // Re-throw with user-friendly message
     if (error instanceof Error) {
       throw new Error(`Failed to load dashboard data: ${error.message}`);
