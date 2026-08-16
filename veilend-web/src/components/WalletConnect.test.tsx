@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { WalletProvider } from "@/context/WalletContext";
 import { WalletConnect } from "./WalletConnect";
 
@@ -14,58 +14,48 @@ vi.mock("@/lib/stellar/wallet", async (importOriginal) => {
 });
 
 describe("WalletConnect trigger", () => {
-  let container: HTMLDivElement;
-  let root: Root;
-
-  beforeEach(() => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    container = document.createElement("div");
-    document.body.appendChild(container);
-    root = createRoot(container);
-  });
-
-  afterEach(async () => {
-    await act(async () => {
-      root.unmount();
-    });
-    container.remove();
+  afterEach(() => {
+    cleanup();
     vi.restoreAllMocks();
   });
 
-  const render = async () => {
-    await act(async () => {
-      root.render(
-        <WalletProvider>
-          <WalletConnect />
-        </WalletProvider>
-      );
-    });
-  };
+  const renderComponent = () =>
+    render(
+      <WalletProvider>
+        <WalletConnect />
+      </WalletProvider>
+    );
 
-  it("exposes dialog semantics and an accessible name on the trigger", async () => {
-    await render();
+  it("exposes dialog semantics and an accessible name on the trigger", () => {
+    renderComponent();
 
-    const trigger = container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]');
-    expect(trigger).not.toBeNull();
-    expect(trigger?.tagName).toBe("BUTTON");
-    expect(trigger?.getAttribute("aria-expanded")).toBe("false");
-    expect(trigger?.getAttribute("aria-controls")).toBe("wallet-connect-dialog");
-    expect(trigger?.textContent).toContain("Connect Wallet");
+    const trigger = screen.getByRole("button", { name: /connect wallet/i });
+    expect(trigger.tagName).toBe("BUTTON");
+    expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(trigger.getAttribute("aria-controls")).toBe("wallet-connect-dialog");
   });
 
-  it("toggles aria-expanded and opens the dialog on activation", async () => {
-    await render();
+  it("opens the dialog on click and reflects aria-expanded", async () => {
+    const user = userEvent.setup();
+    renderComponent();
 
-    const trigger = container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]');
-    expect(trigger?.getAttribute("aria-expanded")).toBe("false");
+    const trigger = screen.getByRole("button", { name: /connect wallet/i });
+    await user.click(trigger);
 
-    await act(async () => {
-      trigger?.click();
-    });
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByRole("dialog").textContent).toContain("Connect Wallet");
+  });
 
-    expect(trigger?.getAttribute("aria-expanded")).toBe("true");
-    const dialog = document.body.querySelector('[role="dialog"]');
-    expect(dialog).not.toBeNull();
-    expect(dialog?.textContent).toContain("Connect Wallet");
+  it("activates the trigger via the keyboard (Enter)", async () => {
+    const user = userEvent.setup();
+    renderComponent();
+
+    const trigger = screen.getByRole("button", { name: /connect wallet/i });
+    trigger.focus();
+    await user.keyboard("{Enter}");
+
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
   });
 });

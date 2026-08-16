@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { AmountInput } from "./AmountInput";
 import type { ValidationContext } from "@/lib/validation/amount";
 
@@ -15,59 +15,39 @@ const context: ValidationContext = {
 };
 
 describe("AmountInput Max button", () => {
-  let container: HTMLDivElement;
-  let root: Root;
-
-  beforeEach(() => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    container = document.createElement("div");
-    document.body.appendChild(container);
-    root = createRoot(container);
+  afterEach(() => {
+    cleanup();
   });
 
-  afterEach(async () => {
-    await act(async () => {
-      root.unmount();
-    });
-    container.remove();
-  });
+  const renderComponent = (onChange: (value: string) => void = vi.fn()) =>
+    render(
+      <AmountInput
+        action="DEPOSIT"
+        context={context}
+        assetSymbol="USDC"
+        value=""
+        onChange={onChange}
+      />
+    );
 
-  const render = async (value = "", onChange = vi.fn()) => {
-    await act(async () => {
-      root.render(
-        <AmountInput
-          action="DEPOSIT"
-          context={context}
-          assetSymbol="USDC"
-          value={value}
-          onChange={onChange}
-        />
-      );
-    });
-  };
+  it("renders the Max button with the exact accessible label", () => {
+    renderComponent();
 
-  it("renders the Max button with the exact accessible label", async () => {
-    await render();
-
-    const max = container.querySelector('button[aria-label="Use maximum available amount"]');
-    expect(max).not.toBeNull();
-    expect(max?.tagName).toBe("BUTTON");
+    const max = screen.getByRole("button", { name: "Use maximum available amount" });
+    expect(max).toBeTruthy();
+    expect(max.tagName).toBe("BUTTON");
   });
 
   it("fills the maximum amount on keyboard-focusable activation", async () => {
+    const user = userEvent.setup();
     const onChange = vi.fn();
-    await render("", onChange);
+    renderComponent(onChange);
 
-    const max = container.querySelector(
-      'button[aria-label="Use maximum available amount"]'
-    ) as HTMLButtonElement;
-
+    const max = screen.getByRole("button", { name: "Use maximum available amount" });
     max.focus();
     expect(document.activeElement).toBe(max);
 
-    await act(async () => {
-      max.click();
-    });
+    await user.keyboard("{Enter}");
     expect(onChange).toHaveBeenCalledWith("100");
   });
 });
