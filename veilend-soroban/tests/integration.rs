@@ -900,3 +900,120 @@ fn test_oracle_price_bounds() {
     client.set_oracle_price(&admin, &asset, &500);
     assert_eq!(client.get_oracle_price(&asset), Some(500));
 }
+
+#[test]
+fn test_accrue_interest_syncs_reserve_total_balance() {
+    // Regression test for issue #260: interest accrual must keep
+    // AssetReserve.total_balance in sync with suppliers' growing claim,
+    // otherwise the reserve balance drifts stale relative to
+    // TotalDeposited - TotalBorrowed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    // 50% utilization: borrow_rate = 12% APR, supply_rate = 6% APR.
+    client.deposit(&user, &asset, &1_000_000);
+    client.borrow(&user, &asset, &500_000);
+
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger()
+        .set_timestamp(ledger_timestamp + SECONDS_PER_YEAR);
+
+    client.accrue_interest(&asset);
+
+    assert_eq!(client.get_total_deposited(&asset), 1_060_000);
+    assert_eq!(client.get_total_borrowed(&asset), 560_000);
+
+    let reserve = client.get_asset_reserve(&asset);
+    // 1_000_000 deposited - 500_000 borrowed out + 60_000 interest credited
+    // to suppliers = 560_000. Borrower-side interest (60_000 owed on top of
+    // the 500_000 debt) must NOT add to the reserve balance since it never
+    // left/entered the reserve as tokens.
+    assert_eq!(reserve.total_balance, 560_000);
+
+    assert!(
+        reserve.total_balance
+            >= client.get_total_deposited(&asset) - client.get_total_borrowed(&asset)
+    );
+}
+
+#[test]
+fn test_withdraw_after_implicit_accrual_uses_synced_reserve() {
+    // The implicit accrual inside withdraw() must update the reserve before
+    // the InsufficientReserve check runs, or a legitimate full withdrawal of
+    // the post-accrual supplier claim would incorrectly be blocked.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    client.deposit(&user, &asset, &1_000_000);
+    client.borrow(&user, &asset, &500_000);
+
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger()
+        .set_timestamp(ledger_timestamp + SECONDS_PER_YEAR);
+
+    // No explicit accrue_interest call - withdraw() must accrue internally
+    // and sync the reserve before its balance check.
+    client.repay(&user, &asset, &560_000);
+    client.withdraw(&user, &asset, &1_060_000);
+
+    let position = client.get_position(&user, &asset);
+    assert_eq!(position.deposited, 0);
+}
+
+#[test]
+fn test_repay_then_withdraw_full_claim_after_accrual() {
+    // After a full year of accrual, repaying the full accrued debt and then
+    // withdrawing the full accrued deposit must both succeed against a
+    // reserve balance that has been kept in sync throughout.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    client.deposit(&user, &asset, &1_000_000);
+    client.borrow(&user, &asset, &500_000);
+
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger()
+        .set_timestamp(ledger_timestamp + SECONDS_PER_YEAR);
+
+    client.repay(&user, &asset, &560_000);
+
+    // Reserve was 560_000 (1_000_000 deposited - 500_000 lent out + 60_000
+    // supplier interest) before repay; the full 560_000 debt repayment
+    // returns those tokens to the reserve.
+    let reserve_after_repay = client.get_asset_reserve(&asset);
+    assert_eq!(reserve_after_repay.total_balance, 1_120_000);
+    assert!(reserve_after_repay.total_balance >= 1_060_000);
+
+    client.withdraw(&user, &asset, &1_060_000);
+
+    let position = client.get_position(&user, &asset);
+    assert_eq!(position.deposited, 0);
+    assert_eq!(position.borrowed, 0);
+
+    let reserve_after_withdraw = client.get_asset_reserve(&asset);
+    assert_eq!(reserve_after_withdraw.total_balance, 60_000);
+}

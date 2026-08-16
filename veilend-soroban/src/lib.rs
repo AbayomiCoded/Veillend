@@ -1525,6 +1525,14 @@ impl VeilLendContract {
                 &DataKey::TotalDeposited(asset.clone()),
                 &(total_supplied + result.interest_to_suppliers),
             );
+
+            // Interest owed to suppliers is a new claim on the reserve, so the
+            // reserve's tracked balance must grow to back it. Borrow-side
+            // interest (below) is debt growth, not new reserve tokens, so it
+            // must NOT be added to total_balance.
+            let mut reserve = Self::read_asset_reserve(env, asset);
+            reserve.total_balance += result.interest_to_suppliers;
+            Self::write_asset_reserve(env, asset, &reserve);
         }
         if result.interest_to_borrowers != 0 {
             env.storage().persistent().set(
