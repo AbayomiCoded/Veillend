@@ -3,6 +3,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { fetchDashboardData } from '@/lib/api/dashboard';
+import { ActionTray } from '@/components/ActionTray';
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
@@ -114,6 +115,7 @@ export default async function DashboardPage() {
                 Last updated: {new Date(portfolio.lastUpdated).toLocaleString()}
               </p>
             </div>
+            <ActionTray userAddress={walletAddress} portfolio={portfolio} />
           </Flex>
         </Section>
 

@@ -20,9 +20,10 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { useWallet } from "@/context/WalletContext"
 import { WalletConnect } from "@/components/WalletConnect"
 import { WalletStatus } from "@/components/WalletStatus"
+import { ActionTray } from "@/components/ActionTray"
 
 export default function VeilLendDashboard() {
-  const { isConnected, isAuthenticated } = useWallet();
+  const { isConnected, isAuthenticated, address } = useWallet();
   // Global simulation states to demonstrate acceptance criteria loading/empty loops
   const [isLoading, setIsLoading] = React.useState<boolean>(false)
   const [isEmpty, setIsEmpty] = React.useState<boolean>(false)
@@ -96,6 +97,9 @@ export default function VeilLendDashboard() {
           </Button>
         </div>
       </div>
+
+      {/* Protocol Action Tray (Deposit / Withdraw / Borrow / Repay) */}
+      <ActionTray userAddress={address || undefined} />
 
       {/* --- LAYER 1: PROTOCOL RISK ENGINE OVERVIEW --- */}
       {!isEmpty && !isLoading && (
