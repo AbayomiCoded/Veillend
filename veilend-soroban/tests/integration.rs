@@ -757,7 +757,7 @@ fn test_oracle_staleness_tracking() {
     let client = VeilLendContractClient::new(&env, &contract_id);
 
     client.add_admin(&admin, &admin);
-    client.configure_asset(&admin, &asset, &true);
+    configure_asset(&env, &client, &admin, &asset);
 
     // Set initial price
     client.set_oracle_price(&admin, &asset, &100);
@@ -788,7 +788,7 @@ fn test_oracle_staleness_blocks_collateral_check() {
     let client = VeilLendContractClient::new(&env, &contract_id);
 
     client.add_admin(&admin, &admin);
-    client.configure_asset(&admin, &asset, &true);
+    configure_asset(&env, &client, &admin, &asset);
     client.set_oracle_price(&admin, &asset, &100);
 
     // Set max age to 1 hour
@@ -828,7 +828,7 @@ fn test_oracle_max_change_bps_blocks_excessive_volatility() {
     let client = VeilLendContractClient::new(&env, &contract_id);
 
     client.add_admin(&admin, &admin);
-    client.configure_asset(&admin, &asset, &true);
+    configure_asset(&env, &client, &admin, &asset);
 
     // Set initial price to 100
     client.set_oracle_price(&admin, &asset, &100);
@@ -871,7 +871,7 @@ fn test_oracle_price_bounds() {
     let client = VeilLendContractClient::new(&env, &contract_id);
 
     client.add_admin(&admin, &admin);
-    client.configure_asset(&admin, &asset, &true);
+    configure_asset(&env, &client, &admin, &asset);
 
     // Set bounds: min=1, max=1000
     client.set_oracle_price_bounds(&admin, &asset, &1, &1000);

@@ -857,7 +857,7 @@
             },
             "ext": "v0"
           },
-          4095
+          4195
         ]
       ],
       [
@@ -1200,18 +1200,6 @@
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                             }
                           ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "MaxOracleAge"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "86400"
                         }
                       },
                       {

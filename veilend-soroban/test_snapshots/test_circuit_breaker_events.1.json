@@ -317,18 +317,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "MaxOracleAge"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "86400"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "MinCollateralRatioBps"
                             }
                           ]
