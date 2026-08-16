@@ -1,44 +1,73 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, ScrollView, StyleSheet, TouchableOpacity, Image, Modal, TextInput, TouchableWithoutFeedback, Keyboard, KeyboardAvoidingView, Platform, Dimensions, FlatList } from 'react-native';
-import api from '../utils/api';
-import { useStore } from '../store/store';
+import { View, Text, ScrollView, StyleSheet, TouchableOpacity, Image, Modal, TouchableWithoutFeedback, Keyboard, Dimensions, FlatList, ActivityIndicator, RefreshControl } from 'react-native';
+import { useStore, TransactionRecord } from '../store/store';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import * as ImagePicker from 'expo-image-picker';
-import { MOCK_USER, MOCK_TRANSACTIONS } from '../data/mockData';
-import { shortenAddress } from '../utils/helpers';
+import { shortenAddress, getCurrencySymbol } from '../utils/helpers';
+import ProtocolStatusBanners from '../components/ProtocolStatusBanners';
+import OfflineBanner from '../components/OfflineBanner';
+import { ListSkeleton } from '../components/Skeletons';
 
 const { width } = Dimensions.get('window');
 const isSmallScreen = width < 380;
 const CARD_WIDTH = width - 48; // Padding 24 * 2
+const DEFAULT_PROFILE_IMAGE = 'https://i.pravatar.cc/100?img=5';
 
 
   
-  const CARDS = [
-    { label: 'Total Balance', value: MOCK_USER.balance, icon: 'wallet-outline' },
-    { label: 'Collateral Value', value: 8000.00, icon: 'shield-checkmark-outline' },
-    { label: 'Borrowed Value', value: 1000.00, icon: 'trending-down-outline' },
-  ];
-
 export default function DashboardScreen({ navigation }: any) {
-  const { address, logout, isPrivacyMode, togglePrivacyMode } = useStore();
-  const [data, setData] = useState(null as any);
+  const {
+    address,
+    authToken,
+    logout,
+    isPrivacyMode,
+    profileName,
+    profileImage,
+    currency,
+    togglePrivacyMode,
+    expectedNetwork,
+    currentNetwork,
+    lastProtocolSyncAt,
+    protocolStatusLoading,
+    refreshProtocolStatus,
+    balance,
+    collateralValue,
+    borrowedValue,
+    dashboardLoading,
+    dashboardError,
+    hydrateDashboard,
+    transactions,
+    transactionsLoading,
+    pendingTransactions,
+    refreshDashboard,
+    isOnline,
+  } = useStore();
+  const [initialLoad, setInitialLoad] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshAbortRef = useRef<AbortController | null>(null);
+  const allTransactions = [...pendingTransactions, ...transactions];
   
   // Profile Menu State
   const [profileVisible, setProfileVisible] = useState(false);
-  const [username, setUsername] = useState(address ? shortenAddress(address) : MOCK_USER.name);
-  const [isEditingName, setIsEditingName] = useState(false);
-  const [tempName, setTempName] = useState(address ? shortenAddress(address) : MOCK_USER.name);
-  const [profileImage, setProfileImage] = useState('https://i.pravatar.cc/100?img=5');
 
-  useEffect(() => {
-    if (address) {
-      const shortAddr = shortenAddress(address);
-      setUsername(shortAddr);
-      setTempName(shortAddr);
-    }
-  }, [address]);
+  const CARDS = [
+    { label: 'Total Balance', value: balance.toFixed(2), icon: 'wallet-outline' },
+    { label: 'Collateral Value', value: collateralValue.toFixed(2), icon: 'shield-checkmark-outline' },
+    { label: 'Borrowed Value', value: borrowedValue.toFixed(2), icon: 'trending-down-outline' },
+  ];
+
+  if (initialLoad && dashboardLoading) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0F172A' }}>
+        <ActivityIndicator size="large" color="#A855F7" />
+        <Text style={{ color: '#94A3B8', marginTop: 12 }}>Loading dashboard...</Text>
+      </View>
+    );
+  }
+  const defaultUsername = address ? shortenAddress(address) : 'Guest';
+  const username = profileName ?? defaultUsername;
+  const avatarUri = profileImage ?? DEFAULT_PROFILE_IMAGE;
 
   const handleLogout = () => {
     setProfileVisible(false);
@@ -46,25 +75,10 @@ export default function DashboardScreen({ navigation }: any) {
     navigation.replace('ConnectWallet');
   };
 
-  const saveUsername = () => {
-    setUsername(tempName);
-    setIsEditingName(false);
+  const handleStatusRetry = () => {
+    refreshProtocolStatus().catch(() => {});
   };
 
-  const pickImage = async () => {
-    // No permissions request is necessary for launching the image library
-    let result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 1,
-    });
-
-    if (!result.canceled) {
-      setProfileImage(result.assets[0].uri);
-    }
-  };
-  
   const onViewableItemsChanged = useRef(({ viewableItems }: any) => {
     if (viewableItems.length > 0) {
       setCurrentIndex(viewableItems[0].index || 0);
@@ -76,15 +90,29 @@ export default function DashboardScreen({ navigation }: any) {
   }).current;
 
   useEffect(() => {
-    fetchData();
+    // One-shot dashboard hydration: supported assets, portfolio, positions
+    // and transactions are fetched concurrently by the store.
+    hydrateDashboard().finally(() => setInitialLoad(false));
   }, []);
 
-  const fetchData = async () => {
-    // In a real app, you would fetch real data here
-    // For now, we use the hardcoded mock data for UI demo
-    setData({
-      positions: [] 
-    });
+  // Cancel any in-flight pull-to-refresh work when the screen unmounts.
+  useEffect(() => {
+    return () => refreshAbortRef.current?.abort();
+  }, []);
+
+  const handleRefresh = async () => {
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
+    setRefreshing(true);
+    try {
+      await refreshDashboard(controller.signal);
+    } catch (e) {
+      // refreshDashboard aggregates failures into dashboardError; keep the
+      // spinner from getting stuck if an unexpected error escapes.
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   const ServiceButton = ({ icon, label, onPress }: any) => (
@@ -120,9 +148,9 @@ export default function DashboardScreen({ navigation }: any) {
             <Text style={styles.cardLabel}>{item.label}</Text>
             <View style={styles.balanceRow}>
               <Text style={styles.balanceAmount}>
-                {isPrivacyMode 
-                  ? '****' 
-                  : `$${item.value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                {isPrivacyMode
+                  ? '****'
+                  : `${getCurrencySymbol(currency)}${item.value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
                 }
               </Text>
                {/* Masked number eye icon */}
@@ -132,7 +160,7 @@ export default function DashboardScreen({ navigation }: any) {
           
           {/* Added privacy shield top-right */}
           <View style={styles.privacyBadge}>
-            <Ionicons name={item.icon as any} size={isSmallScreen ? 16 : 20} color="#00D1FF" />
+            <Ionicons name={item.icon as string} size={isSmallScreen ? 16 : 20} color="#00D1FF" />
             <Text style={styles.privacyText}>ZK Shielded</Text>
           </View>
         </View>
@@ -156,7 +184,18 @@ export default function DashboardScreen({ navigation }: any) {
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView
+      style={styles.container}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
+          tintColor="#A855F7"
+          colors={['#A855F7']}
+          progressBackgroundColor="#1A1A1A"
+        />
+      }
+    >
       {/* Header */}
       <View style={styles.header}>
         <View>
@@ -169,12 +208,38 @@ export default function DashboardScreen({ navigation }: any) {
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setProfileVisible(true)}>
             <Image 
-              source={{ uri: profileImage }} 
+              source={{ uri: avatarUri }} 
               style={styles.avatar} 
             />
           </TouchableOpacity>
         </View>
       </View>
+
+      <ProtocolStatusBanners
+        expectedNetwork={expectedNetwork}
+        currentNetwork={currentNetwork}
+        walletConnected={Boolean(address && authToken)}
+        lastSyncedAt={lastProtocolSyncAt}
+        isRefreshing={protocolStatusLoading}
+        isOnline={isOnline}
+        onReconnect={handleLogout}
+        onRetrySync={handleStatusRetry}
+      />
+
+      {/* Aggregate hydration error with retry */}
+      {dashboardError ? (
+        <View style={styles.errorBanner}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.errorBannerText}>{dashboardError}</Text>
+          </View>
+          <TouchableOpacity
+            style={styles.errorBannerBtn}
+            onPress={() => hydrateDashboard().catch(() => {})}
+          >
+            <Text style={styles.errorBannerBtnText}>Retry</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       {/* Profile Menu Modal */}
       <Modal
@@ -187,6 +252,7 @@ export default function DashboardScreen({ navigation }: any) {
           <View style={styles.modalOverlay}>
             <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
               <View style={styles.modalContent}>
+                <OfflineBanner />
                 <View style={styles.modalHeader}>
                   <Text style={styles.modalTitle}>Profile</Text>
                   <TouchableOpacity onPress={() => setProfileVisible(false)}>
@@ -194,72 +260,26 @@ export default function DashboardScreen({ navigation }: any) {
                   </TouchableOpacity>
                 </View>
 
-                {/* Profile Setup / Username */}
-                <View style={styles.menuItem}>
-                  <View style={styles.menuIconBox}>
-                    <Ionicons name="person" size={20} color="#00D1FF" />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.menuLabel}>Username</Text>
-                    {isEditingName ? (
-                      <View style={styles.editNameContainer}>
-                        <TextInput
-                          style={styles.nameInput}
-                          value={tempName}
-                          onChangeText={setTempName}
-                          autoFocus
-                          placeholderTextColor="#555"
-                        />
-                        <TouchableOpacity onPress={saveUsername} style={styles.saveBtn}>
-                          <Ionicons name="checkmark" size={18} color="#000" />
-                        </TouchableOpacity>
-                      </View>
-                    ) : (
-                      <View style={styles.nameDisplayRow}>
-                        <Text style={styles.menuValue}>{username}</Text>
-                        <TouchableOpacity onPress={() => {
-                          setTempName(username);
-                          setIsEditingName(true);
-                        }}>
-                          <Ionicons name="pencil" size={16} color="#A855F7" style={{ marginLeft: 8 }} />
-                        </TouchableOpacity>
-                      </View>
-                    )}
-                  </View>
+                {/* Profile summary */}
+                <View style={styles.profileSummary}>
+                  <Image source={{ uri: avatarUri }} style={styles.largeAvatar} />
+                  <Text style={styles.profileSummaryName}>{username}</Text>
                 </View>
 
-                {/* Change Profile Picture */}
-                <TouchableOpacity style={styles.menuItem} onPress={pickImage}>
-                  <View style={styles.menuIconBox}>
-                    <Ionicons name="camera" size={20} color="#00D1FF" />
-                  </View>
-                  <View>
-                    <Text style={styles.menuLabel}>Change Profile Picture</Text>
-                    <Text style={styles.menuSubLabel}>Update your avatar</Text>
-                  </View>
-                  <Ionicons name="chevron-forward" size={20} color="#555" style={{ marginLeft: 'auto' }} />
-                </TouchableOpacity>
-
-                {/* Account Preference */}
-                <TouchableOpacity style={styles.menuItem}>
+                {/* Settings */}
+                <TouchableOpacity
+                  style={styles.menuItem}
+                  onPress={() => {
+                    setProfileVisible(false);
+                    navigation.navigate('Settings');
+                  }}
+                >
                   <View style={styles.menuIconBox}>
                     <Ionicons name="settings" size={20} color="#A855F7" />
                   </View>
                   <View>
-                    <Text style={styles.menuLabel}>Account Preferences</Text>
-                    <Text style={styles.menuSubLabel}>Currency, Notifications, Privacy</Text>
-                  </View>
-                  <Ionicons name="chevron-forward" size={20} color="#555" style={{ marginLeft: 'auto' }} />
-                </TouchableOpacity>
-
-                {/* Profile Setup (Generic) */}
-                 <TouchableOpacity style={styles.menuItem}>
-                  <View style={styles.menuIconBox}>
-                    <Ionicons name="build" size={20} color="#A855F7" />
-                  </View>
-                  <View>
-                    <Text style={styles.menuLabel}>Profile Setup</Text>
-                    <Text style={styles.menuSubLabel}>Complete your KYC/Verification</Text>
+                    <Text style={styles.menuLabel}>Settings</Text>
+                    <Text style={styles.menuSubLabel}>Profile, currency, notifications & privacy</Text>
                   </View>
                   <Ionicons name="chevron-forward" size={20} color="#555" style={{ marginLeft: 'auto' }} />
                 </TouchableOpacity>
@@ -332,22 +352,44 @@ export default function DashboardScreen({ navigation }: any) {
 
       {/* Transactions List */}
       <Text style={styles.sectionTitle}>Transactions</Text>
-      <View style={styles.transactionsList}>
-        {MOCK_TRANSACTIONS.map((tx) => (
-          <View key={tx.id} style={styles.txItem}>
-            <View style={styles.txLeft}>
-              <View style={styles.txIconBox}>
-                <Ionicons name={tx.icon as any} size={20} color="#fff" />
+      {transactionsLoading && allTransactions.length === 0 ? (
+        <ListSkeleton count={2} height={72} />
+      ) : allTransactions.length === 0 ? (
+        <View style={styles.txEmpty}>
+          <Text style={styles.txEmptyText}>No transactions yet</Text>
+        </View>
+      ) : (
+        <View style={styles.transactionsList}>
+          {allTransactions.map((tx: TransactionRecord) => (
+            <View key={tx.id} style={styles.txItem}>
+              <View style={styles.txLeft}>
+                <View style={styles.txIconBox}>
+                  <Ionicons
+                    name={(tx.type === 'deposit' ? 'arrow-down' : tx.type === 'withdraw' ? 'arrow-up' : 'swap-horizontal') as any}
+                    size={20}
+                    color="#fff"
+                  />
+                </View>
+                <View>
+                  <Text style={styles.txTitle}>{tx.type} — {tx.asset}</Text>
+                  <Text style={styles.txDate}>{tx.timestamp}</Text>
+                  {tx.status === 'PENDING' ? (
+                    <View style={styles.txStatusRow}>
+                      <ActivityIndicator size="small" color="#A855F7" />
+                      <Text style={[styles.txStatus, { color: '#A855F7' }]}>Pending</Text>
+                    </View>
+                  ) : tx.status === 'FAILED' ? (
+                    <Text style={[styles.txStatus, { color: '#FF4D4D' }]}>
+                      Failed{tx.errorReason ? ` — ${tx.errorReason}` : ''}
+                    </Text>
+                  ) : null}
+                </View>
               </View>
-              <View>
-                <Text style={styles.txTitle}>{tx.title}</Text>
-                <Text style={styles.txDate}>{tx.date}</Text>
-              </View>
+              <Text style={styles.txValue}>{tx.amount} {tx.asset}</Text>
             </View>
-            <Text style={styles.txValue}>{tx.value}</Text>
-          </View>
-        ))}
-      </View>
+          ))}
+        </View>
+      )}
       
       {/* Spacer for bottom tab bar */}
       <View style={{ height: 100 }} />
@@ -585,9 +627,15 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#fff',
   },
-  profileImageContainer: {
-    position: 'relative',
-    marginBottom: 8,
+  profileSummary: {
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  profileSummaryName: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 12,
   },
   largeAvatar: {
     width: 80,
@@ -595,23 +643,6 @@ const styles = StyleSheet.create({
     borderRadius: 40,
     borderWidth: 2,
     borderColor: '#A855F7',
-  },
-  cameraIconBadge: {
-    position: 'absolute',
-    bottom: 0,
-    right: 0,
-    backgroundColor: '#00D1FF',
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 2,
-    borderColor: '#121212',
-  },
-  editPhotoText: {
-    color: '#A1A1A1',
-    fontSize: 12,
   },
   menuItem: {
     flexDirection: 'row',
@@ -639,32 +670,6 @@ const styles = StyleSheet.create({
   menuSubLabel: {
     fontSize: 12,
     color: '#888',
-  },
-  menuValue: {
-    fontSize: 16,
-    color: '#ccc',
-  },
-  nameDisplayRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  editNameContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  nameInput: {
-    flex: 1,
-    color: '#fff',
-    fontSize: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#A855F7',
-    paddingVertical: 4,
-    marginRight: 10,
-  },
-  saveBtn: {
-    backgroundColor: '#00D1FF',
-    padding: 6,
-    borderRadius: 8,
   },
   divider: {
     height: 1,
@@ -696,5 +701,53 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  txStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 4,
+  },
+  txStatus: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  txEmpty: {
+    alignItems: 'center',
+    paddingVertical: 32,
+    backgroundColor: '#121212',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#222',
+  },
+  txEmptyText: {
+    color: '#666',
+    fontSize: 14,
+  },
+  errorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: 'rgba(255, 77, 77, 0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 77, 77, 0.25)',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 24,
+  },
+  errorBannerText: {
+    color: '#FF4D4D',
+    fontSize: 13,
+  },
+  errorBannerBtn: {
+    backgroundColor: '#FF4D4D',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  errorBannerBtnText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 13,
   },
 });

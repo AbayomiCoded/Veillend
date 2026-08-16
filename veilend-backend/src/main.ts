@@ -1,16 +1,40 @@
 import { NestFactory } from '@nestjs/core';
-import { ConfigService } from '@nestjs/config';
+import {
+  BadRequestException,
+  ValidationError,
+  ValidationPipe,
+} from '@nestjs/common';
 import helmet from 'helmet';
 import express from 'express';
 import { AppModule } from './app.module';
+import { AppLoggerService } from './common/logging/app-logger.service';
+import { AppConfigService } from './config/app-config.service';
 import { createOriginCheckMiddleware } from './middleware/origin-check';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
-  const configService = app.get(ConfigService);
+  const app = await NestFactory.create(AppModule, {
+    bufferLogs: true,
+    bodyParser: false,
+  });
+
+  app.useLogger(app.get(AppLoggerService));
+
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+      exceptionFactory: (errors: ValidationError[]) => {
+        const message = errors
+          .flatMap((error) => Object.values(error.constraints ?? {}))
+          .join('; ');
+        return new BadRequestException(message || 'Validation failed');
+      },
+    }),
+  );
 
   // ── CORS allowlist ────────────────────────────────────────────────────────
-  const envOrigins = configService.get<string>('CORS_ORIGINS', '');
+  const envOrigins = process.env.CORS_ORIGINS ?? '';
   const allowlist: string[] = [
     'http://localhost:3000',
     'http://localhost:8081',
@@ -34,22 +58,18 @@ async function bootstrap() {
   });
 
   // ── Security headers ──────────────────────────────────────────────────────
-  const isProduction = configService.get<string>('NODE_ENV') === 'production';
+  const isProduction = process.env.NODE_ENV === 'production';
   app.use(
     helmet({
-      // CSP is intentionally disabled — handled by the frontend reverse-proxy layer
       contentSecurityPolicy: false,
-      // HSTS only on production (mainnet); disable for local dev
       hsts: isProduction
         ? { maxAge: 31536000, includeSubDomains: true }
         : false,
-      // Remaining defaults (xContentTypeOptions, referrerPolicy, xFrameOptions, etc.)
       referrerPolicy: { policy: 'no-referrer' },
       frameguard: { action: 'deny' },
     }),
   );
 
-  // Permissions-Policy (not yet shipped by helmet as a default)
   app.use(
     (
       _req: express.Request,
@@ -65,13 +85,11 @@ async function bootstrap() {
   );
 
   // ── Body size limits ──────────────────────────────────────────────────────
-  // Indexer replay routes may carry large event arrays — allow 5 MB
   app.use('/indexer/replay', express.json({ limit: '5mb' }));
-  // All other routes — explicit 100 KB cap
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-  const port = configService.get<number>('PORT', 3000);
-  await app.listen(port);
+  const config = app.get(AppConfigService);
+  await app.listen(config.port);
 }
 void bootstrap();
