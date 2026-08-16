@@ -1,7 +1,18 @@
-import { DashboardData, ActivityActionType, AssetBalance } from '../types/dashboard';
+import { DashboardData, HfBreakdownItem, ActivityActionType, AssetBalance } from '../types/dashboard';
 import { backendFetch } from '@/lib/server/backendFetch';
+import {
+  buildAssetRegistry,
+  registryDecimals,
+  registrySymbol,
+  registryName,
+  registryMcr,
+  warnRegistryUnavailable,
+} from './assetRegistry';
 
-// Define types for API responses
+// ---------------------------------------------------------------------------
+// API response shapes
+// ---------------------------------------------------------------------------
+
 interface IndexerPosition {
   assetAddress: string;
   depositedAmount: string | number;
@@ -21,109 +32,170 @@ interface OraclePrice {
   [assetAddress: string]: number;
 }
 
+interface RawAssetDto {
+  symbol?: string;
+  code?: string;
+  name?: string;
+  decimals?: number;
+  contractId?: string | null;
+  isNative?: boolean;
+  logoUrl?: string | null;
+  minCollateralRatio?: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Main function
+// ---------------------------------------------------------------------------
+
 /**
- * Fetches live dashboard data for a specific wallet address
- * @param address - Stellar wallet address (must start with 'G')
- * @returns Promise<DashboardData>
- * @throws Error if address is invalid or API calls fail
+ * Fetches live dashboard data for a specific wallet address.
+ * Uses per-asset decimals and MCR from the /assets registry (falls back
+ * to hardcoded table when endpoint is unavailable).
  */
 export async function fetchDashboardData(address: string): Promise<DashboardData> {
-  // Validate address
   if (!address || !address.startsWith('G')) {
     throw new Error('Invalid Stellar address provided. Address must start with "G".');
   }
 
   try {
-    const [positionsRes, transactionsRes, pricesRes] = await Promise.all([
-      backendFetch(`/indexer/positions/${address}`, { 
+    // Fetch all four in parallel; /assets is non-fatal (5-min revalidate)
+    const [positionsRes, transactionsRes, pricesRes, assetsRes] = await Promise.all([
+      backendFetch(`/indexer/positions/${address}`, {
         next: { revalidate: 10 },
-        headers: { 'Cache-Control': 'no-cache' }
+        headers: { 'Cache-Control': 'no-cache' },
       }),
-      backendFetch(`/indexer/transactions/${address}`, { 
+      backendFetch(`/indexer/transactions/${address}`, {
         next: { revalidate: 10 },
-        headers: { 'Cache-Control': 'no-cache' }
+        headers: { 'Cache-Control': 'no-cache' },
       }),
-      backendFetch(`/oracle/prices`, { 
+      backendFetch(`/oracle/prices`, {
         next: { revalidate: 10 },
-        headers: { 'Cache-Control': 'no-cache' }
-      })
+        headers: { 'Cache-Control': 'no-cache' },
+      }),
+      // Non-fatal: registry miss → fallback table
+      backendFetch(`/assets`, { next: { revalidate: 300 } }).catch(() => null),
     ]);
 
     if (!positionsRes.ok || !transactionsRes.ok || !pricesRes.ok) {
-      const errorDetails = {
-        positions: positionsRes.status,
-        transactions: transactionsRes.status,
-        prices: pricesRes.status
-      };
-      throw new Error(`Failed to fetch data from indexer: ${JSON.stringify(errorDetails)}`);
+      throw new Error(
+        `Failed to fetch data from indexer: ${JSON.stringify({
+          positions: positionsRes.status,
+          transactions: transactionsRes.status,
+          prices: pricesRes.status,
+        })}`,
+      );
     }
 
+    // ── Parse asset registry ──────────────────────────────────────────────
+    const rawAssetsJson = assetsRes?.ok
+      ? (await assetsRes.json() as { data?: RawAssetDto[]; assets?: RawAssetDto[] } | RawAssetDto[])
+      : null;
+
+    let rawAssets: RawAssetDto[] = [];
+    if (rawAssetsJson) {
+      if (Array.isArray(rawAssetsJson)) {
+        rawAssets = rawAssetsJson;
+      } else {
+        rawAssets = rawAssetsJson.data ?? rawAssetsJson.assets ?? [];
+      }
+    } else {
+      warnRegistryUnavailable();
+    }
+    const registry = buildAssetRegistry(rawAssets);
+
+    // ── Parse core data ───────────────────────────────────────────────────
     const positionsData = await positionsRes.json() as { positions: IndexerPosition[] };
     const transactionsData = await transactionsRes.json() as { transactions: IndexerTransaction[] };
     const pricesData = await pricesRes.json() as { prices: OraclePrice };
 
-    // Validate response structure
     if (!positionsData.positions || !Array.isArray(positionsData.positions)) {
       throw new Error('Invalid positions data format received from indexer');
     }
 
+    const positions = positionsData.positions;
+    const transactions = transactionsData.transactions ?? [];
+    const prices = pricesData.prices ?? {};
+
+    // ── Process positions ─────────────────────────────────────────────────
     let totalDepositedUsd = 0;
     let totalBorrowedUsd = 0;
     const depositedAssets: AssetBalance[] = [];
     const borrowedAssets: AssetBalance[] = [];
+    const hfBreakdown: HfBreakdownItem[] = [];
+    let weightedCollateral = 0;
+    let missingMcrSymbol: string | null = null;
 
-    // Map positions with real oracle prices
-    const positions = positionsData.positions || [];
-    const transactions = transactionsData.transactions || [];
-    const prices = pricesData.prices || {};
-
-    positions.forEach((pos: IndexerPosition) => {
-      const deposited = Number(pos.depositedAmount) / 1e7;
-      const borrowed = Number(pos.borrowedAmount) / 1e7;
-      
-      // Use oracle price, fallback to 0 if not available
-      const price = prices[pos.assetAddress] || 0;
+    for (const pos of positions) {
+      const decimals = registryDecimals(registry, pos.assetAddress);
+      const deposited = Number(pos.depositedAmount) / (10 ** decimals);
+      const borrowed  = Number(pos.borrowedAmount)  / (10 ** decimals);
+      const symbol    = registrySymbol(registry, pos.assetAddress);
+      const name      = registryName(registry, pos.assetAddress);
+      const price     = prices[pos.assetAddress] ?? 0;
+      const logoUrl   = registry.get(pos.assetAddress)?.logoUrl ?? undefined;
+      const mcr       = registryMcr(registry, pos.assetAddress);
 
       if (deposited > 0 && price > 0) {
         const usdValue = deposited * price;
         totalDepositedUsd += usdValue;
         depositedAssets.push({
-          assetSymbol: extractAssetSymbol(pos.assetAddress),
-          assetName: pos.assetAddress,
+          assetSymbol: symbol,
+          assetName: name,
           balance: deposited,
           usdValue,
+          decimals,
+          minCollateralRatio: mcr ?? undefined,
+          logoUrl,
         });
+        if (mcr != null) {
+          const weighted = usdValue * mcr;
+          weightedCollateral += weighted;
+          hfBreakdown.push({ symbol, depositedUsd: usdValue, minCollateralRatio: mcr, weightedUsd: weighted });
+        } else if (usdValue > 0 && !missingMcrSymbol) {
+          missingMcrSymbol = symbol;
+        }
       }
 
       if (borrowed > 0 && price > 0) {
         const usdValue = borrowed * price;
         totalBorrowedUsd += usdValue;
         borrowedAssets.push({
-          assetSymbol: extractAssetSymbol(pos.assetAddress),
-          assetName: pos.assetAddress,
+          assetSymbol: symbol,
+          assetName: name,
           balance: borrowed,
           usdValue,
+          decimals,
+          logoUrl,
         });
       }
-    });
+    }
 
-    // Calculate health factor with proper LTV
-    const healthFactor = totalBorrowedUsd === 0 
-      ? Infinity 
-      : Math.min((totalDepositedUsd * 0.8) / totalBorrowedUsd, 99.99);
-    
+    // ── Health factor (per-asset MCR weighted) ────────────────────────────
+    let healthFactor: number;
+    let hfWarning: string | undefined;
+
+    if (totalBorrowedUsd === 0) {
+      healthFactor = Infinity;
+    } else if (missingMcrSymbol) {
+      healthFactor = -1; // sentinel — UI should show hfWarning instead
+      hfWarning = 'Asset registry not loaded — refresh';
+    } else {
+      healthFactor = Math.min(weightedCollateral / totalBorrowedUsd, 99.99);
+    }
+
     const totalBalanceUsd = totalDepositedUsd - totalBorrowedUsd;
 
-    // Map transactions with real prices
-    const recentActivity = Array.isArray(transactions) 
+    // ── Process transactions ──────────────────────────────────────────────
+    const recentActivity = Array.isArray(transactions)
       ? transactions
           .map((tx: IndexerTransaction) => {
-            const amount = Number(tx.amount) / 1e7;
-            const price = prices[tx.assetAddress] || 0;
+            const decimals = registryDecimals(registry, tx.assetAddress);
+            const amount   = Number(tx.amount) / (10 ** decimals);
+            const price    = prices[tx.assetAddress] ?? 0;
             return {
               id: tx.id,
               action: mapTransactionType(tx.type),
-              assetSymbol: extractAssetSymbol(tx.assetAddress),
+              assetSymbol: registrySymbol(registry, tx.assetAddress),
               amount,
               usdValue: amount * price,
               timestamp: tx.timestamp,
@@ -145,13 +217,13 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
         depositedAssets,
         borrowedAssets,
         lastUpdated: new Date().toISOString(),
+        hfBreakdown,
+        hfWarning,
       },
       recentActivity,
     };
   } catch (error) {
     console.error('Dashboard API Error:', error);
-    
-    // Re-throw with user-friendly message
     if (error instanceof Error) {
       throw new Error(`Failed to load dashboard data: ${error.message}`);
     }
@@ -159,26 +231,10 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
   }
 }
 
-/**
- * Extracts a short asset symbol from the asset address
- * @param assetAddress - Full asset address
- * @returns 4-character symbol
- */
-function extractAssetSymbol(assetAddress: string): string {
-  // For production, this should use a proper mapping from the backend
-  // or extract from the asset code if available
-  if (assetAddress.includes('USDC')) return 'USDC';
-  if (assetAddress.includes('XLM')) return 'XLM';
-  if (assetAddress.includes('BTC')) return 'BTC';
-  if (assetAddress.includes('ETH')) return 'ETH';
-  return assetAddress.slice(-4);
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-/**
- * Maps transaction type to ActivityActionType
- * @param type - Raw transaction type from indexer
- * @returns Normalized ActivityActionType
- */
 function mapTransactionType(type: string): ActivityActionType {
   const normalizedType = type.toUpperCase();
   switch (normalizedType) {

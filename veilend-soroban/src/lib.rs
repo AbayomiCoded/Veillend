@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 /// Increment this only when a contract interface change requires consumers to adapt.
-pub const CONTRACT_VERSION: u32 = 3;
+pub const CONTRACT_VERSION: u32 = 4;
 
 /// Increment this only when the serialized `DataKey` or stored value layout changes.
 pub const STORAGE_SCHEMA_VERSION: u32 = 3;
@@ -88,6 +88,9 @@ pub enum DataKey {
     OracleMaxPrice(Address),
     /// Protocol-wide maximum oracle age in seconds
     MaxOracleAge,
+    /// Admin-configured upper bound on single-call protocol fees, in bps.
+    /// 0 (default / never set) means the bound is disabled.
+    MaxProtocolFeeBps,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +235,17 @@ pub enum VeilLendError {
     OraclePriceBelowMin = 25,
     /// Oracle price is above maximum allowed price
     OraclePriceAboveMax = 26,
+    /// Cannot disable an asset that still has active deposited or borrowed balances.
+    /// Disabling such an asset would permanently trap user funds because every
+    /// lending entrypoint calls require_supported_asset.
+    AssetHasActivePositions = 27,
+    /// Proposed cap is below the current outstanding total for that asset.
+    /// Setting a cap below the live total creates an immediately-violated
+    /// invariant and could block users from repaying or withdrawing.
+    CapBelowOutstanding = 28,
+    /// The requested protocol fee exceeds the admin-configured max_protocol_fee_bps
+    /// limit. Without this bound an admin could drain user funds disguised as fees.
+    ProtocolFeeExceedsLimit = 29,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -882,46 +896,64 @@ impl VeilLendContract {
         Self::publish_asset_reserve_updated(&env, &asset, &reserve, ReserveUpdateKind::Deposit);
     }
 
-    pub fn borrow(env: Env, user: Address, asset: Address, amount: i128) {
+    pub fn borrow(
+        env: Env,
+        user: Address,
+        borrow_asset: Address,
+        collateral_asset: Address,
+        amount: i128,
+    ) {
         Self::require_not_paused(&env);
-        Self::require_supported_asset(&env, &asset);
+        Self::require_supported_asset(&env, &borrow_asset);
+        Self::require_supported_asset(&env, &collateral_asset);
         Self::require_positive_amount(&env, amount);
         user.require_auth();
 
         // Accrue interest first so both the cap check below and the totals
         // we write reflect up-to-date, time-aware values.
-        let interest_state = Self::accrue_and_persist_interest(&env, &asset);
+        let interest_state = Self::accrue_and_persist_interest(&env, &borrow_asset);
 
         // Check borrow cap
-        Self::check_borrow_cap(&env, &asset, amount);
+        Self::check_borrow_cap(&env, &borrow_asset, amount);
 
         let mut position = interest::compute_accrued_position(
-            &Self::read_position(&env, &user, &asset),
+            &Self::read_position(&env, &user, &borrow_asset),
             &interest_state,
         );
-        let mut reserve = Self::read_asset_reserve(&env, &asset);
+        let mut reserve = Self::read_asset_reserve(&env, &borrow_asset);
         if amount > reserve.total_balance {
             panic_with_error!(&env, VeilLendError::InsufficientReserve);
         }
         position.borrowed += amount;
         reserve.total_balance -= amount;
-        Self::assert_collateralized(&env, &user, &asset, &position);
-        Self::write_position(&env, &user, &asset, &position);
-        Self::write_asset_reserve(&env, &asset, &reserve);
+        Self::assert_collateralized(
+            &env,
+            &collateral_asset,
+            &borrow_asset,
+            &user,
+            CollateralAction::Borrow { amount },
+        );
+        Self::write_position(&env, &user, &borrow_asset, &position);
+        Self::write_asset_reserve(&env, &borrow_asset, &reserve);
 
         // Update total borrows
-        let total = Self::get_total_borrowed(env.clone(), asset.clone()) + amount;
+        let total = Self::get_total_borrowed(env.clone(), borrow_asset.clone()) + amount;
         env.storage()
             .persistent()
-            .set(&DataKey::TotalBorrowed(asset.clone()), &total);
+            .set(&DataKey::TotalBorrowed(borrow_asset.clone()), &total);
 
         BorrowEvent {
             user,
-            asset: asset.clone(),
+            asset: borrow_asset.clone(),
             amount,
         }
         .publish(&env);
-        Self::publish_asset_reserve_updated(&env, &asset, &reserve, ReserveUpdateKind::Borrow);
+        Self::publish_asset_reserve_updated(
+            &env,
+            &borrow_asset,
+            &reserve,
+            ReserveUpdateKind::Borrow,
+        );
     }
 
     pub fn repay(env: Env, user: Address, asset: Address, amount: i128) {
@@ -968,19 +1000,26 @@ impl VeilLendContract {
         Self::publish_asset_reserve_updated(&env, &asset, &reserve, ReserveUpdateKind::Repay);
     }
 
-    pub fn withdraw(env: Env, user: Address, asset: Address, amount: i128) {
+    pub fn withdraw(
+        env: Env,
+        user: Address,
+        withdrawn_asset: Address,
+        debt_asset: Address,
+        amount: i128,
+    ) {
         // Withdraw is allowed even when paused (users can always remove collateral)
-        Self::require_supported_asset(&env, &asset);
+        Self::require_supported_asset(&env, &withdrawn_asset);
+        Self::require_supported_asset(&env, &debt_asset);
         Self::require_positive_amount(&env, amount);
         user.require_auth();
 
-        let interest_state = Self::accrue_and_persist_interest(&env, &asset);
+        let interest_state = Self::accrue_and_persist_interest(&env, &withdrawn_asset);
 
         let mut position = interest::compute_accrued_position(
-            &Self::read_position(&env, &user, &asset),
+            &Self::read_position(&env, &user, &withdrawn_asset),
             &interest_state,
         );
-        let mut reserve = Self::read_asset_reserve(&env, &asset);
+        let mut reserve = Self::read_asset_reserve(&env, &withdrawn_asset);
         if amount > position.deposited {
             panic_with_error!(&env, VeilLendError::InsufficientDeposit);
         }
@@ -990,30 +1029,34 @@ impl VeilLendContract {
 
         position.deposited -= amount;
         reserve.total_balance -= amount;
-
-        let mut dust_delta = 0;
-        if position.deposited > 0 && position.deposited <= DUST_THRESHOLD {
-            dust_delta = position.deposited;
-            position.deposited = 0;
-        }
-
-        Self::assert_collateralized(&env, &user, &asset, &position);
-        Self::write_position(&env, &user, &asset, &position);
-        Self::write_asset_reserve(&env, &asset, &reserve);
+        Self::assert_collateralized(
+            &env,
+            &withdrawn_asset,
+            &debt_asset,
+            &user,
+            CollateralAction::Withdraw { amount },
+        );
+        Self::write_position(&env, &user, &withdrawn_asset, &position);
+        Self::write_asset_reserve(&env, &withdrawn_asset, &reserve);
 
         // Update total deposits
-        let total = Self::get_total_deposited(env.clone(), asset.clone()) - amount - dust_delta;
+        let total = Self::get_total_deposited(env.clone(), withdrawn_asset.clone()) - amount;
         env.storage()
             .persistent()
-            .set(&DataKey::TotalDeposited(asset.clone()), &total);
+            .set(&DataKey::TotalDeposited(withdrawn_asset.clone()), &total);
 
         WithdrawEvent {
             user,
-            asset: asset.clone(),
+            asset: withdrawn_asset.clone(),
             amount,
         }
         .publish(&env);
-        Self::publish_asset_reserve_updated(&env, &asset, &reserve, ReserveUpdateKind::Withdraw);
+        Self::publish_asset_reserve_updated(
+            &env,
+            &withdrawn_asset,
+            &reserve,
+            ReserveUpdateKind::Withdraw,
+        );
     }
 
     /// Returns a user's position with any interest accrued since their last
@@ -1095,12 +1138,53 @@ impl VeilLendContract {
         Self::cancel_action(&env, &admin, action_id, ActionKind::RecordProtocolFee);
     }
 
+    /// Sets the maximum protocol fee that may be recorded in a single
+    /// `record_protocol_fee` call, expressed as basis points of the asset's
+    /// net reserve (total_balance − protocol_fees).
+    ///
+    /// - `bps = 0` (the default if this function is never called) **disables**
+    ///   the bound entirely, preserving backward-compatible behaviour for any
+    ///   deployment that has not opted in to fee caps.
+    /// - Maximum settable value is 5000 (50 %).  Values above 5000 are rejected
+    ///   with `InvalidCap` (reusing the existing cap-validation error rather than
+    ///   introducing a new code for a closely related concept).
+    ///
+    /// This is an immediate (non-timelocked) admin-only setter, matching the
+    /// same pattern as `set_timelock_ledgers`.
+    pub fn set_max_protocol_fee_bps(env: Env, admin: Address, bps: u32) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        // 5000 bps = 50%; anything higher is treated as misconfiguration.
+        // InvalidCap is reused here (rather than a new error code) because this
+        // is semantically identical to setting an invalid asset cap: both are
+        // admin-supplied bounds that fall outside the allowed range.
+        const MAX_FEE_BPS: u32 = 5_000;
+        if bps > MAX_FEE_BPS {
+            panic_with_error!(&env, VeilLendError::InvalidCap);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxProtocolFeeBps, &bps);
+    }
+
     pub fn min_collateral_ratio_bps(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::MinCollateralRatioBps)
             .unwrap_or(15_000)
     }
+}
+
+/// Describes the pending mutation being validated against the cross-asset
+/// collateral ratio. `assert_collateralized` reads both positions from
+/// storage and applies this delta before computing the ratio.
+enum CollateralAction {
+    /// A borrow of `amount` is about to increase the debt position.
+    Borrow { amount: i128 },
+    /// A withdraw of `amount` is about to decrease the collateral position.
+    Withdraw { amount: i128 },
 }
 
 impl VeilLendContract {
@@ -1293,6 +1377,18 @@ impl VeilLendContract {
     }
 
     fn apply_configure_asset(env: &Env, admin: &Address, asset: &Address, supported: bool) {
+        // Guard: refuse to disable an asset that still has active user balances.
+        // If we allowed this, every lending entrypoint would call
+        // require_supported_asset and immediately panic, permanently trapping
+        // any funds deposited or borrowed against this asset.
+        if !supported {
+            let total_deposited = Self::get_total_deposited(env.clone(), asset.clone());
+            let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
+            if total_deposited != 0 || total_borrowed != 0 {
+                panic_with_error!(env, VeilLendError::AssetHasActivePositions);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::SupportedAsset(asset.clone()), &supported);
@@ -1439,6 +1535,25 @@ impl VeilLendContract {
         deposit_cap: i128,
         borrow_cap: i128,
     ) {
+        // Guard: refuse to set a cap below the current outstanding total.
+        // Setting deposit_cap < total_deposited (or borrow_cap < total_borrowed)
+        // creates an immediately-violated invariant: the protocol would report
+        // that users have more outstanding than the cap allows, and could block
+        // repayments or withdrawals indirectly.  -1 is the "unlimited" sentinel
+        // and is always allowed regardless of outstanding totals.
+        if deposit_cap != -1 {
+            let total_deposited = Self::get_total_deposited(env.clone(), asset.clone());
+            if deposit_cap < total_deposited {
+                panic_with_error!(env, VeilLendError::CapBelowOutstanding);
+            }
+        }
+        if borrow_cap != -1 {
+            let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
+            if borrow_cap < total_borrowed {
+                panic_with_error!(env, VeilLendError::CapBelowOutstanding);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::DepositCap(asset.clone()), &deposit_cap);
@@ -1476,6 +1591,26 @@ impl VeilLendContract {
         Self::accrue_and_persist_interest(env, asset);
 
         let mut reserve = Self::read_asset_reserve(env, asset);
+
+        // Guard: if the admin has configured a max_protocol_fee_bps cap, enforce
+        // it.  A value of 0 (the default) means the bound is disabled, preserving
+        // backward-compatible behaviour for deployments that never call
+        // set_max_protocol_fee_bps.  Without this guard an admin could record
+        // arbitrarily large "fees" that drain the net reserve and effectively
+        // steal deposited user funds.
+        let max_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxProtocolFeeBps)
+            .unwrap_or(0);
+        if max_bps != 0 {
+            let net_reserve = reserve.total_balance - reserve.protocol_fees;
+            let max_allowed = net_reserve * max_bps as i128 / 10_000;
+            if amount > max_allowed {
+                panic_with_error!(env, VeilLendError::ProtocolFeeExceedsLimit);
+            }
+        }
+
         reserve.total_balance += amount;
         reserve.protocol_fees += amount;
         Self::write_asset_reserve(env, asset, &reserve);
@@ -1687,13 +1822,63 @@ impl VeilLendContract {
         }
     }
 
-    fn assert_collateralized(env: &Env, _user: &Address, asset: &Address, position: &Position) {
-        if position.borrowed == 0 {
+    /// Validates a user's post-action cross-asset collateral health.
+    ///
+    /// `collateral_asset` and `debt_asset` may differ: the collateral value
+    /// is `deposited(collateral_asset) × price(collateral_asset)` and the
+    /// debt value is `borrowed(debt_asset) × price(debt_asset)`. The ratio
+    /// `collateral_value / debt_value` must be ≥ `min_collateral_ratio_bps`.
+    ///
+    /// Both positions are read from storage (with interest simulated in) and
+    /// then `action_delta` is applied, so the caller may invoke this before
+    /// persisting its own mutation.
+    fn assert_collateralized(
+        env: &Env,
+        collateral_asset: &Address,
+        debt_asset: &Address,
+        user: &Address,
+        action_delta: CollateralAction,
+    ) {
+        let collateral_position = Self::read_accrued_position(env, user, collateral_asset);
+        let debt_position = Self::read_accrued_position(env, user, debt_asset);
+
+        let mut collateral_deposited = collateral_position.deposited;
+        let mut debt_borrowed = debt_position.borrowed;
+
+        match action_delta {
+            CollateralAction::Borrow { amount } => debt_borrowed += amount,
+            CollateralAction::Withdraw { amount } => collateral_deposited -= amount,
+        }
+
+        if debt_borrowed == 0 {
             return;
         }
 
         let collateral_ratio_bps = Self::min_collateral_ratio_bps(env.clone()) as i128;
 
+        // Fetch the oracle price for BOTH assets independently; a missing or
+        // stale price on either side is a hard failure.
+        let collateral_price = Self::read_oracle_price(env, collateral_asset);
+        let debt_price = Self::read_oracle_price(env, debt_asset);
+
+        let collateral_value = collateral_deposited * collateral_price;
+        let borrowed_value = debt_borrowed * debt_price;
+
+        if collateral_value * 10_000 < borrowed_value * collateral_ratio_bps {
+            panic_with_error!(env, VeilLendError::InsufficientCollateral);
+        }
+    }
+
+    /// Reads a position with interest accrued up to the current ledger time
+    /// simulated in, without persisting anything.
+    fn read_accrued_position(env: &Env, user: &Address, asset: &Address) -> Position {
+        let state = Self::simulate_accrued_interest_state(env, asset);
+        interest::compute_accrued_position(&Self::read_position(env, user, asset), &state)
+    }
+
+    /// Returns an asset's oracle price, panicking with `OraclePriceMissing`
+    /// if unset and `OraclePriceStale` if it has exceeded `MaxOracleAge`.
+    fn read_oracle_price(env: &Env, asset: &Address) -> i128 {
         // Get oracle price for the asset — fail explicitly if not set
         let price: i128 = env
             .storage()
@@ -1719,13 +1904,7 @@ impl VeilLendContract {
             }
         }
 
-        // Calculate collateral value using oracle price
-        let collateral_value = position.deposited * price;
-        let borrowed_value = position.borrowed * price;
-
-        if collateral_value * 10_000 < borrowed_value * collateral_ratio_bps {
-            panic_with_error!(env, VeilLendError::InsufficientCollateral);
-        }
+        price
     }
 }
 
@@ -1783,13 +1962,16 @@ mod tests {
         assert_eq!(VeilLendError::OraclePriceChangeExceedsLimit as u32, 24);
         assert_eq!(VeilLendError::OraclePriceBelowMin as u32, 25);
         assert_eq!(VeilLendError::OraclePriceAboveMax as u32, 26);
+        assert_eq!(VeilLendError::AssetHasActivePositions as u32, 27);
+        assert_eq!(VeilLendError::CapBelowOutstanding as u32, 28);
+        assert_eq!(VeilLendError::ProtocolFeeExceedsLimit as u32, 29);
     }
 
     #[test]
     fn test_contract_metadata_identifies_current_storage_shape() {
         let metadata = VeilLendContract::contract_metadata(Env::default());
 
-        assert_eq!(metadata.contract_version, 3);
+        assert_eq!(metadata.contract_version, 4);
         assert_eq!(metadata.storage_schema_version, 3);
         assert_eq!(metadata.storage_schema_id, symbol_short!("VLENDV3"));
     }
@@ -1824,6 +2006,9 @@ mod tests {
             VeilLendError::OraclePriceChangeExceedsLimit as u32,
             VeilLendError::OraclePriceBelowMin as u32,
             VeilLendError::OraclePriceAboveMax as u32,
+            VeilLendError::AssetHasActivePositions as u32,
+            VeilLendError::CapBelowOutstanding as u32,
+            VeilLendError::ProtocolFeeExceedsLimit as u32,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();

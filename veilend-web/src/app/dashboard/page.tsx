@@ -20,6 +20,7 @@ import {
 } from './dashboard-cards';
 
 export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
 
 const title = 'Portfolio Dashboard';
 const description = 'Monitor private Stellar lending positions, deposits, borrowing, and recent VeilLend activity.';
@@ -84,7 +85,7 @@ export default async function DashboardPage() {
   preloadDashboardData(walletAddress);
 
   return (
-    <div className="min-h-screen bg-background">
+    <main className="min-h-screen bg-background">
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData).replace(/</g, '\\u003c') }}
@@ -138,6 +139,6 @@ export default async function DashboardPage() {
           </Suspense>
         </Section>
       </Container>
-    </div>
+    </main>
   );
 }

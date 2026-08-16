@@ -17,6 +17,7 @@ import { shortenAddress } from '../utils/helpers';
 import Toast from '../utils/toast';
 import { WalletExportModal } from '../components/WalletExportModal';
 import { useWalletSecurity } from '../hooks/useWalletSecurity';
+import { navigationRef } from '../navigation';
 
 const DEFAULT_PROFILE_IMAGE = 'https://i.pravatar.cc/100?img=5';
 const CURRENCIES = ['USD', 'EUR', 'GBP'];
@@ -74,7 +75,7 @@ export default function SettingsScreen({ navigation }: any) {
 
   const handleLogout = () => {
     logout();
-    navigation.replace('ConnectWallet');
+    navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
   };
 
   const handleExportWallet = () => {

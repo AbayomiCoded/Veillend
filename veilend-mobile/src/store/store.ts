@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import api from '../utils/api';
+import api, { fetchWithRetry } from '../utils/api';
 // prefer expo SecureStore when installed; fall back to local shim
 import * as SecureStoreShim from '../utils/secureStoreShim';
 let SecureStore: typeof SecureStoreShim;
@@ -58,6 +58,16 @@ type UiState = {
   protocolStatusError: string | null;
   refreshProtocolStatus: () => Promise<void>;
   shieldedLoading: boolean;
+  // Connectivity reported by NetworkProvider (NetInfo). `isOnline` defaults
+  // to true so the UI does not flash an offline banner before NetInfo resolves.
+  isOnline: boolean;
+  networkType: string | null;
+  isInternetReachable: boolean | null;
+  setNetworkState: (state: {
+    isOnline: boolean;
+    networkType: string | null;
+    isInternetReachable: boolean | null;
+  }) => void;
 };
 
 type LendingKind = 'deposit' | 'withdraw' | 'borrow' | 'repay';
@@ -132,11 +142,14 @@ type PortfolioState = {
   dashboardError: string | null;
   // Optimistically-inserted lending transactions (PENDING / CONFIRMED / FAILED).
   pendingTransactions: TransactionRecord[];
-  fetchPortfolio: () => Promise<void>;
-  fetchTransactions: () => Promise<void>;
+  fetchPortfolio: (signal?: AbortSignal) => Promise<void>;
+  fetchTransactions: (signal?: AbortSignal) => Promise<void>;
   fetchSupportedAssets: () => Promise<void>;
   fetchPositions: () => Promise<void>;
   hydrateDashboard: () => Promise<void>;
+  // Pull-to-refresh: refetches portfolio + transactions concurrently and is
+  // abortable so screens can cancel in-flight work on unmount.
+  refreshDashboard: (signal?: AbortSignal) => Promise<void>;
 };
 
 type StoreState = AuthState & UiState & LendingState & PortfolioState;
@@ -359,6 +372,10 @@ export const useStore = create<StoreState>(
     protocolStatusLoading: false,
     protocolStatusError: null,
     shieldedLoading: false,
+    isOnline: true,
+    networkType: null,
+    isInternetReachable: null,
+    setNetworkState: (state) => set(state),
     refreshProtocolStatus: async () => {
       set({ protocolStatusLoading: true, protocolStatusError: null });
       try {
@@ -429,12 +446,12 @@ export const useStore = create<StoreState>(
     dashboardLoading: false,
     dashboardError: null,
     pendingTransactions: [],
-    fetchPortfolio: async () => {
+    fetchPortfolio: async (signal?: AbortSignal) => {
       const addr = get().address;
       if (!addr) return;
       set({ portfolioLoading: true, portfolioError: null });
       try {
-        const res = await api.get(`/portfolios/${addr}`);
+        const res = await fetchWithRetry(`/portfolios/${addr}`, undefined, { signal });
         const data = res.data?.data ?? res.data;
         set({
           balance: data?.balance ?? 0,
@@ -446,6 +463,10 @@ export const useStore = create<StoreState>(
           portfolioLoading: false,
         });
       } catch (err: any) {
+        if (err?.name === 'AbortError' || err?.name === 'CanceledError') {
+          set({ portfolioLoading: false });
+          throw err;
+        }
         set({
           portfolioError: err?.message ?? 'Failed to load portfolio',
           portfolioLoading: false,
@@ -453,18 +474,22 @@ export const useStore = create<StoreState>(
         throw err;
       }
     },
-    fetchTransactions: async () => {
+    fetchTransactions: async (signal?: AbortSignal) => {
       const addr = get().address;
       if (!addr) return;
       set({ transactionsLoading: true, transactionsError: null });
       try {
-        const res = await api.get(`/transactions/${addr}`);
+        const res = await fetchWithRetry(`/transactions/${addr}`, undefined, { signal });
         const data = res.data?.data ?? res.data;
         set({
           transactions: Array.isArray(data) ? data : [],
           transactionsLoading: false,
         });
       } catch (err: any) {
+        if (err?.name === 'AbortError' || err?.name === 'CanceledError') {
+          set({ transactionsLoading: false });
+          throw err;
+        }
         set({
           transactionsError: err?.message ?? 'Failed to load transactions',
           transactionsLoading: false,
@@ -531,6 +556,36 @@ export const useStore = create<StoreState>(
       set({
         dashboardLoading: false,
         dashboardError: errors.length ? errors.join('; ') : null,
+      });
+    },
+    refreshDashboard: async (signal?: AbortSignal) => {
+      const addr = get().address;
+      if (!addr) {
+        set({ dashboardLoading: false });
+        return;
+      }
+      set({ dashboardLoading: true, dashboardError: null });
+      let aborted = false;
+      const errors: string[] = [];
+      await Promise.all([
+        get().fetchPortfolio(signal).catch((e: any) => {
+          if (e?.name === 'AbortError' || e?.name === 'CanceledError') {
+            aborted = true;
+            return;
+          }
+          errors.push(e?.message ?? 'portfolio');
+        }),
+        get().fetchTransactions(signal).catch((e: any) => {
+          if (e?.name === 'AbortError' || e?.name === 'CanceledError') {
+            aborted = true;
+            return;
+          }
+          errors.push(e?.message ?? 'transactions');
+        }),
+      ]);
+      set({
+        dashboardLoading: false,
+        dashboardError: errors.length && !aborted ? errors.join('; ') : null,
       });
     },
   };

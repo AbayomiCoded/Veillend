@@ -1,6 +1,6 @@
 import { Controller, Get, Logger, Post, Req, UseGuards } from '@nestjs/common';
-
 import { Body } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 
 import { AuthService } from './auth.service';
 
@@ -11,6 +11,7 @@ import { SessionResponseDto } from './dto/session-response.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { AuthenticatedRequest } from './types/authenticated-request.type';
 
+@Throttle({ default: { limit: 15, ttl: 60000 } })
 @Controller('auth')
 export class AuthController {
   private readonly logger = new Logger(AuthController.name);

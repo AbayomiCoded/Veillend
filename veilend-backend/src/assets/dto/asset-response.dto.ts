@@ -31,4 +31,7 @@ export class AssetResponseDto {
 
   @Expose()
   isSupported: boolean;
+
+  @Expose()
+  minCollateralRatio: number | null;
 }

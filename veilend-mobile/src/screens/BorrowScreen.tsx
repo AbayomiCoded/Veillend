@@ -5,6 +5,7 @@ import { useStore, SupportedAsset } from '../store/store';
 import { ActivityIndicator } from 'react-native';
 import Toast from '../utils/toast';
 import { ListSkeleton } from '../components/Skeletons';
+import OfflineBanner from '../components/OfflineBanner';
 import { getAssetIcon, getCurrencySymbol } from '../utils/helpers';
 
 type SelectedAsset = { symbol: string; name: string; balance?: number } | null;
@@ -157,6 +158,7 @@ export default function BorrowScreen() {
         >
           <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
             <View style={styles.modalContent}>
+              <OfflineBanner />
               <Text style={styles.modalTitle}>Borrow {selectedAsset?.symbol}</Text>
               <TextInput
                 value={amount}

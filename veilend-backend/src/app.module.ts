@@ -4,9 +4,10 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ClsModule } from 'nestjs-cls';
 import type { Request, Response } from 'express';
-import { PrismaModule } from './prisma/prisma.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { PrismaModule } from './prisma/prisma.module';
+import { HealthModule } from './health/health.module';
 import { StellarModule } from './stellar/stellar.module';
 import { IndexerModule } from './indexer/indexer.module';
 import { PortfoliosModule } from './portfolios/portfolios.module';
@@ -43,12 +44,14 @@ import {
       inject: [ConfigService],
       useFactory: (config: ConfigService) => [
         {
+          name: 'default',
           ttl: config.get<number>('THROTTLE_TTL', 60000),
-          limit: config.get<number>('THROTTLE_LIMIT', 100),
+          limit: config.get<number>('THROTTLE_LIMIT', 200),
         },
       ],
     }),
     PrismaModule,
+    HealthModule,
     StellarModule,
     IndexerModule,
     PortfoliosModule,

@@ -182,6 +182,7 @@ export class DashboardClient {
         depositedAssets,
         borrowedAssets,
         lastUpdated: new Date().toISOString(),
+        hfBreakdown: [],
       },
       recentActivity,
     };

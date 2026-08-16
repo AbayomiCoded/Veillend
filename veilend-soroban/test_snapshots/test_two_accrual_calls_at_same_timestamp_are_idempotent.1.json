@@ -162,6 +162,9 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
                   "i128": "500000"
                 }
               ]
@@ -471,7 +474,7 @@
                         "symbol": "total_balance"
                       },
                       "val": {
-                        "i128": "500000"
+                        "i128": "560000"
                       }
                     }
                   ]
