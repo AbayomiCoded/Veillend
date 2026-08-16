@@ -1,6 +1,5 @@
 import { DashboardData, ActivityActionType, AssetBalance } from '../types/dashboard';
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+import { backendFetch } from '@/lib/server/backendFetch';
 
 // Define types for API responses
 interface IndexerPosition {
@@ -36,15 +35,15 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
 
   try {
     const [positionsRes, transactionsRes, pricesRes] = await Promise.all([
-      fetch(`${API_BASE_URL}/indexer/positions/${address}`, { 
+      backendFetch(`/indexer/positions/${address}`, { 
         next: { revalidate: 10 },
         headers: { 'Cache-Control': 'no-cache' }
       }),
-      fetch(`${API_BASE_URL}/indexer/transactions/${address}`, { 
+      backendFetch(`/indexer/transactions/${address}`, { 
         next: { revalidate: 10 },
         headers: { 'Cache-Control': 'no-cache' }
       }),
-      fetch(`${API_BASE_URL}/oracle/prices`, { 
+      backendFetch(`/oracle/prices`, { 
         next: { revalidate: 10 },
         headers: { 'Cache-Control': 'no-cache' }
       })

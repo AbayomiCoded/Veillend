@@ -88,7 +88,6 @@ export function useStellarWallet(): WalletState & WalletActions {
 
       const verification = await verifyAuthSignature(
         wallet.address,
-        nonce,
         signature
       );
 
@@ -123,7 +122,7 @@ export function useStellarWallet(): WalletState & WalletActions {
   const disconnect = useCallback(async () => {
     try {
       await disconnectWallet();
-      clearAuthSession();
+      await clearAuthSession();
 
       setState((prev) => ({
         ...prev,
