@@ -7,6 +7,9 @@ import {
   SITE_TITLE,
 } from '@/lib/site';
 
+export const revalidate = 3600;
+export const dynamic = 'auto';
+
 export const metadata: Metadata = {
   title: { absolute: SITE_TITLE },
   description: SITE_DESCRIPTION,
