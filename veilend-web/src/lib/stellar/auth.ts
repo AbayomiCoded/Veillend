@@ -20,18 +20,20 @@ export interface AuthSession {
   sessionId?: string;
   expiresAt?: string;
   lastVerifiedAt?: string;
-  
+
 }
 
 export interface AuthVerificationResult {
   accessToken?: string;
   sessionId?: string;
   expiresAt?: string;
+
 }
 
 /**
  * Clear the auth session (logout) via API route
  */
+
 export const clearAuthSession = async (): Promise<void> => {
   try {
     await fetch('/api/auth/logout', { method: 'POST' });
