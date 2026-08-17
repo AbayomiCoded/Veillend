@@ -1739,3 +1739,83 @@ fn test_cross_asset_withdraw_that_breaks_ratio_panics() {
         "withdraw that drops the cross-asset ratio to 149% must panic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Interest accrual correctness tests (issue #349)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn small_amounts_dust_accrual() {
+    // Tiny balances: total_supplied = 15_000, total_borrowed = 5_000
+    // (33% utilization). Over one year:
+    //   borrow_rate = 200 + (3333 * 2000 / 10_000) = 866 bps
+    //   supply_rate = 866 * 3333 / 10_000 = 288 bps
+    //   borrow_growth = 86_600_000
+    //   supply_growth = 28_800_000
+    //   interest_to_borrowers = 5_000 * 86_600_000 / 1e9 = 433
+    //   interest_to_suppliers = 15_000 * 28_800_000 / 1e9 = 432
+    //   dust = 433 - 432 = 1
+    //
+    // We accrue 100 times (each 1 year apart — limited to 100 to avoid
+    // borrow_index overflow from exponential compounding) and verify:
+    //   1. The aggregate dust across all accruals is non-zero
+    //   2. Final reserve.total_balance == initial deposit + Σ(supplier interest) + Σ(dust)
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &1);
+
+    // Deposit creates the supplier side; borrow creates the borrower side.
+    client.deposit(&user, &asset, &15_000);
+    client.borrow(&user, &asset, &asset, &5_000);
+
+    let initial_reserve = client.get_asset_reserve(&asset);
+    let mut cumulative_supplier_interest: i128 = 0;
+    let mut cumulative_dust: i128 = 0;
+
+    for _ in 0..100 {
+        let before_total_deposited = client.get_total_deposited(&asset);
+        let before_total_borrowed = client.get_total_borrowed(&asset);
+
+        let ledger_timestamp = env.ledger().timestamp();
+        env.ledger()
+            .set_timestamp(ledger_timestamp + SECONDS_PER_YEAR);
+
+        client.accrue_interest(&asset);
+
+        let after_total_deposited = client.get_total_deposited(&asset);
+        let after_total_borrowed = client.get_total_borrowed(&asset);
+        let supplier_interest = after_total_deposited - before_total_deposited;
+        let borrower_interest = after_total_borrowed - before_total_borrowed;
+        let dust = borrower_interest - supplier_interest;
+
+        // Dust must never be negative — borrowers always pay >= what suppliers receive.
+        assert!(dust >= 0, "dust must never be negative");
+
+        cumulative_supplier_interest += supplier_interest;
+        cumulative_dust += dust;
+    }
+
+    // Aggregate dust over 100 accruals must be non-zero.
+    assert!(
+        cumulative_dust > 0,
+        "aggregate dust over accruals must be non-zero"
+    );
+
+    let final_reserve = client.get_asset_reserve(&asset);
+    // Reserve balance must equal: initial_deposit + Σ(supplier_interest) + Σ(dust)
+    assert_eq!(
+        final_reserve.total_balance,
+        initial_reserve.total_balance + cumulative_supplier_interest + cumulative_dust
+    );
+}
+
+// The overflow test is in interest.rs as a unit test (zero_snapshot and
+// overflow tests work at the function level since they need to construct
+// extreme states directly).
