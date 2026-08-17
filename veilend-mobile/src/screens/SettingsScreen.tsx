@@ -74,7 +74,7 @@ export default function SettingsScreen({ navigation }: any) {
   };
 
   const handleLogout = () => {
-    logout();
+    logout().catch(() => {});
     navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
   };
 
