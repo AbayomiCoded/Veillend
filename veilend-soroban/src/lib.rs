@@ -246,6 +246,8 @@ pub enum VeilLendError {
     /// The requested protocol fee exceeds the admin-configured max_protocol_fee_bps
     /// limit. Without this bound an admin could drain user funds disguised as fees.
     ProtocolFeeExceedsLimit = 29,
+    /// Arithmetic overflow or underflow in interest accrual or index computation.
+    ArithmeticOverflow = 30,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -1734,13 +1736,14 @@ impl VeilLendContract {
                 state,
                 interest_to_suppliers: 0,
                 interest_to_borrowers: 0,
+                dust_to_reserves: 0,
             };
         }
 
         let total_supplied = Self::get_total_deposited(env.clone(), asset.clone());
         let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
 
-        let result = interest::compute_accrual(&state, total_supplied, total_borrowed, now);
+        let result = interest::compute_accrual(env, &state, total_supplied, total_borrowed, now);
 
         Self::write_interest_state(env, asset, &result.state);
         if result.interest_to_suppliers != 0 {
@@ -1762,6 +1765,15 @@ impl VeilLendContract {
                 &DataKey::TotalBorrowed(asset.clone()),
                 &(total_borrowed + result.interest_to_borrowers),
             );
+        }
+
+        // Truncation dust (interest_to_borrowers - interest_to_suppliers)
+        // belongs to protocol reserves so the conservation invariant holds
+        // exactly: every stroop borrowers pay is accounted for.
+        if result.dust_to_reserves > 0 {
+            let mut reserve = Self::read_asset_reserve(env, asset);
+            reserve.total_balance += result.dust_to_reserves;
+            Self::write_asset_reserve(env, asset, &reserve);
         }
 
         // Publish a per-asset interest accrual event only when interest
@@ -1794,7 +1806,7 @@ impl VeilLendContract {
         let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
         let now = env.ledger().timestamp();
 
-        interest::compute_accrual(&state, total_supplied, total_borrowed, now).state
+        interest::compute_accrual(env, &state, total_supplied, total_borrowed, now).state
     }
 
     fn write_position(env: &Env, user: &Address, asset: &Address, position: &Position) {
@@ -2030,6 +2042,7 @@ mod tests {
         assert_eq!(VeilLendError::AssetHasActivePositions as u32, 27);
         assert_eq!(VeilLendError::CapBelowOutstanding as u32, 28);
         assert_eq!(VeilLendError::ProtocolFeeExceedsLimit as u32, 29);
+        assert_eq!(VeilLendError::ArithmeticOverflow as u32, 30);
     }
 
     #[test]
@@ -2074,6 +2087,7 @@ mod tests {
             VeilLendError::AssetHasActivePositions as u32,
             VeilLendError::CapBelowOutstanding as u32,
             VeilLendError::ProtocolFeeExceedsLimit as u32,
+            VeilLendError::ArithmeticOverflow as u32,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();
