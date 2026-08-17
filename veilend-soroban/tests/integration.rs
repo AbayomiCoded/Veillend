@@ -1,10 +1,21 @@
+use core::cmp::Ordering;
+
+use soroban_env_common::Compare;
 use soroban_sdk::events::Event;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Val};
 use veillend_contract::{InterestAccrued, VeilLendContract, VeilLendContractClient};
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
 const DEFAULT_TIMELOCK: u32 = 50;
+
+/// Returns true if two `Val`s are equal per the host's value comparison.
+///
+/// `soroban_sdk::Val` does not implement `PartialEq` in soroban-sdk 23.x, so
+/// event data (a `Val`) must be compared through the host `Compare` trait.
+fn val_eq(env: &Env, a: &Val, b: &Val) -> bool {
+    env.compare(a, b).unwrap() == Ordering::Equal
+}
 
 fn advance_ledgers(env: &Env, n: u32) {
     let current = env.ledger().sequence();
@@ -556,7 +567,7 @@ fn test_interest_accrued_event_emission_and_values() {
     let events = env.events().all();
     let mut interest_accrued_count = 0u32;
     for (_, topics, data) in events.iter() {
-        if topics == expected_topics && data == expected_data {
+        if topics == expected_topics && val_eq(&env, &data, &expected_data) {
             interest_accrued_count += 1;
         }
     }
@@ -566,19 +577,26 @@ fn test_interest_accrued_event_emission_and_values() {
     );
 
     // A second accrual at the same timestamp accrues zero interest, so the
-    // guard must skip storage writes and emit no InterestAccrued event.
+    // guard must skip storage writes and emit no events at all: no
+    // InterestAccrued event and no reserve-update event. `env.events().all()`
+    // returns only the events of the last contract invocation.
     client.accrue_interest(&asset);
 
     let second_events = env.events().all();
     let mut second_interest_accrued_count = 0u32;
     for (_, topics, data) in second_events.iter() {
-        if topics == expected_topics && data == expected_data {
+        if topics == expected_topics && val_eq(&env, &data, &expected_data) {
             second_interest_accrued_count += 1;
         }
     }
     assert_eq!(
         second_interest_accrued_count, 0,
         "no InterestAccrued event should be emitted when interest is zero"
+    );
+    assert_eq!(
+        second_events.len(),
+        0,
+        "a zero-interest accrual must be a pure no-op and emit no events at all"
     );
 }
 
