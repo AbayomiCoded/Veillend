@@ -7,9 +7,10 @@ import { AdminActionWatcherService } from './admin-action-watcher.service';
 import { AuthModule } from '../auth/auth.module';
 import { StellarModule } from '../stellar/stellar.module';
 import { IndexerModule } from '../indexer/indexer.module';
+import { ConfigModule } from '../config/config.module';
 
 @Module({
-  imports: [AuthModule, StellarModule, IndexerModule],
+  imports: [ConfigModule, AuthModule, StellarModule, IndexerModule],
   controllers: [AdminController],
   providers: [
     AdminService,
