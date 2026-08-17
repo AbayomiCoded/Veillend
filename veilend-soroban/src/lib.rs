@@ -327,6 +327,20 @@ pub struct AssetReserveUpdated {
     pub kind: ReserveUpdateKind,
 }
 
+#[contractevent(topics = ["veillend", "interest_accrued"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterestAccrued {
+    #[topic]
+    pub asset: Address,
+    pub interest_to_suppliers: i128,
+    pub interest_to_borrowers: i128,
+    pub supply_index_before: i128,
+    pub borrow_index_before: i128,
+    pub supply_index_after: i128,
+    pub borrow_index_after: i128,
+    pub timestamp: u64,
+}
+
 #[contractevent(topics = ["veillend", "admin_added"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminAdded {
@@ -866,7 +880,7 @@ impl VeilLendContract {
 
         // Accrue interest first so both the cap check below and the totals
         // we write reflect up-to-date, time-aware values.
-        let interest_state = Self::accrue_and_persist_interest(&env, &asset);
+        let interest_state = Self::accrue_and_persist_interest(&env, &asset).state;
 
         // Check deposit cap
         Self::check_deposit_cap(&env, &asset, amount);
@@ -911,7 +925,7 @@ impl VeilLendContract {
 
         // Accrue interest first so both the cap check below and the totals
         // we write reflect up-to-date, time-aware values.
-        let interest_state = Self::accrue_and_persist_interest(&env, &borrow_asset);
+        let interest_state = Self::accrue_and_persist_interest(&env, &borrow_asset).state;
 
         // Check borrow cap
         Self::check_borrow_cap(&env, &borrow_asset, amount);
@@ -962,7 +976,7 @@ impl VeilLendContract {
         Self::require_positive_amount(&env, amount);
         user.require_auth();
 
-        let interest_state = Self::accrue_and_persist_interest(&env, &asset);
+        let interest_state = Self::accrue_and_persist_interest(&env, &asset).state;
 
         let mut position = interest::compute_accrued_position(
             &Self::read_position(&env, &user, &asset),
@@ -1013,7 +1027,7 @@ impl VeilLendContract {
         Self::require_positive_amount(&env, amount);
         user.require_auth();
 
-        let interest_state = Self::accrue_and_persist_interest(&env, &withdrawn_asset);
+        let interest_state = Self::accrue_and_persist_interest(&env, &withdrawn_asset).state;
 
         let mut position = interest::compute_accrued_position(
             &Self::read_position(&env, &user, &withdrawn_asset),
@@ -1086,15 +1100,20 @@ impl VeilLendContract {
     /// action.
     pub fn accrue_interest(env: Env, asset: Address) {
         Self::require_supported_asset(&env, &asset);
-        Self::accrue_and_persist_interest(&env, &asset);
+        let result = Self::accrue_and_persist_interest(&env, &asset);
 
-        let reserve = Self::read_asset_reserve(&env, &asset);
-        Self::publish_asset_reserve_updated(
-            &env,
-            &asset,
-            &reserve,
-            ReserveUpdateKind::InterestAccrual,
-        );
+        // The reserve-update event is only meaningful when interest actually
+        // accrued. A same-timestamp (or zero-utilization) call is a pure no-op
+        // and must produce no observable events for indexers.
+        if result.interest_to_suppliers != 0 || result.interest_to_borrowers != 0 {
+            let reserve = Self::read_asset_reserve(&env, &asset);
+            Self::publish_asset_reserve_updated(
+                &env,
+                &asset,
+                &reserve,
+                ReserveUpdateKind::InterestAccrual,
+            );
+        }
     }
 
     pub fn is_asset_supported(env: Env, asset: Address) -> bool {
@@ -1684,14 +1703,42 @@ impl VeilLendContract {
     /// balances to reflect accrual must additionally realize that position
     /// via `interest::compute_accrued_position` against the returned state.
     ///
+    /// Returns the persisted state plus the interest amounts actually accrued,
+    /// so callers can tell whether anything happened (a same-timestamp or
+    /// zero-utilization call accrues nothing).
+    ///
     /// Must be called before any cap check or balance mutation in every
     /// entrypoint that reads/writes reserve state, so caps are enforced
     /// against up-to-date totals and totals never drift from reality.
-    fn accrue_and_persist_interest(env: &Env, asset: &Address) -> InterestState {
+    fn accrue_and_persist_interest(env: &Env, asset: &Address) -> interest::AccrualResult {
         let state = Self::read_interest_state(env, asset);
+        let now = env.ledger().timestamp();
+
+        // Explicit idempotency guard: when the ledger clock has not advanced
+        // since the last *persisted* accrual there is nothing to accrue. Return
+        // the stored state without touching storage so repeated same-timestamp
+        // calls produce no writes and no InterestAccrued events.
+        //
+        // The guard only applies to an already-persisted state. A missing
+        // InterestState entry anchors `last_accrual_timestamp` at `now` (see
+        // `read_interest_state`); on that first touch we deliberately fall
+        // through and persist the anchor below, otherwise every later call
+        // would keep re-anchoring to the current time and interest would never
+        // accrue.
+        let already_persisted = env
+            .storage()
+            .persistent()
+            .has(&DataKey::InterestState(asset.clone()));
+        if already_persisted && now <= state.last_accrual_timestamp {
+            return interest::AccrualResult {
+                state,
+                interest_to_suppliers: 0,
+                interest_to_borrowers: 0,
+            };
+        }
+
         let total_supplied = Self::get_total_deposited(env.clone(), asset.clone());
         let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
-        let now = env.ledger().timestamp();
 
         let result = interest::compute_accrual(&state, total_supplied, total_borrowed, now);
 
@@ -1717,7 +1764,25 @@ impl VeilLendContract {
             );
         }
 
-        result.state
+        // Publish a per-asset interest accrual event only when interest
+        // actually accrued, so indexers and portfolio dashboards can attribute
+        // interest to a specific asset and ledger. Zero-interest accruals
+        // (no elapsed time, or no utilization) emit nothing.
+        if result.interest_to_suppliers != 0 || result.interest_to_borrowers != 0 {
+            InterestAccrued {
+                asset: asset.clone(),
+                interest_to_suppliers: result.interest_to_suppliers,
+                interest_to_borrowers: result.interest_to_borrowers,
+                supply_index_before: state.supply_index,
+                borrow_index_before: state.borrow_index,
+                supply_index_after: result.state.supply_index,
+                borrow_index_after: result.state.borrow_index,
+                timestamp: now,
+            }
+            .publish(env);
+        }
+
+        result
     }
 
     /// Like `accrue_and_persist_interest`, but purely computed — does not
