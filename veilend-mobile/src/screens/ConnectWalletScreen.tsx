@@ -274,7 +274,7 @@ export default function ConnectWalletScreen() {
       {/* Wallet Backup Modal */}
       <WalletBackupModal
         visible={showBackupModal}
-        secretKey={generatedSecretKey}
+        onRequestSecret={() => Promise.resolve(generatedSecretKey)}
         onClose={() => setShowBackupModal(false)}
         onBackupConfirmed={handleBackupConfirmed}
       />

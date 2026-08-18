@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -35,6 +35,9 @@ export function WalletBackupModal({
   const [confirmInput, setConfirmInput] = useState('');
   const [isSecretRevealed, setIsSecretRevealed] = useState(false);
   const [maskedKey, setMaskedKey] = useState('');
+  const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
+  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const SECURE_TIMER_DURATION = 30000;
 
   useEffect(() => {
     let mounted = true;
@@ -56,12 +59,26 @@ export function WalletBackupModal({
     };
   }, [onRequestSecret]);
 
-  const handleReveal = () => {
-    setIsSecretRevealed(true);
+  const handleReveal = async () => {
+    try {
+      const secret = await onRequestSecret();
+      if (!secret) return;
+      setRevealedSecret(secret);
+      setIsSecretRevealed(true);
+      if (revealTimerRef.current) clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = setTimeout(() => {
+        setIsSecretRevealed(false);
+        setRevealedSecret(null);
+        if (revealTimerRef.current) {
+          clearTimeout(revealTimerRef.current);
+          revealTimerRef.current = null;
+        }
+      }, SECURE_TIMER_DURATION);
+    } catch (e) {}
   };
 
   const handleCopyToClipboard = async () => {
-    const secret = await onRequestSecret();
+    const secret = revealedSecret ?? (await onRequestSecret());
     if (secret) {
       await Clipboard.setString(secret);
       Toast.show({
@@ -72,8 +89,8 @@ export function WalletBackupModal({
     }
   };
 
-  const handleConfirm = () => {
-    const secret = await onRequestSecret();
+  const handleConfirm = async () => {
+    const secret = revealedSecret ?? (await onRequestSecret());
     if (secret && confirmInput.trim() === secret) {
       setStep('success');
       onBackupConfirmed();
@@ -112,7 +129,7 @@ export function WalletBackupModal({
         <Text style={styles.secretKeyLabel}>Your Secret Key</Text>
         <View style={styles.secretKeyBox}>
           <Text style={styles.secretKeyText}>
-            {isSecretRevealed ? secretKey : maskedKey}
+            {isSecretRevealed ? (revealedSecret ?? '') : maskedKey}
           </Text>
           <TouchableOpacity
             style={styles.eyeButton}

@@ -172,8 +172,8 @@ export function useWalletSecurity() {
       clearTimeout(revealTimerRef.current);
       revealTimerRef.current = null;
     }
-    setState((prev) => ({ ...prev, revealTimer: null as any, isRevealActive: false }));
-  }, [state.revealTimer]);
+    setState((prev) => ({ ...prev, isRevealActive: false }));
+  }, []);
 
   const copyToClipboard = useCallback(async (text: string): Promise<boolean> => {
     try {
