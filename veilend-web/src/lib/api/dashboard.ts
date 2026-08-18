@@ -6,7 +6,7 @@ import {
   OraclePricesResponseSchema,
   type IndexerTransaction,
 } from '@/lib/validation/api-schemas';
-import { toSafeNumber } from '@/lib/validation/safe-numbers';
+import { requireSafeNumber } from '@/lib/validation/safe-numbers';
 import type {
   ActivityActionType,
   AssetBalance,
@@ -88,12 +88,12 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
 
     for (const [index, pos] of positions.entries()) {
       const decimals = registryDecimals(registry, pos.assetAddress);
-      const deposited = toSafeNumber(pos.depositedRaw, decimals, [
+      const deposited = requireSafeNumber(pos.depositedRaw, decimals, [
         'positions',
         index,
         'depositedRaw',
       ]);
-      const borrowed = toSafeNumber(pos.borrowedRaw, decimals, [
+      const borrowed = requireSafeNumber(pos.borrowedRaw, decimals, [
         'positions',
         index,
         'borrowedRaw',
@@ -158,7 +158,7 @@ export async function fetchDashboardData(address: string): Promise<DashboardData
     const recentActivity = transactions
           .map((tx: IndexerTransaction, index) => {
             const decimals = registryDecimals(registry, tx.assetAddress);
-            const amount = toSafeNumber(tx.amount, decimals, [
+            const amount = requireSafeNumber(tx.amount, decimals, [
               'transactions',
               index,
               'amount',

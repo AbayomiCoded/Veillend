@@ -5,7 +5,7 @@ import {
   type IndexerPosition,
   type IndexerTransaction,
 } from '@/lib/validation/api-schemas';
-import { toSafeNumber } from '@/lib/validation/safe-numbers';
+import { requireSafeNumber } from '@/lib/validation/safe-numbers';
 import type {
   ActivityActionType,
   ActivityEvent,
@@ -113,12 +113,12 @@ export class DashboardClient {
     // Process positions with real oracle prices
     if (Array.isArray(positions) && positions.length > 0) {
       positions.forEach((pos, index) => {
-        const deposited = toSafeNumber(pos.depositedRaw, DEFAULT_ASSET_DECIMALS, [
+        const deposited = requireSafeNumber(pos.depositedRaw, DEFAULT_ASSET_DECIMALS, [
           'positions',
           index,
           'depositedRaw',
         ]);
-        const borrowed = toSafeNumber(pos.borrowedRaw, DEFAULT_ASSET_DECIMALS, [
+        const borrowed = requireSafeNumber(pos.borrowedRaw, DEFAULT_ASSET_DECIMALS, [
           'positions',
           index,
           'borrowedRaw',
@@ -163,7 +163,7 @@ export class DashboardClient {
     
     if (Array.isArray(transactions) && transactions.length > 0) {
       const mappedActivities = transactions.map((tx, index) => {
-        const amount = toSafeNumber(tx.amount, DEFAULT_ASSET_DECIMALS, [
+        const amount = requireSafeNumber(tx.amount, DEFAULT_ASSET_DECIMALS, [
           'transactions',
           index,
           'amount',

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { ValidationError } from './api-schemas';
-import { toSafeBigInt, toSafeNumber } from './safe-numbers';
+import { requireSafeNumber, toSafeBigInt, toSafeNumber } from './safe-numbers';
 
 describe('safe numeric conversions', () => {
   it('converts integer strings with asset decimals', () => {
@@ -10,18 +9,23 @@ describe('safe numeric conversions', () => {
   });
 
   it.each(['notANumber', '1.2', '', Number.NaN, Number.POSITIVE_INFINITY])(
-    'rejects unsafe integer input %s',
+    'returns null for unsafe integer input %s',
     (value) => {
-      expect(() => toSafeBigInt(value, ['positions', 0, 'depositedRaw'])).toThrow(
-        expect.objectContaining<Partial<ValidationError>>({
-          name: 'ValidationError',
-          path: 'positions.0.depositedRaw',
-        }),
-      );
+      expect(toSafeBigInt(value)).toBeNull();
+      expect(toSafeNumber(value)).toBeNull();
     },
   );
 
-  it('rejects values whose decimal conversion is not finite', () => {
-    expect(() => toSafeNumber('1', 400, ['amount'])).toThrow(ValidationError);
+  it('returns null when decimals or the converted value are unsafe', () => {
+    expect(toSafeNumber('1', 400)).toBeNull();
+    expect(toSafeNumber(`1${'0'.repeat(400)}`)).toBeNull();
+  });
+
+  it('turns a failed required conversion into a path-aware validation error', () => {
+    expect(() => requireSafeNumber(`1${'0'.repeat(400)}`, 0, ['transactions', 0, 'amount']))
+      .toThrow(expect.objectContaining({
+        name: 'ValidationError',
+        path: 'transactions.0.amount',
+      }));
   });
 });
