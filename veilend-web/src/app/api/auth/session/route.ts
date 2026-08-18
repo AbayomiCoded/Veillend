@@ -15,6 +15,13 @@ export async function GET() {
     return NextResponse.json(data);
   } catch (error) {
     if (error instanceof HttpError) {
+      if (error.status === 401) {
+        // backend indicated session invalid; backendFetch already clears cookies.
+        const redirectUrl = new URL(process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000');
+        redirectUrl.pathname = '/login';
+        redirectUrl.searchParams.set('reason', 'expired');
+        return NextResponse.redirect(redirectUrl);
+      }
       return NextResponse.json({ error: 'Not authenticated' }, { status: error.status });
     }
     if (error instanceof ValidationError) {
