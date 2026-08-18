@@ -27,19 +27,15 @@ const makePrismaStub = (up: boolean) => ({
 });
 
 const makeSorobanStub = (up: boolean, seq = 1234) => ({
-  getClient: () => ({
-    getLatestLedger: up
-      ? jest.fn().mockResolvedValue({ sequence: seq })
-      : jest.fn().mockRejectedValue(new Error('RPC down')),
-  }),
+  getLatestLedger: up
+    ? jest.fn().mockResolvedValue({ sequence: seq })
+    : jest.fn().mockRejectedValue(new Error('RPC down')),
 });
 
 const makeHorizonStub = (up: boolean, ledger = 5678) => ({
-  getClient: () => ({
-    root: up
-      ? jest.fn().mockResolvedValue({ core_latest_ledger: ledger })
-      : jest.fn().mockRejectedValue(new Error('Horizon down')),
-  }),
+  getRoot: up
+    ? jest.fn().mockResolvedValue({ core_latest_ledger: ledger })
+    : jest.fn().mockRejectedValue(new Error('Horizon down')),
 });
 
 // ── Helper to spin up a lightweight NestJS app ────────────────────────────────

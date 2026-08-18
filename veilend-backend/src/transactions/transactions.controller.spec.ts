@@ -29,6 +29,11 @@ describe('TransactionsController', () => {
       data: [],
       nextCursor: null,
     };
+    const mockQuery: GetTransactionsQueryDto = {
+      order: 'DESC',
+      skip: 0,
+      take: 20,
+    };
     service.getTransactions.mockResolvedValue(mockResponse);
 
     const req = {
@@ -37,13 +42,13 @@ describe('TransactionsController', () => {
 
     const result = await controller.getTransactions(
       { walletAddress: 'GABC' },
-      { cursor: 'some-cursor', limit: 50 },
+      { skip: 0, take: 50 } as GetTransactionsQueryDto,
       req,
     );
 
     expect(service.getTransactions).toHaveBeenCalledWith('GABC', {
-      cursor: 'some-cursor',
-      limit: 50,
+      skip: 0,
+      take: 50,
     });
     expect(result).toEqual(mockResponse);
   });

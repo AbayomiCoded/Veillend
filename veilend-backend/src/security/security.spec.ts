@@ -25,7 +25,9 @@ describe('createOriginCheckMiddleware', () => {
   it('blocks an unlisted origin with 403', () => {
     const statusMock = jest.fn().mockReturnThis();
     const jsonMock = jest.fn();
-    const req = { headers: { origin: 'http://evil.com' } } as unknown as Request;
+    const req = {
+      headers: { origin: 'http://evil.com' },
+    } as unknown as Request;
     const res = { status: statusMock, json: jsonMock } as unknown as Response;
     const next = jest.fn() as NextFunction;
 

@@ -80,9 +80,7 @@ describe('IndexerService', () => {
         },
         {
           provide: SorobanRpcService,
-          useValue: {
-            getClient: jest.fn().mockReturnValue(mockRpcClient),
-          },
+          useValue: mockRpcClient,
         },
       ],
     }).compile();
