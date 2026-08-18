@@ -10,6 +10,7 @@ import { AppService } from '../app.service';
 import { AppConfigService } from '../config/app-config.service';
 import { AuthController } from '../auth/auth.controller';
 import { AuthService } from '../auth/auth.service';
+import { PrismaService } from '../prisma/prisma.service';
 import { createOriginCheckMiddleware } from '../middleware/origin-check';
 
 const mockAppConfigService = {
@@ -25,7 +26,9 @@ describe('createOriginCheckMiddleware', () => {
   it('blocks an unlisted origin with 403', () => {
     const statusMock = jest.fn().mockReturnThis();
     const jsonMock = jest.fn();
-    const req = { headers: { origin: 'http://evil.com' } } as unknown as Request;
+    const req = {
+      headers: { origin: 'http://evil.com' },
+    } as unknown as Request;
     const res = { status: statusMock, json: jsonMock } as unknown as Response;
     const next = jest.fn() as NextFunction;
 
@@ -121,6 +124,10 @@ describe('ThrottlerGuard — AuthController nonce endpoint', () => {
       controllers: [AuthController],
       providers: [
         { provide: AuthService, useValue: mockAuthService },
+        {
+          provide: PrismaService,
+          useValue: { admin: { findUnique: jest.fn() } },
+        },
         { provide: APP_GUARD, useClass: ThrottlerGuard },
       ],
     }).compile();

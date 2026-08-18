@@ -20,7 +20,11 @@ export class PortfoliosController {
     @Param() { walletAddress }: WalletAddressParamDto,
     @Req() req: AuthenticatedRequest,
   ): Promise<PortfolioResponseDto> {
-    await assertWalletAccess(this.prisma, req.user.walletAddress, walletAddress);
+    await assertWalletAccess(
+      this.prisma,
+      req.user.walletAddress,
+      walletAddress,
+    );
     return this.portfoliosService.getPortfolio(walletAddress);
   }
 }
