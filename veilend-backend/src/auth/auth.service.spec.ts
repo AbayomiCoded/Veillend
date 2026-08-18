@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { UnauthorizedException, GoneException } from '@nestjs/common';
+import { UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
 import { AuthService } from './auth.service';
