@@ -9,6 +9,7 @@ import {
   TextInput,
   Switch,
   Keyboard,
+  Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
@@ -16,6 +17,7 @@ import { useStore } from '../store/store';
 import { shortenAddress } from '../utils/helpers';
 import Toast from '../utils/toast';
 import { WalletExportModal } from '../components/WalletExportModal';
+import { WalletBackupModal } from '../components/WalletBackupModal';
 import { useWalletSecurity } from '../hooks/useWalletSecurity';
 import { navigationRef } from '../navigation';
 
@@ -38,7 +40,7 @@ export default function SettingsScreen({ navigation }: any) {
     logout,
   } = useStore();
 
-  const { secretKey, isBackupConfirmed } = useWalletSecurity();
+  const { secretKey, isBackupConfirmed, withSigner, wipeClipboardNow } = useWalletSecurity() as any;
   const [showExportModal, setShowExportModal] = useState(false);
 
   const defaultUsername = address ? shortenAddress(address) : 'Guest';
@@ -74,8 +76,25 @@ export default function SettingsScreen({ navigation }: any) {
   };
 
   const handleLogout = () => {
-    logout();
-    navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
+    Alert.alert(
+      'Confirm Log Out',
+      'Are you sure you want to log out? The secret key stored on this device will be permanently deleted. Ensure you have your backup saved.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Log Out',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await wipeClipboardNow();
+            } catch (e) {}
+            logout();
+            navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
+          },
+        },
+      ],
+      { cancelable: true },
+    );
   };
 
   const handleExportWallet = () => {
@@ -258,8 +277,21 @@ export default function SettingsScreen({ navigation }: any) {
       {/* Wallet Export Modal */}
       <WalletExportModal
         visible={showExportModal}
-        secretKey={secretKey}
+        onRequestSecret={() =>
+          // use withSigner to get the secret transiently
+          withSigner(async (_kp: any, secret?: string | undefined) => secret || null)
+        }
         onClose={() => setShowExportModal(false)}
+      />
+      <WalletBackupModal
+        visible={showExportModal}
+        onRequestSecret={() =>
+          withSigner(async (_kp: any, secret?: string | undefined) => secret || null)
+        }
+        onClose={() => setShowExportModal(false)}
+        onBackupConfirmed={() => {
+          Toast.show({ type: 'success', text1: 'Backup confirmed' });
+        }}
       />
     </ScrollView>
   );

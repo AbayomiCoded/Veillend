@@ -19,7 +19,7 @@ const { width } = Dimensions.get('window');
 
 type WalletExportModalProps = {
   visible: boolean;
-  secretKey: string | null;
+  onRequestSecret: () => Promise<string | null>;
   onClose: () => void;
 };
 
@@ -27,7 +27,7 @@ type ExportStep = 'warning' | 'export' | 'exported';
 
 export function WalletExportModal({
   visible,
-  secretKey,
+  onRequestSecret,
   onClose,
 }: WalletExportModalProps) {
   const [step, setStep] = useState<ExportStep>('warning');
@@ -39,6 +39,7 @@ export function WalletExportModal({
   };
 
   const handleCopyToClipboard = async () => {
+    const secretKey = await onRequestSecret();
     if (secretKey) {
       await Clipboard.setString(secretKey);
       Toast.show({
@@ -50,6 +51,7 @@ export function WalletExportModal({
   };
 
   const handleExportToFile = async () => {
+    const secretKey = await onRequestSecret();
     if (!secretKey) return;
     
     setIsExporting(true);

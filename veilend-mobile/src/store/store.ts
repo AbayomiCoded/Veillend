@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { Clipboard } from 'react-native';
 import api, { fetchWithRetry } from '../utils/api';
 import { getSecureItem, setSecureItem, deleteSecureItem } from '../utils/secureStorage';
 
@@ -298,6 +299,9 @@ export const useStore = create<StoreState>(
       } catch (e) {
         // ignore persistence errors
       }
+      try {
+        Clipboard.setString('');
+      } catch (e) {}
     },
 
     // UI
