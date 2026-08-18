@@ -138,6 +138,8 @@ export function WalletExportModal({
         <TouchableOpacity
           style={[styles.actionButton, styles.cancelButton]}
           onPress={onClose}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel wallet export"
         >
           <Text style={styles.cancelButtonText}>Cancel</Text>
         </TouchableOpacity>
@@ -145,6 +147,8 @@ export function WalletExportModal({
         <TouchableOpacity
           style={[styles.actionButton, styles.exportButton]}
           onPress={handleExport}
+          accessibilityRole="button"
+          accessibilityLabel="Proceed to wallet export options"
         >
           <Text style={styles.exportButtonText}>I Understand, Proceed</Text>
         </TouchableOpacity>
@@ -166,6 +170,8 @@ export function WalletExportModal({
         <TouchableOpacity
           style={styles.exportOption}
           onPress={handleCopyToClipboard}
+          accessibilityRole="button"
+          accessibilityLabel="Copy wallet secret key"
         >
           <Ionicons name="copy-outline" size={32} color="#FFFFFF" />
           <Text style={styles.exportOptionTitle}>Copy to Clipboard</Text>
@@ -178,6 +184,8 @@ export function WalletExportModal({
           style={styles.exportOption}
           onPress={handleExportToFile}
           disabled={isExporting}
+          accessibilityRole="button"
+          accessibilityLabel="Export wallet backup file"
         >
           <Ionicons name="document-text-outline" size={32} color="#FFFFFF" />
           <Text style={styles.exportOptionTitle}>Export to File</Text>
@@ -190,6 +198,8 @@ export function WalletExportModal({
       <TouchableOpacity
         style={[styles.actionButton, styles.cancelButton, { width: '100%' }]}
         onPress={() => setStep('warning')}
+        accessibilityRole="button"
+        accessibilityLabel="Go back to export warning"
       >
         <Text style={styles.cancelButtonText}>← Back</Text>
       </TouchableOpacity>
@@ -224,6 +234,8 @@ export function WalletExportModal({
       <TouchableOpacity
         style={[styles.actionButton, styles.doneButton]}
         onPress={onClose}
+        accessibilityRole="button"
+        accessibilityLabel="Finish wallet export"
       >
         <Text style={styles.doneButtonText}>Done</Text>
       </TouchableOpacity>
@@ -239,7 +251,7 @@ export function WalletExportModal({
     >
       <View style={styles.modalOverlay}>
         <View style={styles.modalContent}>
-          <TouchableOpacity style={styles.closeButton} onPress={onClose}>
+          <TouchableOpacity style={styles.closeButton} accessibilityRole="button" accessibilityLabel="Close modal" onPress={onClose}>
             <Ionicons name="close-outline" size={28} color="#888" />
           </TouchableOpacity>
 
