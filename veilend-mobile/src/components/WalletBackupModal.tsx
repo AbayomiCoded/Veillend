@@ -18,7 +18,7 @@ const { width } = Dimensions.get('window');
 
 type WalletBackupModalProps = {
   visible: boolean;
-  secretKey: string | null;
+  onRequestSecret: () => Promise<string | null>;
   onClose: () => void;
   onBackupConfirmed: () => void;
 };
@@ -27,7 +27,7 @@ type BackupStep = 'reveal' | 'confirm' | 'success';
 
 export function WalletBackupModal({
   visible,
-  secretKey,
+  onRequestSecret,
   onClose,
   onBackupConfirmed,
 }: WalletBackupModalProps) {
@@ -37,22 +37,33 @@ export function WalletBackupModal({
   const [maskedKey, setMaskedKey] = useState('');
 
   useEffect(() => {
-    if (secretKey && secretKey.length > 0) {
-      // Show only first 4 and last 4 characters with dots in between
-      const firstFour = secretKey.slice(0, 4);
-      const lastFour = secretKey.slice(-4);
-      const dotCount = Math.min(secretKey.length - 8, 20);
-      setMaskedKey(`${firstFour}${'•'.repeat(dotCount > 0 ? dotCount : 0)}${lastFour}`);
-    }
-  }, [secretKey]);
+    let mounted = true;
+    (async () => {
+      try {
+        const secret = await onRequestSecret();
+        if (!mounted || !secret) return;
+        const firstFour = secret.slice(0, 4);
+        const lastFour = secret.slice(-4);
+        const dotCount = Math.min(secret.length - 8, 20);
+        setMaskedKey(`${firstFour}${'•'.repeat(dotCount > 0 ? dotCount : 0)}${lastFour}`);
+      } catch (e) {
+        // ignore
+      }
+    })();
+    return () => {
+      mounted = false;
+      setMaskedKey('');
+    };
+  }, [onRequestSecret]);
 
   const handleReveal = () => {
     setIsSecretRevealed(true);
   };
 
   const handleCopyToClipboard = async () => {
-    if (secretKey) {
-      await Clipboard.setString(secretKey);
+    const secret = await onRequestSecret();
+    if (secret) {
+      await Clipboard.setString(secret);
       Toast.show({
         type: 'success',
         text1: 'Copied to clipboard',
@@ -62,7 +73,8 @@ export function WalletBackupModal({
   };
 
   const handleConfirm = () => {
-    if (confirmInput.trim() === secretKey) {
+    const secret = await onRequestSecret();
+    if (secret && confirmInput.trim() === secret) {
       setStep('success');
       onBackupConfirmed();
       Toast.show({
