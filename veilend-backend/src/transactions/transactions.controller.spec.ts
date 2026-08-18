@@ -3,6 +3,7 @@ import { TransactionsController } from './transactions.controller';
 import { TransactionsService } from './transactions.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { AuthenticatedRequest } from '../auth/types/authenticated-request.type';
+import { GetTransactionsQueryDto } from './dto/get-transactions-query.dto';
 
 describe('TransactionsController', () => {
   let controller: TransactionsController;
@@ -29,11 +30,11 @@ describe('TransactionsController', () => {
       data: [],
       nextCursor: null,
     };
-    const mockQuery: GetTransactionsQueryDto = {
+    const mockQuery = {
       order: 'DESC',
       skip: 0,
-      take: 20,
-    };
+      take: 50,
+    } as unknown as GetTransactionsQueryDto;
     service.getTransactions.mockResolvedValue(mockResponse);
 
     const req = {
@@ -42,14 +43,11 @@ describe('TransactionsController', () => {
 
     const result = await controller.getTransactions(
       { walletAddress: 'GABC' },
-      { skip: 0, take: 50 } as GetTransactionsQueryDto,
+      mockQuery,
       req,
     );
 
-    expect(service.getTransactions).toHaveBeenCalledWith('GABC', {
-      skip: 0,
-      take: 50,
-    });
+    expect(service.getTransactions).toHaveBeenCalledWith('GABC', mockQuery);
     expect(result).toEqual(mockResponse);
   });
 });

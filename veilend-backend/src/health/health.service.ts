@@ -62,7 +62,7 @@ export class HealthService {
   async probeHorizon(): Promise<HorizonComponentStatus> {
     const start = Date.now();
     try {
-      const result = await this.horizon.getRoot();
+      const result = (await this.horizon.getRoot()) as Record<string, unknown>;
       return {
         status: 'up',
         coreLatestLedger:

@@ -83,6 +83,7 @@ describe('CORS origin-check via supertest', () => {
   afterAll(() => app.close());
 
   it('returns 403 for requests from a non-allowlisted Origin', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
     return request(app.getHttpServer())
       .get('/')
       .set('Origin', 'http://attacker.example.com')
@@ -90,6 +91,7 @@ describe('CORS origin-check via supertest', () => {
   });
 
   it('returns 200 for requests from an allowlisted Origin', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
     return request(app.getHttpServer())
       .get('/')
       .set('Origin', 'http://localhost:3000')
@@ -136,12 +138,14 @@ describe('ThrottlerGuard — AuthController nonce endpoint', () => {
   it('returns 429 on the 16th rapid request to POST /auth/nonce', async () => {
     // Send 15 requests — all should succeed (201 Created by default for POST)
     for (let i = 0; i < 15; i++) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       await request(app.getHttpServer())
         .post('/auth/nonce')
         .send({ walletAddress: 'GABC123' });
     }
 
     // 16th request must be throttled
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
     return request(app.getHttpServer())
       .post('/auth/nonce')
       .send({ walletAddress: 'GABC123' })
