@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  UnauthorizedException,
-  GoneException,
-} from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 
 import { JwtService } from '@nestjs/jwt';
 
@@ -33,7 +28,12 @@ export class AuthService {
    * Any previously issued unused nonces for this wallet are invalidated
    * so that only the latest challenge can be used (prevents nonce stacking).
    */
-  async generateNonce(walletAddress: string) {
+  async generateNonce(
+    walletAddress: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ) {
     const nonce = randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + NONCE_TTL_MS);
 
@@ -49,6 +49,16 @@ export class AuthService {
         walletAddress,
         nonce,
         expiresAt,
+      },
+    });
+
+    await this.prisma.authAuditLog.create({
+      data: {
+        walletAddress,
+        event: 'NONCE_GENERATED',
+        ip,
+        userAgent,
+        correlationId,
       },
     });
 
@@ -69,7 +79,14 @@ export class AuthService {
    *     and are rejected.
    *  3. A claimed nonce is used to upsert the user and create a session.
    */
-  async verifyWallet(walletAddress: string, nonce: string, signature: string) {
+  async verifyWallet(
+    walletAddress: string,
+    nonce: string,
+    signature: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ) {
     // 1. Signature must be valid before we consume the nonce.
     const valid = this.walletService.verifySignature(
       walletAddress,
@@ -79,7 +96,14 @@ export class AuthService {
 
     if (!valid) {
       this.logger.warn(`Verify failed: invalid signature for ${walletAddress}`);
-      throw new UnauthorizedException('Invalid wallet signature');
+      await this.logAuthFailure(
+        walletAddress,
+        'Invalid signature',
+        ip,
+        userAgent,
+        correlationId,
+      );
+      throw new UnauthorizedException('Authentication failed');
     }
 
     // 2. Atomically claim the nonce. The WHERE clause is the authoritative
@@ -95,7 +119,13 @@ export class AuthService {
     });
 
     if (count === 0) {
-      await this.handleNonceClaimFailure(walletAddress, nonce);
+      await this.handleNonceClaimFailure(
+        walletAddress,
+        nonce,
+        ip,
+        userAgent,
+        correlationId,
+      );
     }
 
     // 3. Upsert user & create session
@@ -120,6 +150,16 @@ export class AuthService {
       },
     });
 
+    await this.prisma.authAuditLog.create({
+      data: {
+        walletAddress,
+        event: 'LOGIN_SUCCESS',
+        ip,
+        userAgent,
+        correlationId,
+      },
+    });
+
     this.logger.log(`Session created for ${walletAddress} (id: ${session.id})`);
 
     return {
@@ -137,6 +177,9 @@ export class AuthService {
   private async handleNonceClaimFailure(
     walletAddress: string,
     nonce: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
   ): Promise<never> {
     const storedNonce = await this.prisma.walletNonce.findFirst({
       where: { walletAddress, nonce },
@@ -145,16 +188,28 @@ export class AuthService {
 
     if (!storedNonce) {
       this.logger.warn(`Verify failed: unknown nonce for ${walletAddress}`);
-      throw new UnauthorizedException('Invalid or unknown nonce');
+      await this.logAuthFailure(
+        walletAddress,
+        'Unknown nonce',
+        ip,
+        userAgent,
+        correlationId,
+      );
+      throw new UnauthorizedException('Authentication failed');
     }
 
     if (storedNonce.used) {
       this.logger.warn(
         `Replay attempt detected for ${walletAddress} (nonce already used)`,
       );
-      throw new UnauthorizedException(
-        'Nonce has already been used - request a new challenge',
+      await this.logAuthFailure(
+        walletAddress,
+        'Nonce already used',
+        ip,
+        userAgent,
+        correlationId,
       );
+      throw new UnauthorizedException('Authentication failed');
     }
 
     // Expired — mark it used so it can't be retried even if the clock changes.
@@ -162,7 +217,33 @@ export class AuthService {
       where: { id: storedNonce.id },
       data: { used: true },
     });
-    throw new GoneException('Nonce has expired - request a new challenge');
+    await this.logAuthFailure(
+      walletAddress,
+      'Nonce expired',
+      ip,
+      userAgent,
+      correlationId,
+    );
+    throw new UnauthorizedException('Authentication failed');
+  }
+
+  private async logAuthFailure(
+    walletAddress: string,
+    reason: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ) {
+    await this.prisma.authAuditLog.create({
+      data: {
+        walletAddress,
+        event: 'LOGIN_FAILED',
+        reason,
+        ip,
+        userAgent,
+        correlationId,
+      },
+    });
   }
 
   /**
@@ -201,9 +282,26 @@ export class AuthService {
   /**
    * Revoke a session by its ID. Idempotent - safe to call multiple times.
    */
-  async revokeSession(sessionId: string): Promise<void> {
+  async revokeSession(
+    sessionId: string,
+    walletAddress?: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ): Promise<void> {
     try {
       await this.prisma.session.delete({ where: { id: sessionId } });
+      if (walletAddress) {
+        await this.prisma.authAuditLog.create({
+          data: {
+            walletAddress,
+            event: 'LOGOUT',
+            ip,
+            userAgent,
+            correlationId,
+          },
+        });
+      }
     } catch (error) {
       // Already revoked/gone - logout is idempotent. Anything else is a real failure.
       if (!(
@@ -213,5 +311,16 @@ export class AuthService {
         throw error;
       }
     }
+  }
+
+  /**
+   * Admin-only query to fetch the recent audit logs for a given wallet address.
+   */
+  async getAuditLogs(walletAddress: string) {
+    return this.prisma.authAuditLog.findMany({
+      where: { walletAddress },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
   }
 }

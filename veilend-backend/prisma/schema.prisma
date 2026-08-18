@@ -242,6 +242,28 @@ model AdminAction {
   @@index([txHash])
 }
 
+// ─── Auth Audit Log ──────────────────────────────────────────────────────────
+
+enum AuthEventType {
+  NONCE_GENERATED
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  LOGOUT
+}
+
+model AuthAuditLog {
+  id            String        @id @default(uuid())
+  walletAddress String
+  event         AuthEventType
+  reason        String?
+  ip            String?
+  userAgent     String?
+  correlationId String?
+  createdAt     DateTime      @default(now())
+
+  @@index([walletAddress, createdAt(sort: Desc)])
+}
+
 // ─── Indexer Checkpoint ──────────────────────────────────────────────────────
 
 // Singleton row (fixed id "global") tracking the Soroban event indexer's
