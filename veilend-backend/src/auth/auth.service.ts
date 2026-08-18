@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  UnauthorizedException,
-  GoneException,
-} from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 
 import { JwtService } from '@nestjs/jwt';
 
@@ -32,23 +27,44 @@ export class AuthService {
    *
    * Any previously issued unused nonces for this wallet are invalidated
    * so that only the latest challenge can be used (prevents nonce stacking).
+   *
+   * The invalidate-then-create pair runs under Serializable isolation so
+   * concurrent nonce-generation requests for the same wallet cannot both
+   * commit active nonces simultaneously.
    */
-  async generateNonce(walletAddress: string) {
+  async generateNonce(
+    walletAddress: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ) {
     const nonce = randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + NONCE_TTL_MS);
 
-    // Invalidate any prior unused nonces for this wallet
-    await this.prisma.walletNonce.updateMany({
-      where: { walletAddress, used: false },
-      data: { used: true },
+    await this.prisma.withSerializable(async (tx) => {
+      // Invalidate any prior unused nonces for this wallet
+      await tx.walletNonce.updateMany({
+        where: { walletAddress, used: false },
+        data: { used: true },
+      });
+
+      // Persist the new nonce
+      await tx.walletNonce.create({
+        data: {
+          walletAddress,
+          nonce,
+          expiresAt,
+        },
+      });
     });
 
-    // Persist the new nonce
-    await this.prisma.walletNonce.create({
+    await this.prisma.authAuditLog.create({
       data: {
         walletAddress,
-        nonce,
-        expiresAt,
+        event: 'NONCE_GENERATED',
+        ip,
+        userAgent,
+        correlationId,
       },
     });
 
@@ -63,13 +79,21 @@ export class AuthService {
    * Replay protection:
    *  1. The signature over the nonce must be valid (invalid signatures do
    *     not burn nonces).
-   *  2. The nonce is claimed with a single atomic conditional update that
-   *     gates on `used = false AND expiresAt > NOW`. Under concurrency only
-   *     one request can claim the nonce; the rest observe zero affected rows
-   *     and are rejected.
-   *  3. A claimed nonce is used to upsert the user and create a session.
+   *  2. The nonce is claimed inside a Serializable transaction with a
+   *     conditional update that gates on `used = false AND expiresAt > NOW`.
+   *     Under concurrency only one request can claim the nonce; the rest
+   *     observe zero affected rows and are rejected.
+   *  3. A claimed nonce is used to upsert the user and create a session,
+   *     all within the same atomic Serializable transaction.
    */
-  async verifyWallet(walletAddress: string, nonce: string, signature: string) {
+  async verifyWallet(
+    walletAddress: string,
+    nonce: string,
+    signature: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ) {
     // 1. Signature must be valid before we consume the nonce.
     const valid = this.walletService.verifySignature(
       walletAddress,
@@ -79,54 +103,98 @@ export class AuthService {
 
     if (!valid) {
       this.logger.warn(`Verify failed: invalid signature for ${walletAddress}`);
-      throw new UnauthorizedException('Invalid wallet signature');
-    }
-
-    // 2. Atomically claim the nonce. The WHERE clause is the authoritative
-    //    used/expiry gate, eliminating the TOCTOU race in a read-then-write.
-    const { count } = await this.prisma.walletNonce.updateMany({
-      where: {
+      await this.logAuthFailure(
         walletAddress,
-        nonce,
-        used: false,
-        expiresAt: { gt: new Date() },
-      },
-      data: { used: true },
-    });
-
-    if (count === 0) {
-      await this.handleNonceClaimFailure(walletAddress, nonce);
+        'Invalid signature',
+        ip,
+        userAgent,
+        correlationId,
+      );
+      throw new UnauthorizedException('Authentication failed');
     }
 
-    // 3. Upsert user & create session
-    const user = await this.prisma.user.upsert({
-      where: { walletAddress },
-      create: { walletAddress },
-      update: {},
-    });
+    // 2 + 3. Atomically claim nonce, upsert user, and create session under
+    //        Serializable so concurrent claim attempts serialize correctly.
+    let sessionResult: { accessToken: string; sessionId: string; expiresAt: string } | null = null;
 
-    const token = this.jwtService.sign({
-      walletAddress,
-      sub: user.id,
-    });
+    try {
+      sessionResult = await this.prisma.withSerializable(async (tx) => {
+        // Atomically claim the nonce. The WHERE clause is the authoritative
+        // used/expiry gate, eliminating the TOCTOU race in a read-then-write.
+        const { count } = await tx.walletNonce.updateMany({
+          where: {
+            walletAddress,
+            nonce,
+            used: false,
+            expiresAt: { gt: new Date() },
+          },
+          data: { used: true },
+        });
 
-    const { exp } = this.jwtService.decode<{ exp: number }>(token);
+        if (count === 0) {
+          // Run diagnostic outside the serializable tx to avoid blocking it.
+          // The tx will be rolled back by throwing here.
+          throw Object.assign(new Error('NONCE_CLAIM_FAILED'), { __nonce_failed: true });
+        }
 
-    const session = await this.prisma.session.create({
+        // Upsert user & create session within the same transaction.
+        const user = await tx.user.upsert({
+          where: { walletAddress },
+          create: { walletAddress },
+          update: {},
+        });
+
+        const token = this.jwtService.sign({
+          walletAddress,
+          sub: user.id,
+        });
+
+        const { exp } = this.jwtService.decode<{ exp: number }>(token);
+
+        const session = await tx.session.create({
+          data: {
+            userId: user.id,
+            token,
+            expiresAt: new Date(exp * 1000),
+          },
+        });
+
+        return {
+          accessToken: token,
+          sessionId: session.id,
+          expiresAt: session.expiresAt.toISOString(),
+        };
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error as { __nonce_failed?: boolean }).__nonce_failed
+      ) {
+        // Determine why and log appropriately.
+        await this.handleNonceClaimFailure(
+          walletAddress,
+          nonce,
+          ip,
+          userAgent,
+          correlationId,
+        );
+      }
+      throw error;
+    }
+
+    await this.prisma.authAuditLog.create({
       data: {
-        userId: user.id,
-        token,
-        expiresAt: new Date(exp * 1000),
+        walletAddress,
+        event: 'LOGIN_SUCCESS',
+        ip,
+        userAgent,
+        correlationId,
       },
     });
 
-    this.logger.log(`Session created for ${walletAddress} (id: ${session.id})`);
+    this.logger.log(`Session created for ${walletAddress} (id: ${sessionResult!.sessionId})`);
 
-    return {
-      accessToken: token,
-      sessionId: session.id,
-      expiresAt: session.expiresAt.toISOString(),
-    };
+    return sessionResult!;
   }
 
   /**
@@ -137,6 +205,9 @@ export class AuthService {
   private async handleNonceClaimFailure(
     walletAddress: string,
     nonce: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
   ): Promise<never> {
     const storedNonce = await this.prisma.walletNonce.findFirst({
       where: { walletAddress, nonce },
@@ -145,16 +216,28 @@ export class AuthService {
 
     if (!storedNonce) {
       this.logger.warn(`Verify failed: unknown nonce for ${walletAddress}`);
-      throw new UnauthorizedException('Invalid or unknown nonce');
+      await this.logAuthFailure(
+        walletAddress,
+        'Unknown nonce',
+        ip,
+        userAgent,
+        correlationId,
+      );
+      throw new UnauthorizedException('Authentication failed');
     }
 
     if (storedNonce.used) {
       this.logger.warn(
         `Replay attempt detected for ${walletAddress} (nonce already used)`,
       );
-      throw new UnauthorizedException(
-        'Nonce has already been used - request a new challenge',
+      await this.logAuthFailure(
+        walletAddress,
+        'Nonce already used',
+        ip,
+        userAgent,
+        correlationId,
       );
+      throw new UnauthorizedException('Authentication failed');
     }
 
     // Expired — mark it used so it can't be retried even if the clock changes.
@@ -162,7 +245,33 @@ export class AuthService {
       where: { id: storedNonce.id },
       data: { used: true },
     });
-    throw new GoneException('Nonce has expired - request a new challenge');
+    await this.logAuthFailure(
+      walletAddress,
+      'Nonce expired',
+      ip,
+      userAgent,
+      correlationId,
+    );
+    throw new UnauthorizedException('Authentication failed');
+  }
+
+  private async logAuthFailure(
+    walletAddress: string,
+    reason: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ) {
+    await this.prisma.authAuditLog.create({
+      data: {
+        walletAddress,
+        event: 'LOGIN_FAILED',
+        reason,
+        ip,
+        userAgent,
+        correlationId,
+      },
+    });
   }
 
   /**
@@ -201,9 +310,26 @@ export class AuthService {
   /**
    * Revoke a session by its ID. Idempotent - safe to call multiple times.
    */
-  async revokeSession(sessionId: string): Promise<void> {
+  async revokeSession(
+    sessionId: string,
+    walletAddress?: string,
+    ip?: string,
+    userAgent?: string,
+    correlationId?: string,
+  ): Promise<void> {
     try {
       await this.prisma.session.delete({ where: { id: sessionId } });
+      if (walletAddress) {
+        await this.prisma.authAuditLog.create({
+          data: {
+            walletAddress,
+            event: 'LOGOUT',
+            ip,
+            userAgent,
+            correlationId,
+          },
+        });
+      }
     } catch (error) {
       // Already revoked/gone - logout is idempotent. Anything else is a real failure.
       if (!(
@@ -213,5 +339,16 @@ export class AuthService {
         throw error;
       }
     }
+  }
+
+  /**
+   * Admin-only query to fetch the recent audit logs for a given wallet address.
+   */
+  async getAuditLogs(walletAddress: string) {
+    return this.prisma.authAuditLog.findMany({
+      where: { walletAddress },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
   }
 }

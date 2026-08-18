@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { UnauthorizedException, GoneException } from '@nestjs/common';
+import { UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
 import { AuthService } from './auth.service';
@@ -11,6 +11,7 @@ describe('AuthService', () => {
   let walletService: { verifySignature: jest.Mock };
   let jwtService: { sign: jest.Mock; decode: jest.Mock };
   let prisma: {
+    withSerializable: jest.Mock;
     user: { upsert: jest.Mock };
     session: {
       create: jest.Mock;
@@ -24,12 +25,17 @@ describe('AuthService', () => {
       update: jest.Mock;
       updateMany: jest.Mock;
     };
+    authAuditLog: {
+      create: jest.Mock;
+    };
   };
 
   beforeEach(async () => {
     walletService = { verifySignature: jest.fn() };
     jwtService = { sign: jest.fn(), decode: jest.fn() };
     prisma = {
+      // Passthrough: runs the callback with a proxy that delegates to `prisma`.
+      withSerializable: jest.fn(async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma)),
       user: { upsert: jest.fn() },
       session: {
         create: jest.fn(),
@@ -42,6 +48,9 @@ describe('AuthService', () => {
         findFirst: jest.fn(),
         update: jest.fn(),
         updateMany: jest.fn(),
+      },
+      authAuditLog: {
+        create: jest.fn(),
       },
     };
 
@@ -106,10 +115,10 @@ describe('AuthService', () => {
 
       await expect(
         service.verifyWallet('GABC', 'nonce', 'sig'),
-      ).rejects.toThrow('Nonce has already been used');
+      ).rejects.toThrow('Authentication failed');
     });
 
-    it('throws GoneException when nonce has expired', async () => {
+    it('throws UnauthorizedException when nonce has expired', async () => {
       walletService.verifySignature.mockReturnValue(true);
       prisma.walletNonce.updateMany.mockResolvedValue({ count: 0 });
       prisma.walletNonce.findFirst.mockResolvedValue({
@@ -121,7 +130,7 @@ describe('AuthService', () => {
 
       await expect(
         service.verifyWallet('GABC', 'nonce', 'sig'),
-      ).rejects.toThrow(GoneException);
+      ).rejects.toThrow(UnauthorizedException);
 
       expect(prisma.walletNonce.update).toHaveBeenCalledWith({
         where: { id: 'n-1' },
@@ -173,7 +182,7 @@ describe('AuthService', () => {
       expect(fulfilled).toHaveLength(1);
       expect(rejected).toHaveLength(1);
       expect((rejected[0].reason as Error).message).toBe(
-        'Nonce has already been used - request a new challenge',
+        'Authentication failed',
       );
       expect(prisma.session.create).toHaveBeenCalledTimes(1);
       expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
