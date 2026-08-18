@@ -34,4 +34,10 @@ export class AssetResponseDto {
 
   @Expose()
   minCollateralRatio: number | null;
+
+  @Expose()
+  displayName: string | null;
+
+  @Expose()
+  verified: boolean;
 }

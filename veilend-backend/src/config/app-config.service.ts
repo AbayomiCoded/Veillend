@@ -14,7 +14,18 @@ export class AppConfigService {
     horizonUrls: string[];
     sorobanRpcUrls: string[];
     networkPassphrase: string;
+    verifiedAssetList: Record<string, string[]>;
   } {
+    let verifiedAssetList: Record<string, string[]> = {};
+    try {
+      const val = this.configService.get<string>('VERIFIED_ASSET_LIST');
+      if (val) {
+        verifiedAssetList = JSON.parse(val);
+      }
+    } catch (e) {
+      // Ignore
+    }
+
     return {
       network: this.configService.get<string>('STELLAR_NETWORK', 'testnet'),
       horizonUrls: this.configService
@@ -43,6 +54,7 @@ export class AppConfigService {
         'STELLAR_NETWORK_PASSPHRASE',
         'Test SDF Network ; September 2015',
       ),
+      verifiedAssetList,
     };
   }
 

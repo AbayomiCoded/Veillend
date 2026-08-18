@@ -1,4 +1,4 @@
-import { IsString, IsBoolean } from 'class-validator';
+import { IsString, IsBoolean, IsOptional, IsNumber } from 'class-validator';
 
 export class ConfigureAssetDto {
   @IsString()
@@ -6,4 +6,16 @@ export class ConfigureAssetDto {
 
   @IsBoolean()
   supported: boolean;
+
+  @IsOptional()
+  @IsString()
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  symbol?: string;
+
+  @IsOptional()
+  @IsNumber()
+  decimals?: number;
 }

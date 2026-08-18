@@ -8,7 +8,17 @@ import {
   Memo,
   MemoType,
   Operation,
+  Contract,
+  TransactionBuilder,
+  BASE_FEE,
+  scValToNative,
 } from '@stellar/stellar-sdk';
+
+export interface SacValidationResult {
+  symbol: string;
+  name: string;
+  decimals: number;
+}
 import { Observable, from, of } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
 import { ServiceResponse } from './types';
@@ -90,6 +100,98 @@ export class SorobanRpcService implements OnModuleInit {
       (client) => client.sendTransaction(transaction),
       { mode: 'write' }, // Enforces 1 attempt max!
     );
+  }
+
+  async validateStellarAssetContract(
+    address: string,
+  ): Promise<SacValidationResult | null> {
+    const dummyAccount = new Account(
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      '0',
+    );
+
+    try {
+      const contract = new Contract(address);
+      const symbolOp = contract.call('symbol');
+      const nameOp = contract.call('name');
+      const decimalsOp = contract.call('decimals');
+
+      const simSymbol = await this.circuitBreaker.execute(
+        'simulateTransaction',
+        (client) =>
+          client.simulateTransaction(
+            new TransactionBuilder(dummyAccount, {
+              fee: BASE_FEE,
+              networkPassphrase: this.networkPassphrase,
+            })
+              .addOperation(symbolOp)
+              .setTimeout(0)
+              .build(),
+          ),
+        { mode: 'read' },
+      );
+
+      const simName = await this.circuitBreaker.execute(
+        'simulateTransaction',
+        (client) =>
+          client.simulateTransaction(
+            new TransactionBuilder(dummyAccount, {
+              fee: BASE_FEE,
+              networkPassphrase: this.networkPassphrase,
+            })
+              .addOperation(nameOp)
+              .setTimeout(0)
+              .build(),
+          ),
+        { mode: 'read' },
+      );
+
+      const simDecimals = await this.circuitBreaker.execute(
+        'simulateTransaction',
+        (client) =>
+          client.simulateTransaction(
+            new TransactionBuilder(dummyAccount, {
+              fee: BASE_FEE,
+              networkPassphrase: this.networkPassphrase,
+            })
+              .addOperation(decimalsOp)
+              .setTimeout(0)
+              .build(),
+          ),
+        { mode: 'read' },
+      );
+
+      if (
+        rpc.Api.isSimulationError(simSymbol) ||
+        !simSymbol.result ||
+        rpc.Api.isSimulationError(simName) ||
+        !simName.result ||
+        rpc.Api.isSimulationError(simDecimals) ||
+        !simDecimals.result
+      ) {
+        return null;
+      }
+
+      const parseStr = (val: unknown) => {
+        if (Buffer.isBuffer(val) || val instanceof Uint8Array) {
+          return Buffer.from(val).toString('utf8');
+        }
+        return String(val);
+      };
+
+      const symbolVal = scValToNative(simSymbol.result.retval);
+      const nameVal = scValToNative(simName.result.retval);
+      const decimalsVal = scValToNative(simDecimals.result.retval);
+
+      return {
+        symbol: parseStr(symbolVal),
+        name: parseStr(nameVal),
+        decimals: Number(decimalsVal),
+      };
+    } catch (e) {
+      this.logger.warn(`Failed to validate SAC ${address}: ${e}`);
+      return null;
+    }
   }
 
   async validateConnection(): Promise<boolean> {

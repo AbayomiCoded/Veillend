@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ConfigureAssetDto } from './dto/configure-asset.dto';
@@ -16,6 +17,8 @@ import { PageDto } from '../common/dto/page.dto';
 import { PageMetaDto } from '../common/dto/page-meta.dto';
 import { AdminActionRepository } from './admin-action.repository';
 import { AdminTransactionBuilderService } from './admin-transaction-builder.service';
+import { SorobanRpcService } from '../stellar/soroban-rpc.service';
+import { AppConfigService } from '../config/app-config.service';
 
 export interface AdminActionDispatchResult {
   actionId: string;
@@ -30,6 +33,8 @@ export class AdminService {
     private prisma: PrismaService,
     private readonly adminActionRepository: AdminActionRepository,
     private readonly transactionBuilder: AdminTransactionBuilderService,
+    private readonly rpcService: SorobanRpcService,
+    private readonly configService: AppConfigService,
   ) {}
 
   /**
@@ -113,6 +118,46 @@ export class AdminService {
     dto: ConfigureAssetDto,
     actorWallet: string,
   ): Promise<AdminActionDispatchResult> {
+    const sacData = await this.rpcService.validateStellarAssetContract(
+      dto.assetContractId,
+    );
+
+    if (!sacData) {
+      throw new BadRequestException('Contract does not implement SAC interface');
+    }
+
+    const { verifiedAssetList } = this.configService.stellar;
+    const allowedAddresses = verifiedAssetList[sacData.symbol];
+
+    if (allowedAddresses && allowedAddresses.length > 0) {
+      if (!allowedAddresses.includes(dto.assetContractId)) {
+        throw new BadRequestException('Impersonation risk');
+      }
+    }
+
+    // Upsert the Asset with authoritative on-chain data
+    await this.prisma.asset.upsert({
+      where: { contractId: dto.assetContractId },
+      create: {
+        contractId: dto.assetContractId,
+        code: sacData.symbol,
+        symbol: sacData.symbol,
+        name: sacData.name,
+        decimals: sacData.decimals,
+        displayName: dto.name || null,
+        verified: true,
+        isSupported: false,
+      },
+      update: {
+        code: sacData.symbol,
+        symbol: sacData.symbol,
+        name: sacData.name,
+        decimals: sacData.decimals,
+        displayName: dto.name || null,
+        verified: true,
+      },
+    });
+
     return this.dispatchAction(actorWallet, AdminActionType.CONFIGURE_ASSET, {
       assetContractId: dto.assetContractId,
       supported: dto.supported,

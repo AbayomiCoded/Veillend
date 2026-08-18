@@ -1,3 +1,15 @@
-export default () => ({
-  horizonUrl: process.env.HORIZON_URL,
-});
+export default () => {
+  let verifiedAssetList: Record<string, string[]> = {};
+  try {
+    if (process.env.VERIFIED_ASSET_LIST) {
+      verifiedAssetList = JSON.parse(process.env.VERIFIED_ASSET_LIST);
+    }
+  } catch (e) {
+    // Ignore parse error
+  }
+
+  return {
+    horizonUrl: process.env.HORIZON_URL,
+    verifiedAssetList,
+  };
+};
