@@ -112,10 +112,10 @@ describe('AuthService', () => {
 
       await expect(
         service.verifyWallet('GABC', 'nonce', 'sig'),
-      ).rejects.toThrow('Nonce has already been used');
+      ).rejects.toThrow('Authentication failed');
     });
 
-    it('throws GoneException when nonce has expired', async () => {
+    it('throws UnauthorizedException when nonce has expired', async () => {
       walletService.verifySignature.mockReturnValue(true);
       prisma.walletNonce.updateMany.mockResolvedValue({ count: 0 });
       prisma.walletNonce.findFirst.mockResolvedValue({
@@ -127,7 +127,7 @@ describe('AuthService', () => {
 
       await expect(
         service.verifyWallet('GABC', 'nonce', 'sig'),
-      ).rejects.toThrow(GoneException);
+      ).rejects.toThrow(UnauthorizedException);
 
       expect(prisma.walletNonce.update).toHaveBeenCalledWith({
         where: { id: 'n-1' },
@@ -179,7 +179,7 @@ describe('AuthService', () => {
       expect(fulfilled).toHaveLength(1);
       expect(rejected).toHaveLength(1);
       expect((rejected[0].reason as Error).message).toBe(
-        'Nonce has already been used - request a new challenge',
+        'Authentication failed',
       );
       expect(prisma.session.create).toHaveBeenCalledTimes(1);
       expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
