@@ -19,7 +19,7 @@ export class ValidationError extends Error {
     return new ValidationError(
       issue?.message ?? 'Response validation failed',
       [...prefix, ...(issue?.path ?? [])],
-      { cause: error },
+      { cause: error }
     );
   }
 }
@@ -37,7 +37,7 @@ export class HttpError extends Error {
 export const parseApiResponse = <Schema extends z.ZodTypeAny>(
   schema: Schema,
   value: unknown,
-  path: ValidationPath = [],
+  path: ValidationPath = []
 ): z.output<Schema> => {
   const result = schema.safeParse(value);
   if (!result.success) {
@@ -198,6 +198,17 @@ export const AuthSessionResponseSchema = z.object({
   sessionId: z.string().min(1).optional(),
   expiresAt: z.string().min(1).optional(),
 });
+
+const JwtWalletAddressSchema = z.string().startsWith('G');
+
+export const JwtPayloadSchema = z
+  .object({
+    walletAddress: JwtWalletAddressSchema.optional(),
+    sub: JwtWalletAddressSchema.optional(),
+  })
+  .refine((payload) => payload.walletAddress !== undefined || payload.sub !== undefined, {
+    message: 'JWT payload does not contain a wallet address',
+  });
 
 export type SupportedAssetItem = z.infer<typeof SupportedAssetItemSchema>;
 export type AuthVerificationResult = z.infer<typeof AuthVerificationResponseSchema>;
