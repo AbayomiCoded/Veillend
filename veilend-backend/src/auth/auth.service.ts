@@ -27,6 +27,10 @@ export class AuthService {
    *
    * Any previously issued unused nonces for this wallet are invalidated
    * so that only the latest challenge can be used (prevents nonce stacking).
+   *
+   * The invalidate-then-create pair runs under Serializable isolation so
+   * concurrent nonce-generation requests for the same wallet cannot both
+   * commit active nonces simultaneously.
    */
   async generateNonce(
     walletAddress: string,
@@ -37,19 +41,21 @@ export class AuthService {
     const nonce = randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + NONCE_TTL_MS);
 
-    // Invalidate any prior unused nonces for this wallet
-    await this.prisma.walletNonce.updateMany({
-      where: { walletAddress, used: false },
-      data: { used: true },
-    });
+    await this.prisma.withSerializable(async (tx) => {
+      // Invalidate any prior unused nonces for this wallet
+      await tx.walletNonce.updateMany({
+        where: { walletAddress, used: false },
+        data: { used: true },
+      });
 
-    // Persist the new nonce
-    await this.prisma.walletNonce.create({
-      data: {
-        walletAddress,
-        nonce,
-        expiresAt,
-      },
+      // Persist the new nonce
+      await tx.walletNonce.create({
+        data: {
+          walletAddress,
+          nonce,
+          expiresAt,
+        },
+      });
     });
 
     await this.prisma.authAuditLog.create({
@@ -73,11 +79,12 @@ export class AuthService {
    * Replay protection:
    *  1. The signature over the nonce must be valid (invalid signatures do
    *     not burn nonces).
-   *  2. The nonce is claimed with a single atomic conditional update that
-   *     gates on `used = false AND expiresAt > NOW`. Under concurrency only
-   *     one request can claim the nonce; the rest observe zero affected rows
-   *     and are rejected.
-   *  3. A claimed nonce is used to upsert the user and create a session.
+   *  2. The nonce is claimed inside a Serializable transaction with a
+   *     conditional update that gates on `used = false AND expiresAt > NOW`.
+   *     Under concurrency only one request can claim the nonce; the rest
+   *     observe zero affected rows and are rejected.
+   *  3. A claimed nonce is used to upsert the user and create a session,
+   *     all within the same atomic Serializable transaction.
    */
   async verifyWallet(
     walletAddress: string,
@@ -106,49 +113,74 @@ export class AuthService {
       throw new UnauthorizedException('Authentication failed');
     }
 
-    // 2. Atomically claim the nonce. The WHERE clause is the authoritative
-    //    used/expiry gate, eliminating the TOCTOU race in a read-then-write.
-    const { count } = await this.prisma.walletNonce.updateMany({
-      where: {
-        walletAddress,
-        nonce,
-        used: false,
-        expiresAt: { gt: new Date() },
-      },
-      data: { used: true },
-    });
+    // 2 + 3. Atomically claim nonce, upsert user, and create session under
+    //        Serializable so concurrent claim attempts serialize correctly.
+    let sessionResult: { accessToken: string; sessionId: string; expiresAt: string } | null = null;
 
-    if (count === 0) {
-      await this.handleNonceClaimFailure(
-        walletAddress,
-        nonce,
-        ip,
-        userAgent,
-        correlationId,
-      );
+    try {
+      sessionResult = await this.prisma.withSerializable(async (tx) => {
+        // Atomically claim the nonce. The WHERE clause is the authoritative
+        // used/expiry gate, eliminating the TOCTOU race in a read-then-write.
+        const { count } = await tx.walletNonce.updateMany({
+          where: {
+            walletAddress,
+            nonce,
+            used: false,
+            expiresAt: { gt: new Date() },
+          },
+          data: { used: true },
+        });
+
+        if (count === 0) {
+          // Run diagnostic outside the serializable tx to avoid blocking it.
+          // The tx will be rolled back by throwing here.
+          throw Object.assign(new Error('NONCE_CLAIM_FAILED'), { __nonce_failed: true });
+        }
+
+        // Upsert user & create session within the same transaction.
+        const user = await tx.user.upsert({
+          where: { walletAddress },
+          create: { walletAddress },
+          update: {},
+        });
+
+        const token = this.jwtService.sign({
+          walletAddress,
+          sub: user.id,
+        });
+
+        const { exp } = this.jwtService.decode<{ exp: number }>(token);
+
+        const session = await tx.session.create({
+          data: {
+            userId: user.id,
+            token,
+            expiresAt: new Date(exp * 1000),
+          },
+        });
+
+        return {
+          accessToken: token,
+          sessionId: session.id,
+          expiresAt: session.expiresAt.toISOString(),
+        };
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error as { __nonce_failed?: boolean }).__nonce_failed
+      ) {
+        // Determine why and log appropriately.
+        await this.handleNonceClaimFailure(
+          walletAddress,
+          nonce,
+          ip,
+          userAgent,
+          correlationId,
+        );
+      }
+      throw error;
     }
-
-    // 3. Upsert user & create session
-    const user = await this.prisma.user.upsert({
-      where: { walletAddress },
-      create: { walletAddress },
-      update: {},
-    });
-
-    const token = this.jwtService.sign({
-      walletAddress,
-      sub: user.id,
-    });
-
-    const { exp } = this.jwtService.decode<{ exp: number }>(token);
-
-    const session = await this.prisma.session.create({
-      data: {
-        userId: user.id,
-        token,
-        expiresAt: new Date(exp * 1000),
-      },
-    });
 
     await this.prisma.authAuditLog.create({
       data: {
@@ -160,13 +192,9 @@ export class AuthService {
       },
     });
 
-    this.logger.log(`Session created for ${walletAddress} (id: ${session.id})`);
+    this.logger.log(`Session created for ${walletAddress} (id: ${sessionResult!.sessionId})`);
 
-    return {
-      accessToken: token,
-      sessionId: session.id,
-      expiresAt: session.expiresAt.toISOString(),
-    };
+    return sessionResult!;
   }
 
   /**

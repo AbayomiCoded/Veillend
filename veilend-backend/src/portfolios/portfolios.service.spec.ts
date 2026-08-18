@@ -9,6 +9,9 @@ describe('PortfoliosService', () => {
   let service: PortfoliosService;
 
   const mockPrismaService = {
+    withRepeatableRead: jest.fn(async (fn: (db: unknown) => Promise<unknown>) =>
+      fn(mockPrismaService),
+    ),
     user: {
       findUnique: jest.fn(),
     },

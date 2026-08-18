@@ -11,6 +11,7 @@ describe('AuthService', () => {
   let walletService: { verifySignature: jest.Mock };
   let jwtService: { sign: jest.Mock; decode: jest.Mock };
   let prisma: {
+    withSerializable: jest.Mock;
     user: { upsert: jest.Mock };
     session: {
       create: jest.Mock;
@@ -33,6 +34,8 @@ describe('AuthService', () => {
     walletService = { verifySignature: jest.fn() };
     jwtService = { sign: jest.fn(), decode: jest.fn() };
     prisma = {
+      // Passthrough: runs the callback with a proxy that delegates to `prisma`.
+      withSerializable: jest.fn(async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma)),
       user: { upsert: jest.fn() },
       session: {
         create: jest.fn(),
