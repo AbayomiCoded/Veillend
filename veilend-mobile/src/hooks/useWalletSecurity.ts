@@ -14,7 +14,7 @@ try {
 
 const SECRET_KEY_STORE = 'stellar_secret_key';
 const BACKUP_FLAG_STORE = 'wallet_backup_confirmed';
-const SECURE_TIMER_DURATION = 30000; // 30 seconds
+export const SECURE_TIMER_DURATION = 30_000; // 30 seconds
 
 type WalletSecurityState = {
   secretKey: string | null;
