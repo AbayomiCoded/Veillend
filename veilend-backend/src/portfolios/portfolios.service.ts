@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
 import { formatRawAmount } from '../common/utils/format-raw-amount';
+import { computeHealthFactor } from '../common/utils/health-factor.util';
 import {
   PortfolioResponseDto,
   PositionSummaryDto,
@@ -16,18 +17,18 @@ export class PortfoliosService {
   /**
    * Builds a portfolio snapshot from the indexer's Position table, rather
    * than reading live Horizon balances. Positions are the source of truth
-   * for VeilLend protocol collateral/debt; Horizon only knows Stellar
-   * classic balances, which are unrelated to the protocol's lending state.
+   * for VeilLend protocol collateral/debt.
    *
-   * The snapshot is taken inside a RepeatableRead transaction so the caller
-   * always sees a consistent view of all positions — no phantom rows can
-   * appear mid-read between the User lookup and the Position scan.
+   * Computes health factor using authoritative on-chain weighted MCR rules,
+   * flags stale oracle prices, and includes residual bad-debt metrics.
    */
-  async getPortfolio(walletAddress: string): Promise<PortfolioResponseDto> {
-    return this.prisma.withRepeatableRead(async (db) => {
-      const user = await db.user.findUnique({
-        where: { walletAddress },
-      });
+  async getPortfolio(
+    walletAddress: string,
+    options: { allowStale?: boolean } = {},
+  ): Promise<PortfolioResponseDto> {
+    const user = await this.prisma.user.findUnique({
+      where: { walletAddress },
+    });
 
       if (!user) {
         throw new NotFoundException(
@@ -63,21 +64,41 @@ export class PortfoliosService {
         };
       });
 
-      const availableToBorrow = Math.max(collateralValue - borrowedValue, 0);
-      const healthFactor =
-        borrowedValue > 0 ? collateralValue / borrowedValue : Infinity;
+    // Sum residual bad debt if recorded for user
+    let badDebtUsd = 0;
+    try {
+      const liquidationEvents = await this.prisma.transactionHistory.findMany({
+        where: {
+          userId: user.id,
+          type: 'LIQUIDATION',
+        },
+      });
+      for (const ev of liquidationEvents) {
+        const anyEv = ev as Record<string, unknown>;
+        if (anyEv.badDebtUsd && typeof anyEv.badDebtUsd === 'number') {
+          badDebtUsd += anyEv.badDebtUsd;
+        }
+      }
+    } catch {
+      badDebtUsd = 0;
+    }
 
-      this.logger.debug(
-        `Portfolio computed for ${walletAddress}: ${positionSummaries.length} position(s)`,
-      );
+    const positionSummaries: PositionSummaryDto[] = positions.map((p) => {
+      const depositedUsd = Number(p.depositedUsd);
+      const borrowedUsd = Number(p.borrowedUsd);
 
       return {
-        walletAddress,
-        collateralValue,
-        borrowedValue,
-        availableToBorrow,
-        healthFactor,
-        positions: positionSummaries,
+        assetId: p.assetId,
+        assetCode: p.asset.code,
+        assetSymbol: p.asset.symbol,
+        deposited: formatRawAmount(p.depositedRaw, p.asset.decimals),
+        borrowed: formatRawAmount(p.borrowedRaw, p.asset.decimals),
+        depositedUsd,
+        borrowedUsd,
+        minCollateralRatio: p.asset.minCollateralRatio ?? null,
+        healthFactor: p.healthFactor === null ? null : Number(p.healthFactor),
+        privacyMode: p.privacyMode,
+        isStale: p.isStale,
       };
     });
   }
@@ -110,30 +131,44 @@ export class PortfoliosService {
         );
       }
 
-      // Ensure the Position row exists before locking.
-      await db.$executeRaw(Prisma.sql`
-        INSERT INTO "Position" ("id", "userId", "assetId", "updatedAt")
-        VALUES (gen_random_uuid(), ${user.id}, ${assetId}, CURRENT_TIMESTAMP)
-        ON CONFLICT ("userId", "assetId") DO NOTHING
-      `);
-
-      // Acquire a row-level write lock so no concurrent transaction can read
-      // and modify this row until we commit.
-      await db.$executeRaw(Prisma.sql`
-        SELECT 1 FROM "Position"
-        WHERE "userId" = ${user.id} AND "assetId" = ${assetId}
-        FOR UPDATE
-      `);
-
-      // Use atomic increment/decrement — no read-modify-write round-trip.
-      await db.position.update({
-        where: { userId_assetId: { userId: user.id, assetId } },
-        data: {
-          depositedRaw: { increment: depositedRawDelta },
-          borrowedRaw: { increment: borrowedRawDelta },
-          isStale: false,
+    // Authoritative health factor calculation
+    const hfResult = computeHealthFactor(
+      positions.map((p) => ({
+        assetId: p.assetId,
+        assetCode: p.asset.code,
+        depositedUsd: Number(p.depositedUsd),
+        borrowedUsd: Number(p.borrowedUsd),
+        asset: {
+          code: p.asset.code,
+          minCollateralRatio: p.asset.minCollateralRatio,
         },
-      });
-    });
+        isStale: p.isStale,
+      })),
+      {},
+      {},
+      {
+        allowStale: options.allowStale,
+        badDebtUsd,
+      },
+    );
+
+    this.logger.debug(
+      `Portfolio computed for ${walletAddress}: ${positionSummaries.length} position(s), HF=${hfResult.healthFactor}`,
+    );
+
+    return {
+      walletAddress,
+      collateralValue: hfResult.totalCollateralUsd,
+      borrowedValue: hfResult.totalBorrowedUsd,
+      availableToBorrow: hfResult.availableToBorrow,
+      healthFactor: hfResult.healthFactor,
+      hfExBadDebt: hfResult.hfExBadDebt,
+      hfWithBadDebt: hfResult.hfWithBadDebt,
+      badDebtUsd: hfResult.badDebtUsd,
+      isStale: hfResult.isStale,
+      stalePrices: hfResult.stalePrices,
+      missingPrices: hfResult.missingPrices,
+      positions: positionSummaries,
+    };
   }
 }
