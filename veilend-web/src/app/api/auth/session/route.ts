@@ -1,17 +1,26 @@
 import { NextResponse } from 'next/server';
+import { fetchValidated } from '@/lib/api/validated-fetch';
 import { backendFetch } from '@/lib/server/backendFetch';
+import {
+  AuthSessionResponseSchema,
+  HttpError,
+  ValidationError,
+} from '@/lib/validation/api-schemas';
 
 export async function GET() {
   try {
-    const res = await backendFetch('/auth/session');
-    
-    if (!res.ok) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: res.status });
-    }
-    
-    const data = await res.json();
+    const data = await fetchValidated('/auth/session', AuthSessionResponseSchema, {
+      fetcher: (input, init) => backendFetch(String(input), init),
+    });
     return NextResponse.json(data);
   } catch (error) {
+    if (error instanceof HttpError) {
+      return NextResponse.json({ error: 'Not authenticated' }, { status: error.status });
+    }
+    if (error instanceof ValidationError) {
+      console.error('Session response validation error:', error);
+      return NextResponse.json({ error: 'Invalid backend response' }, { status: 502 });
+    }
     console.error('Session error:', error);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }

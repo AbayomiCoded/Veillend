@@ -141,3 +141,64 @@ export const AssetRegistryResponseSchema = z
 export type IndexerPosition = z.infer<typeof IndexerPositionAliasesSchema>;
 export type IndexerTransaction = z.infer<typeof IndexerTransactionSchema>;
 export type AssetRegistryItem = z.infer<typeof AssetRegistryItemSchema>;
+
+export const SupportedAssetItemSchema = z.object({
+  code: z.string().min(1),
+  symbol: z.string().min(1),
+  name: z.string().min(1),
+  decimals: z.number().int().min(0).max(100),
+  issuer: z.string().nullable().optional(),
+  contractId: z.string().nullable().optional(),
+  assetAddress: z.string().optional(),
+  logoUrl: z.string().nullable().optional(),
+  isNative: z.boolean().optional(),
+  isSupported: z.boolean(),
+  minCollateralRatio: z.number().finite().nullable().optional(),
+  priceUsd: z.number().finite().optional(),
+  price: z.number().finite().optional(),
+  walletBalance: z.number().finite().optional(),
+  depositedBalance: z.number().finite().optional(),
+  borrowedBalance: z.number().finite().optional(),
+});
+
+const SupportedAssetArraySchema = z.array(SupportedAssetItemSchema).min(1);
+
+export const SupportedAssetsResponseSchema = z
+  .union([
+    SupportedAssetArraySchema,
+    z.object({ data: SupportedAssetArraySchema }),
+    z.object({ assets: SupportedAssetArraySchema }),
+  ])
+  .transform((value) => {
+    if (Array.isArray(value)) return value;
+    return 'data' in value ? value.data : value.assets;
+  });
+
+export const AuthNonceResponseSchema = z.object({
+  nonce: z.string().min(1),
+});
+
+export const AuthNonceRequestSchema = z.object({
+  walletAddress: z.string().min(1),
+});
+
+export const AuthVerifyRequestSchema = z.object({
+  walletAddress: z.string().min(1),
+  signature: z.string().min(1),
+});
+
+export const AuthVerificationResponseSchema = z.object({
+  accessToken: z.string().min(1),
+  sessionId: z.string().min(1).optional(),
+  expiresAt: z.string().min(1).optional(),
+});
+
+export const AuthSessionResponseSchema = z.object({
+  walletAddress: z.string().min(1),
+  sessionId: z.string().min(1).optional(),
+  expiresAt: z.string().min(1).optional(),
+});
+
+export type SupportedAssetItem = z.infer<typeof SupportedAssetItemSchema>;
+export type AuthVerificationResult = z.infer<typeof AuthVerificationResponseSchema>;
+export type AuthVerifyRequest = z.infer<typeof AuthVerifyRequestSchema>;
