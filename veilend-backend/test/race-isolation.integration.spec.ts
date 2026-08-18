@@ -1,7 +1,7 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-return */
 /**
  * Race-regression and isolation integration tests for VeilLend backend.
  *
- * These tests verify the three acceptance criteria from issue #370:
  *
  *  AC-1  20 concurrent deposit-withdraw requests for the same user end-state
  *        exactly matches the single-threaded sequential baseline of the same
@@ -113,7 +113,13 @@ describeIfDb('Isolation / race-safety integration tests', () => {
       update: {},
     });
     return rawPrisma.position.create({
-      data: { userId: user.id, assetId: asset.id, depositedRaw, borrowedRaw, isStale: false },
+      data: {
+        userId: user.id,
+        assetId: asset.id,
+        depositedRaw,
+        borrowedRaw,
+        isStale: false,
+      },
     });
   };
 
@@ -223,28 +229,35 @@ describeIfDb('Isolation / race-safety integration tests', () => {
       // Wrap withSerializable so the first call throws a "deadlock detected"
       // error, and the second call succeeds with a sentinel value.
       const originalWithSerializable = prisma.withSerializable.bind(prisma);
-      const mockResult = { succeeded: true };
 
-      prisma.withSerializable = jest.fn(async (fn) => {
-        callCount += 1;
-        if (callCount === 1) {
-          // Simulate a Postgres deadlock error on the first attempt so the
-          // retry loop in PrismaService._withRetry kicks in.
-          const err = new Error('deadlock detected');
-          // Trigger the isRetryable path.
-          (err as Error & { code?: string }).code = '40P01';
-          throw err;
-        }
-        // Second attempt: run for real.
-        return originalWithSerializable(fn);
-      }) as typeof prisma.withSerializable;
+      prisma.withSerializable = jest.fn(
+        (fn: Parameters<typeof prisma.withSerializable>[0]) => {
+          callCount += 1;
+          if (callCount === 1) {
+            // Simulate a Postgres deadlock error on the first attempt so the
+            // retry loop in PrismaService._withRetry kicks in.
+            const err = new Error('deadlock detected');
+            // Trigger the isRetryable path.
+            (err as Error & { code?: string }).code = '40P01';
+            return Promise.reject(err);
+          }
+          // Second attempt: run for real.
+          return originalWithSerializable(fn);
+        },
+      ) as typeof prisma.withSerializable;
 
       await seedPosition('dl-user', 'dl-asset', 0n, 0n);
 
       // Reset counter _after_ seeding to count only the applyEvent retry.
       prisma.deadlockRetryCount = 0;
 
-      const event = makeEvent('dl-evt-1', 'deposit', '100', 'dl-user', 'dl-asset');
+      const event = makeEvent(
+        'dl-evt-1',
+        'deposit',
+        '100',
+        'dl-user',
+        'dl-asset',
+      );
 
       // The repository wraps applyEvent in withSerializable; the first call
       // throws a simulated deadlock, the retry counter is incremented, then
@@ -267,15 +280,23 @@ describeIfDb('Isolation / race-safety integration tests', () => {
       // MAX_RETRIES attempts and then rethrow.
       const originalWithSerializable = prisma.withSerializable.bind(prisma);
 
-      prisma.withSerializable = jest.fn(async (_fn) => {
-        const err = new Error('deadlock detected');
-        (err as Error & { code?: string }).code = '40P01';
-        throw err;
-      }) as typeof prisma.withSerializable;
+      prisma.withSerializable = jest.fn(
+        (_fn: Parameters<typeof prisma.withSerializable>[0]) => {
+          const err = new Error('deadlock detected');
+          (err as Error & { code?: string }).code = '40P01';
+          return Promise.reject(err);
+        },
+      ) as typeof prisma.withSerializable;
 
       prisma.deadlockRetryCount = 0;
 
-      const event = makeEvent('dl-exhaust-1', 'deposit', '100', 'dl-user2', 'dl-asset2');
+      const event = makeEvent(
+        'dl-exhaust-1',
+        'deposit',
+        '100',
+        'dl-user2',
+        'dl-asset2',
+      );
 
       await expect(repository.applyEvent(event, 100n, 0n)).rejects.toThrow(
         'deadlock detected',
@@ -367,7 +388,8 @@ describeIfDb('Isolation / race-safety integration tests', () => {
 
     it('getPortfolio runs under RepeatableRead, not Serializable', async () => {
       // Import here to avoid a circular module issue in the test harness.
-      const { PortfoliosService } = await import('../src/portfolios/portfolios.service');
+      const { PortfoliosService } =
+        await import('../src/portfolios/portfolios.service');
 
       const user = await rawPrisma.user.upsert({
         where: { walletAddress: 'portfolio-user' },
@@ -420,7 +442,13 @@ describeIfDb('Isolation / race-safety integration tests', () => {
     it('same sorobanEventId processed twice returns [true, false] and counts once', async () => {
       await seedPosition('dup-user', 'dup-asset', 0n, 0n);
 
-      const ev = makeEvent('dup-evt-ser', 'deposit', '100', 'dup-user', 'dup-asset');
+      const ev = makeEvent(
+        'dup-evt-ser',
+        'deposit',
+        '100',
+        'dup-user',
+        'dup-asset',
+      );
 
       const results = await Promise.all([
         repository.applyEvent(ev, 100n, 0n),

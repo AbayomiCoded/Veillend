@@ -21,14 +21,18 @@ export class PortfoliosService {
    *
    * Computes health factor using authoritative on-chain weighted MCR rules,
    * flags stale oracle prices, and includes residual bad-debt metrics.
+   *
+   * Wrapped in RepeatableRead so the position list and any sub-queries see
+   * the same consistent snapshot without acquiring write locks.
    */
   async getPortfolio(
     walletAddress: string,
     options: { allowStale?: boolean } = {},
   ): Promise<PortfolioResponseDto> {
-    const user = await this.prisma.user.findUnique({
-      where: { walletAddress },
-    });
+    return this.prisma.withRepeatableRead(async (db) => {
+      const user = await db.user.findUnique({
+        where: { walletAddress },
+      });
 
       if (!user) {
         throw new NotFoundException(
@@ -41,14 +45,28 @@ export class PortfoliosService {
         include: { asset: true },
       });
 
-      let collateralValue = 0;
-      let borrowedValue = 0;
+      // Sum residual bad debt if recorded for user
+      let badDebtUsd = 0;
+      try {
+        const liquidationEvents = await db.transactionHistory.findMany({
+          where: {
+            userId: user.id,
+            type: 'LIQUIDATION',
+          },
+        });
+        for (const ev of liquidationEvents) {
+          const anyEv = ev as Record<string, unknown>;
+          if (anyEv.badDebtUsd && typeof anyEv.badDebtUsd === 'number') {
+            badDebtUsd += anyEv.badDebtUsd;
+          }
+        }
+      } catch {
+        badDebtUsd = 0;
+      }
 
       const positionSummaries: PositionSummaryDto[] = positions.map((p) => {
         const depositedUsd = Number(p.depositedUsd);
         const borrowedUsd = Number(p.borrowedUsd);
-        collateralValue += depositedUsd;
-        borrowedValue += borrowedUsd;
 
         return {
           assetId: p.assetId,
@@ -58,47 +76,51 @@ export class PortfoliosService {
           borrowed: formatRawAmount(p.borrowedRaw, p.asset.decimals),
           depositedUsd,
           borrowedUsd,
+          minCollateralRatio: p.asset.minCollateralRatio ?? null,
           healthFactor: p.healthFactor === null ? null : Number(p.healthFactor),
           privacyMode: p.privacyMode,
           isStale: p.isStale,
         };
       });
 
-    // Sum residual bad debt if recorded for user
-    let badDebtUsd = 0;
-    try {
-      const liquidationEvents = await this.prisma.transactionHistory.findMany({
-        where: {
-          userId: user.id,
-          type: 'LIQUIDATION',
+      // Authoritative health factor calculation
+      const hfResult = computeHealthFactor(
+        positions.map((p) => ({
+          assetId: p.assetId,
+          assetCode: p.asset.code,
+          depositedUsd: Number(p.depositedUsd),
+          borrowedUsd: Number(p.borrowedUsd),
+          asset: {
+            code: p.asset.code,
+            minCollateralRatio: p.asset.minCollateralRatio,
+          },
+          isStale: p.isStale,
+        })),
+        {},
+        {},
+        {
+          allowStale: options.allowStale,
+          badDebtUsd,
         },
-      });
-      for (const ev of liquidationEvents) {
-        const anyEv = ev as Record<string, unknown>;
-        if (anyEv.badDebtUsd && typeof anyEv.badDebtUsd === 'number') {
-          badDebtUsd += anyEv.badDebtUsd;
-        }
-      }
-    } catch {
-      badDebtUsd = 0;
-    }
+      );
 
-    const positionSummaries: PositionSummaryDto[] = positions.map((p) => {
-      const depositedUsd = Number(p.depositedUsd);
-      const borrowedUsd = Number(p.borrowedUsd);
+      this.logger.debug(
+        `Portfolio computed for ${walletAddress}: ${positionSummaries.length} position(s), HF=${hfResult.healthFactor}`,
+      );
 
       return {
-        assetId: p.assetId,
-        assetCode: p.asset.code,
-        assetSymbol: p.asset.symbol,
-        deposited: formatRawAmount(p.depositedRaw, p.asset.decimals),
-        borrowed: formatRawAmount(p.borrowedRaw, p.asset.decimals),
-        depositedUsd,
-        borrowedUsd,
-        minCollateralRatio: p.asset.minCollateralRatio ?? null,
-        healthFactor: p.healthFactor === null ? null : Number(p.healthFactor),
-        privacyMode: p.privacyMode,
-        isStale: p.isStale,
+        walletAddress,
+        collateralValue: hfResult.totalCollateralUsd,
+        borrowedValue: hfResult.totalBorrowedUsd,
+        availableToBorrow: hfResult.availableToBorrow,
+        healthFactor: hfResult.healthFactor,
+        hfExBadDebt: hfResult.hfExBadDebt,
+        hfWithBadDebt: hfResult.hfWithBadDebt,
+        badDebtUsd: hfResult.badDebtUsd,
+        isStale: hfResult.isStale,
+        stalePrices: hfResult.stalePrices,
+        missingPrices: hfResult.missingPrices,
+        positions: positionSummaries,
       };
     });
   }
@@ -121,7 +143,7 @@ export class PortfoliosService {
     depositedRawDelta: bigint,
     borrowedRawDelta: bigint,
   ): Promise<void> {
-    await this.prisma.withSerializable(async (db) => {
+    await this.prisma.withSerializable(async (db: Prisma.TransactionClient) => {
       const user = await db.user.findUnique({
         where: { walletAddress },
       });
@@ -131,44 +153,20 @@ export class PortfoliosService {
         );
       }
 
-    // Authoritative health factor calculation
-    const hfResult = computeHealthFactor(
-      positions.map((p) => ({
-        assetId: p.assetId,
-        assetCode: p.asset.code,
-        depositedUsd: Number(p.depositedUsd),
-        borrowedUsd: Number(p.borrowedUsd),
-        asset: {
-          code: p.asset.code,
-          minCollateralRatio: p.asset.minCollateralRatio,
+      await db.position.upsert({
+        where: { userId_assetId: { userId: user.id, assetId } },
+        create: {
+          userId: user.id,
+          assetId,
+          depositedRaw: depositedRawDelta,
+          borrowedRaw: borrowedRawDelta,
+          isStale: false,
         },
-        isStale: p.isStale,
-      })),
-      {},
-      {},
-      {
-        allowStale: options.allowStale,
-        badDebtUsd,
-      },
-    );
-
-    this.logger.debug(
-      `Portfolio computed for ${walletAddress}: ${positionSummaries.length} position(s), HF=${hfResult.healthFactor}`,
-    );
-
-    return {
-      walletAddress,
-      collateralValue: hfResult.totalCollateralUsd,
-      borrowedValue: hfResult.totalBorrowedUsd,
-      availableToBorrow: hfResult.availableToBorrow,
-      healthFactor: hfResult.healthFactor,
-      hfExBadDebt: hfResult.hfExBadDebt,
-      hfWithBadDebt: hfResult.hfWithBadDebt,
-      badDebtUsd: hfResult.badDebtUsd,
-      isStale: hfResult.isStale,
-      stalePrices: hfResult.stalePrices,
-      missingPrices: hfResult.missingPrices,
-      positions: positionSummaries,
-    };
+        update: {
+          depositedRaw: { increment: depositedRawDelta },
+          borrowedRaw: { increment: borrowedRawDelta },
+        },
+      });
+    });
   }
 }
