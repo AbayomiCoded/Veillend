@@ -24,6 +24,9 @@ describe('AuthService', () => {
       update: jest.Mock;
       updateMany: jest.Mock;
     };
+    authAuditLog: {
+      create: jest.Mock;
+    };
   };
 
   beforeEach(async () => {
@@ -42,6 +45,9 @@ describe('AuthService', () => {
         findFirst: jest.fn(),
         update: jest.fn(),
         updateMany: jest.fn(),
+      },
+      authAuditLog: {
+        create: jest.fn(),
       },
     };
 
