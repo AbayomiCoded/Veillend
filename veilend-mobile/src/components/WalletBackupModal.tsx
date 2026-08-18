@@ -103,8 +103,10 @@ export function WalletBackupModal({
             {isSecretRevealed ? secretKey : maskedKey}
           </Text>
           <TouchableOpacity
-            style={styles.eyeButton}
-            onPress={handleReveal}
+          style={styles.eyeButton}
+          onPress={handleReveal}
+          accessibilityRole="button"
+          accessibilityLabel={isSecretRevealed ? 'Hide secret key' : 'Reveal secret key'}
           >
             <Ionicons
               name={isSecretRevealed ? 'eye-off-outline' : 'eye-outline'}
@@ -127,6 +129,8 @@ export function WalletBackupModal({
           style={[styles.actionButton, styles.copyButton]}
           onPress={handleCopyToClipboard}
           disabled={!isSecretRevealed}
+          accessibilityRole="button"
+          accessibilityLabel="Copy secret key"
         >
           <Ionicons name="copy-outline" size={20} color="#FFFFFF" />
           <Text style={styles.copyButtonText}>Copy</Text>
@@ -136,6 +140,8 @@ export function WalletBackupModal({
           style={[styles.actionButton, styles.nextButton]}
           onPress={() => setStep('confirm')}
           disabled={!isSecretRevealed}
+          accessibilityRole="button"
+          accessibilityLabel="Continue to confirm wallet backup"
         >
           <Text style={styles.nextButtonText}>I've Saved It →</Text>
         </TouchableOpacity>
@@ -183,6 +189,8 @@ export function WalletBackupModal({
             setStep('reveal');
             setIsSecretRevealed(false);
           }}
+          accessibilityRole="button"
+          accessibilityLabel="Go back to reveal wallet backup"
         >
           <Text style={styles.backButtonText}>← Back</Text>
         </TouchableOpacity>
@@ -195,6 +203,8 @@ export function WalletBackupModal({
           ]}
           onPress={handleConfirm}
           disabled={!confirmInput.trim()}
+          accessibilityRole="button"
+          accessibilityLabel="Confirm wallet backup"
         >
           <Text style={styles.confirmButtonText}>Confirm</Text>
         </TouchableOpacity>
@@ -230,6 +240,8 @@ export function WalletBackupModal({
       <TouchableOpacity
         style={[styles.actionButton, styles.doneButton]}
         onPress={handleClose}
+        accessibilityRole="button"
+        accessibilityLabel="Continue to app"
       >
         <Text style={styles.doneButtonText}>Continue to App</Text>
       </TouchableOpacity>
@@ -245,7 +257,7 @@ export function WalletBackupModal({
     >
       <View style={styles.modalOverlay}>
         <View style={styles.modalContent}>
-          <TouchableOpacity style={styles.closeButton} onPress={handleClose}>
+          <TouchableOpacity style={styles.closeButton} accessibilityRole="button" accessibilityLabel="Close modal" onPress={handleClose}>
             <Ionicons name="close-outline" size={28} color="#888" />
           </TouchableOpacity>
 
