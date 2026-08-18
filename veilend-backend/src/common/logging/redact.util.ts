@@ -23,7 +23,8 @@ const STELLAR_G_ADDRESS_RE = /\b(G[A-Z0-9]{50,60})\b/g;
 const STELLAR_S_SECRET_RE = /\b(S[A-Z0-9]{50,60})\b/g;
 
 // JWT pattern (header.payload.signature starting with eyJ)
-const JWT_RE = /\beyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]+\b/g;
+const JWT_RE =
+  /\beyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]+\b/g;
 
 // Bearer token pattern
 const BEARER_RE = /Bearer\s+[A-Za-z0-9-._~+/]+=*/gi;
@@ -32,7 +33,8 @@ const BEARER_RE = /Bearer\s+[A-Za-z0-9-._~+/]+=*/gi;
 const HEX_SIGNATURE_RE = /\b([0-9a-fA-F]{128})\b/g;
 
 // Key-value sensitive pairs in logs (e.g. "password: secret123", "apikey=xyz", "seed: ...")
-const KV_SENSITIVE_RE = /\b(password|token|accesstoken|refreshtoken|secret|secretkey|apikey|authorization|jwt|privatekey|seed)\s*[:=]\s*([^\s,;]+)/gi;
+const KV_SENSITIVE_RE =
+  /\b(password|token|accesstoken|refreshtoken|secret|secretkey|apikey|authorization|jwt|privatekey|seed)\s*[:=]\s*([^\s,;]+)/gi;
 
 export function redactString(str: string): string {
   if (!str || typeof str !== 'string') {

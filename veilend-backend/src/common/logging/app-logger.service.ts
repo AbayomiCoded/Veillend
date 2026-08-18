@@ -43,7 +43,10 @@ export class AppLoggerService implements LoggerService {
         time: now,
         timestamp: now,
         level,
-        msg: typeof redactedMsg === 'string' ? redactedMsg : JSON.stringify(redactedMsg),
+        msg:
+          typeof redactedMsg === 'string'
+            ? redactedMsg
+            : JSON.stringify(redactedMsg),
         message: redactedMsg,
         component: context,
         context,

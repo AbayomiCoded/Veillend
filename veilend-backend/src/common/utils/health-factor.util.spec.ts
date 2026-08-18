@@ -86,7 +86,12 @@ describe('computeHealthFactor', () => {
       },
     ];
 
-    const result = computeHealthFactor(positions, {}, {}, { allowStale: false });
+    const result = computeHealthFactor(
+      positions,
+      {},
+      {},
+      { allowStale: false },
+    );
 
     expect(result.isStale).toBe(true);
     expect(result.stalePrices).toContain('XLM');

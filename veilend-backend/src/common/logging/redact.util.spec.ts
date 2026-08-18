@@ -1,4 +1,4 @@
-import { redact, redactString } from './redact.util';
+import { redact } from './redact.util';
 
 describe('redact', () => {
   it('redacts top-level sensitive keys case-insensitively', () => {
@@ -44,7 +44,8 @@ describe('redact', () => {
   });
 
   it('redacts JWT tokens embedded in strings', () => {
-    const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    const jwt =
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
     const redacted = redact(`Session claim payload ${jwt}`);
     expect(redacted).toBe('Session claim payload [REDACTED_JWT]');
   });
@@ -82,8 +83,12 @@ describe('redact', () => {
     for (const sample of piiSamples) {
       const redacted = redact(sample) as string;
       // Assert no raw secret seed or full 56-char secret key remains
-      expect(redacted).not.toMatch(/SCZANGBA5YHTNYVVV4C3U252E2B6P6IRKD4D876OQO7D6EUZPIF274IH/);
-      expect(redacted).not.toMatch(/SAAZANGBA5YHTNYVVV4C3U252E2B6P6IRKD4D876OQO7D6EUZPIF274IH/);
+      expect(redacted).not.toMatch(
+        /SCZANGBA5YHTNYVVV4C3U252E2B6P6IRKD4D876OQO7D6EUZPIF274IH/,
+      );
+      expect(redacted).not.toMatch(
+        /SAAZANGBA5YHTNYVVV4C3U252E2B6P6IRKD4D876OQO7D6EUZPIF274IH/,
+      );
       expect(redacted).not.toMatch(/mySuperSecretPassword/);
       expect(redacted).not.toMatch(/nrm_live_secret_key_9999/);
     }

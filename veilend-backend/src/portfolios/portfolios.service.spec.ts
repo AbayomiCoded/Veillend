@@ -52,7 +52,12 @@ describe('PortfoliosService', () => {
     mockPrismaService.position.findMany.mockResolvedValue([
       {
         assetId: 'asset-usdc',
-        asset: { code: 'USDC', symbol: 'USDC', decimals: 7, minCollateralRatio: 0.8 },
+        asset: {
+          code: 'USDC',
+          symbol: 'USDC',
+          decimals: 7,
+          minCollateralRatio: 0.8,
+        },
         depositedRaw: 1_000_0000000n,
         borrowedRaw: 400_0000000n,
         depositedUsd: 1000,
@@ -63,7 +68,12 @@ describe('PortfoliosService', () => {
       },
       {
         assetId: 'asset-xlm',
-        asset: { code: 'XLM', symbol: 'XLM', decimals: 7, minCollateralRatio: 0.7 },
+        asset: {
+          code: 'XLM',
+          symbol: 'XLM',
+          decimals: 7,
+          minCollateralRatio: 0.7,
+        },
         depositedRaw: 500_0000000n,
         borrowedRaw: 0n,
         depositedUsd: 100,
@@ -100,7 +110,12 @@ describe('PortfoliosService', () => {
     mockPrismaService.position.findMany.mockResolvedValue([
       {
         assetId: 'asset-xlm',
-        asset: { code: 'XLM', symbol: 'XLM', decimals: 7, minCollateralRatio: 0.7 },
+        asset: {
+          code: 'XLM',
+          symbol: 'XLM',
+          decimals: 7,
+          minCollateralRatio: 0.7,
+        },
         depositedRaw: 100_0000000n,
         borrowedRaw: 50_0000000n,
         depositedUsd: 100,
@@ -125,7 +140,12 @@ describe('PortfoliosService', () => {
     mockPrismaService.position.findMany.mockResolvedValue([
       {
         assetId: 'asset-xlm',
-        asset: { code: 'XLM', symbol: 'XLM', decimals: 7, minCollateralRatio: 0.7 },
+        asset: {
+          code: 'XLM',
+          symbol: 'XLM',
+          decimals: 7,
+          minCollateralRatio: 0.7,
+        },
         depositedRaw: 100_0000000n,
         borrowedRaw: 50_0000000n,
         depositedUsd: 100,
@@ -149,7 +169,12 @@ describe('PortfoliosService', () => {
     mockPrismaService.position.findMany.mockResolvedValue([
       {
         assetId: 'asset-usdc',
-        asset: { code: 'USDC', symbol: 'USDC', decimals: 7, minCollateralRatio: 0.8 },
+        asset: {
+          code: 'USDC',
+          symbol: 'USDC',
+          decimals: 7,
+          minCollateralRatio: 0.8,
+        },
         depositedRaw: 100_0000000n,
         borrowedRaw: 0n,
         depositedUsd: 100,
@@ -174,7 +199,12 @@ describe('PortfoliosService', () => {
     mockPrismaService.position.findMany.mockResolvedValue([
       {
         assetId: 'asset-usdc',
-        asset: { code: 'USDC', symbol: 'USDC', decimals: 7, minCollateralRatio: 0.8 },
+        asset: {
+          code: 'USDC',
+          symbol: 'USDC',
+          decimals: 7,
+          minCollateralRatio: 0.8,
+        },
         depositedRaw: 100_0000000n,
         borrowedRaw: 200_0000000n,
         depositedUsd: 100,

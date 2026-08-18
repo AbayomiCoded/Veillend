@@ -83,7 +83,9 @@ describe('AppLoggerService', () => {
     const record = lastLine();
     expect(record.message).toContain('GCKZ27...K6MH');
     expect(record.message).toContain('[REDACTED_SECRET_KEY]');
-    expect(record.message).not.toContain('SCZANGBA5YHTNYVVV4C3U252E2B6P6IRKD4D876OQO7D6EUZPIF274IH');
+    expect(record.message).not.toContain(
+      'SCZANGBA5YHTNYVVV4C3U252E2B6P6IRKD4D876OQO7D6EUZPIF274IH',
+    );
   });
 
   it('includes trace on error logs', () => {

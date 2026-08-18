@@ -94,7 +94,8 @@ export function computeHealthFactor(
     totalBorrowedUsd += borrowedUsd;
 
     // Resolve per-asset Min Collateral Ratio (MCR)
-    const registryAsset = assetRegistry[assetCode] || assetRegistry[pos.assetId];
+    const registryAsset =
+      assetRegistry[assetCode] || assetRegistry[pos.assetId];
     let mcr = defaultMcr;
 
     if (pos.asset?.minCollateralRatioBps != null) {
@@ -145,7 +146,10 @@ export function computeHealthFactor(
   const missingPrices = Array.from(missingPricesSet);
   const isStale = stalePrices.length > 0 || missingPrices.length > 0;
 
-  const availableToBorrow = Math.max(0, totalWeightedCollateralUsd - totalBorrowedUsd);
+  const availableToBorrow = Math.max(
+    0,
+    totalWeightedCollateralUsd - totalBorrowedUsd,
+  );
 
   let rawHf: number;
   let hfExBadDebt: number;
@@ -154,14 +158,17 @@ export function computeHealthFactor(
   if (totalBorrowedUsd <= 0) {
     rawHf = Infinity;
     hfExBadDebt = Infinity;
-    hfWithBadDebt = badDebtUsd > 0 ? totalWeightedCollateralUsd / badDebtUsd : Infinity;
+    hfWithBadDebt =
+      badDebtUsd > 0 ? totalWeightedCollateralUsd / badDebtUsd : Infinity;
   } else {
     rawHf = totalWeightedCollateralUsd / totalBorrowedUsd;
     hfExBadDebt = rawHf;
-    hfWithBadDebt = totalWeightedCollateralUsd / (totalBorrowedUsd + badDebtUsd);
+    hfWithBadDebt =
+      totalWeightedCollateralUsd / (totalBorrowedUsd + badDebtUsd);
   }
 
-  const shouldNullifyHf = isStale && !allowStale && (totalCollateralUsd > 0 || totalBorrowedUsd > 0);
+  const shouldNullifyHf =
+    isStale && !allowStale && (totalCollateralUsd > 0 || totalBorrowedUsd > 0);
   const finalHf = shouldNullifyHf ? null : rawHf;
 
   return {
