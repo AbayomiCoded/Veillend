@@ -46,11 +46,11 @@ const readJson = async (response: Response): Promise<unknown> => {
 const wait = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-export const fetchValidated = async <Output>(
+export const fetchValidated = async <Schema extends z.ZodTypeAny>(
   input: RequestInfo | URL,
-  schema: z.ZodType<Output>,
+  schema: Schema,
   options: ValidatedFetchOptions = {},
-): Promise<Output> => {
+): Promise<z.output<Schema>> => {
   const {
     fetcher = fetch,
     requestInit,
