@@ -25,14 +25,24 @@ export interface ValidatedFetchOptions {
 const isAbortError = (error: unknown): boolean =>
   error instanceof Error && error.name === 'AbortError';
 
-const isRetryable = (error: unknown, externalSignal?: AbortSignal): boolean => {
-  if (externalSignal?.aborted || error instanceof ValidationError) {
+export const isRetryableApiError = (error: unknown): boolean => {
+  if (error instanceof ValidationError || isAbortError(error)) {
     return false;
   }
   if (error instanceof HttpError) {
     return error.status >= 500;
   }
-  return !isAbortError(error) || !externalSignal?.aborted;
+  return true;
+};
+
+const isRetryable = (error: unknown, externalSignal?: AbortSignal): boolean => {
+  if (externalSignal?.aborted || error instanceof ValidationError) {
+    return false;
+  }
+  if (isAbortError(error)) {
+    return !externalSignal?.aborted;
+  }
+  return isRetryableApiError(error);
 };
 
 const readJson = async (response: Response): Promise<unknown> => {
