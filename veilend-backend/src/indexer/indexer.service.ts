@@ -219,6 +219,8 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
           borrowedDelta = -amount;
         }
 
+        // applyEvent already runs under Serializable + deadlock retry inside
+        // the repository; the retry counter and warn logs live in PrismaService.
         const isNewTx = await this.repository.applyEvent(
           {
             id,

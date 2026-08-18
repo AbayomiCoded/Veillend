@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 import {
   computeHealthFactor,
   PositionLike,
@@ -98,6 +99,11 @@ describe('Health Factor Simulation & Integration', () => {
     const WALLET = 'GBJEI2M7C3VCWLNGMVIUCA5MNNJICYGKRPS75OZHNUCX33RTRJNQK6MH';
 
     const mockPrismaService = {
+      // Passthrough for getPortfolio which now uses withRepeatableRead
+
+      withRepeatableRead: jest.fn(
+        async (fn: (db: unknown) => Promise<unknown>) => fn(mockPrismaService),
+      ),
       user: {
         findUnique: jest.fn(),
       },
