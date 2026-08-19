@@ -2071,17 +2071,12 @@ fn liquidate_healthy_position_reverts() {
     );
 }
 
-
 // ============================================================================
 // Flash Loan Integration Tests
 // ============================================================================
 
 mod flash_loan_integration_tests {
     use super::*;
-    use veillend_contract::flash_loan::{
-        FlashLoanReceiverClient, FlashLoanState, DEFAULT_FLASH_LOAN_PREMIUM_BPS,
-    };
-    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{contract, contractimpl, Symbol, Vec};
 
     #[contract]
@@ -2090,7 +2085,7 @@ mod flash_loan_integration_tests {
     #[contractimpl]
     impl IntegrationTestFlashLoanReceiver {
         pub fn flash_loan_receiver(
-            env: Env,
+            _env: Env,
             _initiator: Address,
             _asset: Address,
             _amount: i128,
@@ -2127,13 +2122,7 @@ mod flash_loan_integration_tests {
 
         // Execute flash loan
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.flash_loan(
-                &user,
-                &receiver_id,
-                &asset,
-                &100_000,
-                &Vec::new(&env),
-            );
+            client.flash_loan(&user, &receiver_id, &asset, &100_000, &Vec::new(&env));
         }));
 
         // In integration tests, this may fail due to missing token balance simulation

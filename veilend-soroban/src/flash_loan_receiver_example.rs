@@ -5,11 +5,7 @@
 //! 2. Performs arbitrage, collateral swap, or liquidation
 //! 3. Repays the principal + premium
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol, Vec,
-};
-
-use crate::flash_loan::FlashLoanReceiverClient;
+use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec};
 
 /// Example flash loan receiver that demonstrates the interface.
 #[contract]
@@ -66,19 +62,15 @@ impl ExampleFlashLoanReceiver {
     fn perform_operation(env: &Env, asset: &Address, amount: &i128, operation: &Symbol) {
         // Mock implementation: just log the operation
         // In production, this would execute actual trades or operations
-        match operation.to_string() {
-            "arbitrage" => {
-                // Execute arbitrage logic
-            }
-            "swap" => {
-                // Execute collateral swap logic
-            }
-            "liquidate" => {
-                // Execute liquidation logic
-            }
-            _ => {
-                // No operation (just repay)
-            }
+        let _ = (asset, amount);
+        if operation == &Symbol::new(env, "arbitrage") {
+            // Execute arbitrage logic
+        } else if operation == &Symbol::new(env, "swap") {
+            // Execute collateral swap logic
+        } else if operation == &Symbol::new(env, "liquidate") {
+            // Execute liquidation logic
+        } else {
+            // No operation (just repay)
         }
     }
 
@@ -90,24 +82,24 @@ impl ExampleFlashLoanReceiver {
     }
 }
 
-/// Example of how to use the flash loan receiver.
-///
-/// # Usage
-/// ```ignore
-/// let lending_contract = VeilLendContractClient::new(&env, &lending_contract_id);
-///
-/// // Prepare parameters for the flash loan
-/// let params = Vec::from_array(&env, [
-///     Symbol::new(&env, "arbitrage"),
-///     Symbol::new(&env, "some_param"),
-/// ]);
-///
-/// // Execute flash loan
-/// lending_contract.flash_loan(
-///     &initiator,
-///     &receiver_contract_id,
-///     &asset,
-///     &100_000,
-///     &params,
-/// );
-/// ```
+// Example of how to use the flash loan receiver.
+//
+// # Usage
+// ```ignore
+// let lending_contract = VeilLendContractClient::new(&env, &lending_contract_id);
+//
+// // Prepare parameters for the flash loan
+// let params = Vec::from_array(&env, [
+//     Symbol::new(&env, "arbitrage"),
+//     Symbol::new(&env, "some_param"),
+// ]);
+//
+// // Execute flash loan
+// lending_contract.flash_loan(
+//     &initiator,
+//     &receiver_contract_id,
+//     &asset,
+//     &100_000,
+//     &params,
+// );
+// ```

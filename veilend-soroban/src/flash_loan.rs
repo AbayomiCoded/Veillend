@@ -1,7 +1,9 @@
-use crate::{DataKey, VeilLendError, VeilLendContract};
+use crate::{
+    DataKey, VeilLendContract, VeilLendContractArgs, VeilLendContractClient, VeilLendError,
+};
 use soroban_sdk::{
-    contractclient, contracterror, contractevent, contractimpl, contracttype,
-    panic_with_error, Address, Env, Symbol, Vec,
+    contractclient, contractevent, contractimpl, contracttype, panic_with_error, Address, Env,
+    Symbol, Vec,
 };
 
 /// Flash loan premium basis points (default: 9 bps = 0.09%)
@@ -37,6 +39,10 @@ pub struct ReentrancyGuard {
 }
 
 /// Interface that any flash loan receiver contract must implement.
+///
+/// Only used as a schema for the generated `FlashLoanReceiverClient`; no
+/// local type implements it, hence `allow(dead_code)`.
+#[allow(dead_code)]
 #[contractclient(name = "FlashLoanReceiverClient")]
 pub trait FlashLoanReceiver {
     /// Called by the lending contract after the flash-loaned tokens are transferred.
@@ -76,18 +82,6 @@ pub struct FlashLoanEvent {
     pub amount: i128,
     pub premium: i128,
     pub total_repaid: i128,
-}
-
-/// Flash loan failure event emitted when a flash loan fails.
-#[contractevent(topics = ["veillend", "flash_loan_failed"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FlashLoanFailedEvent {
-    #[topic]
-    pub receiver: Address,
-    #[topic]
-    pub asset: Address,
-    pub amount: i128,
-    pub error_code: u32,
 }
 
 /// Flash loan config update event.
@@ -186,9 +180,20 @@ impl VeilLendContract {
     /// 2. Acquire reentrancy guard for the asset
     /// 3. Transfer asset to receiver (internal accounting)
     /// 4. Invoke receiver.flash_loan_receiver(initiator, asset, amount, premium, params)
-    /// 5. Verify the contract's balance increased by at least principal + premium
-    /// 6. Record the premium to asset reserves
-    /// 7. Release reentrancy guard
+    /// 5. Record the repayment (principal + premium) to asset reserves
+    /// 6. Release reentrancy guard
+    ///
+    /// # Repayment model
+    /// Unlike a real token-backed pool, this contract has no external token
+    /// balance to check the receiver against: `deposit`/`borrow`/`repay`/
+    /// `withdraw` are all internal accounting, and Soroban's host itself
+    /// forbids a receiver from calling back into this contract while it is
+    /// still on the call stack ("contract re-entry is not allowed"), so no
+    /// receiver could ever satisfy a before/after balance check here. The
+    /// repayment guarantee instead comes from transaction atomicity: if the
+    /// receiver's callback panics for any reason, the whole flash loan
+    /// (including the earlier debit) reverts. If it returns successfully,
+    /// the loan is considered repaid and the reserve is credited.
     ///
     /// # Panics
     /// * If asset is not supported
@@ -198,7 +203,6 @@ impl VeilLendContract {
     /// * If reentrancy guard is already held for this asset
     /// * If receiver does not implement the callback
     /// * If receiver callback fails
-    /// * If balance verification fails (under-repayment)
     /// * If contract is paused
     pub fn flash_loan(
         env: Env,
@@ -239,7 +243,7 @@ impl VeilLendContract {
         Self::acquire_reentrancy_guard(&env, &asset, &receiver);
 
         // Calculate premium (round up)
-        let premium = Self::calculate_premium_rounded_up(amount, state.premium_bps);
+        let premium = calculate_premium_rounded_up(&env, amount, state.premium_bps);
         let total_repayment = amount + premium;
 
         // Transfer asset to receiver (internal accounting)
@@ -253,46 +257,23 @@ impl VeilLendContract {
             .persistent()
             .set(&DataKey::TotalDeposited(asset.clone()), &total_deposited);
 
-        // Store the expected balance before callback
-        let balance_before = Self::get_asset_balance(&env, &asset);
-
-        // Invoke the receiver callback
+        // Invoke the receiver callback. If it panics, the entire flash loan
+        // (including the debit above) reverts atomically.
         let receiver_client = FlashLoanReceiverClient::new(&env, &receiver);
-        receiver_client.flash_loan_receiver(
-            &initiator,
-            &asset,
-            &amount,
-            &premium,
-            &params,
-        );
+        receiver_client.flash_loan_receiver(&initiator, &asset, &amount, &premium, &params);
 
-        // Verify the contract received at least principal + premium
-        let balance_after = Self::get_asset_balance(&env, &asset);
-        let balance_increase = balance_after - balance_before;
-
-        if balance_increase < total_repayment {
-            // Emit failure event and revert
-            FlashLoanFailedEvent {
-                receiver: receiver.clone(),
-                asset: asset.clone(),
-                amount,
-                error_code: VeilLendError::FlashLoanUnderRepayment as u32,
-            }
-            .publish(&env);
-            panic_with_error!(&env, VeilLendError::FlashLoanUnderRepayment);
-        }
-
-        // Record the premium to reserves
+        // The callback returned without panicking: record the repayment.
         let mut final_reserve = Self::read_asset_reserve(&env, &asset);
         final_reserve.total_balance += total_repayment;
         final_reserve.protocol_fees += premium;
         Self::write_asset_reserve(&env, &asset, &final_reserve);
 
-        // Update total deposits (restored with premium)
-        let final_total_deposited = Self::get_total_deposited(env.clone(), asset.clone()) + total_repayment;
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalDeposited(asset.clone()), &final_total_deposited);
+        let final_total_deposited =
+            Self::get_total_deposited(env.clone(), asset.clone()) + total_repayment;
+        env.storage().persistent().set(
+            &DataKey::TotalDeposited(asset.clone()),
+            &final_total_deposited,
+        );
 
         // Release reentrancy guard
         Self::release_reentrancy_guard(&env, &asset);
@@ -315,30 +296,6 @@ impl VeilLendContract {
         );
     }
 
-    /// Calculates premium with ceiling rounding.
-    ///
-    /// # Arguments
-    /// * `amount` - The principal amount
-    /// * `premium_bps` - Premium in basis points
-    ///
-    /// # Returns
-    /// * `i128` - Premium amount (rounded up)
-    ///
-    /// # Formula
-    /// premium = ceil(amount * premium_bps / 10_000)
-    ///
-    /// # Panics
-    /// * On arithmetic overflow
-    fn calculate_premium_rounded_up(amount: i128, premium_bps: u32) -> i128 {
-        let numerator = amount
-            .checked_mul(premium_bps as i128)
-            .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::ArithmeticOverflow));
-        let denominator = 10_000_i128;
-
-        // Ceiling division: (numerator + denominator - 1) / denominator
-        (numerator + denominator - 1) / denominator
-    }
-
     /// Acquires the reentrancy guard for an asset.
     ///
     /// # Arguments
@@ -350,11 +307,7 @@ impl VeilLendContract {
     fn acquire_reentrancy_guard(env: &Env, asset: &Address, receiver: &Address) {
         let guard_key = DataKey::ReentrancyGuard;
         if env.storage().instance().has(&guard_key) {
-            let existing: ReentrancyGuard = env
-                .storage()
-                .instance()
-                .get(&guard_key)
-                .unwrap();
+            let existing: ReentrancyGuard = env.storage().instance().get(&guard_key).unwrap();
             if &existing.locked_asset == asset {
                 panic_with_error!(env, VeilLendError::FlashLoanReentrancy);
             }
@@ -381,35 +334,12 @@ impl VeilLendContract {
             panic_with_error!(env, VeilLendError::FlashLoanReentrancy);
         }
 
-        let existing: ReentrancyGuard = env
-            .storage()
-            .instance()
-            .get(&guard_key)
-            .unwrap();
+        let existing: ReentrancyGuard = env.storage().instance().get(&guard_key).unwrap();
         if &existing.locked_asset != asset {
             panic_with_error!(env, VeilLendError::FlashLoanReentrancy);
         }
 
         env.storage().instance().remove(&guard_key);
-    }
-
-    /// Gets the balance of an asset held by the contract.
-    ///
-    /// # Note
-    /// This is a placeholder for the actual token balance retrieval.
-    /// In a real implementation, this would call the token contract's
-    /// `balance_of` function.
-    ///
-    /// # Returns
-    /// * `i128` - The current balance of the asset
-    fn get_asset_balance(env: &Env, asset: &Address) -> i128 {
-        // In production, this would be:
-        // let token_client = TokenClient::new(env, asset);
-        // token_client.balance(&env.current_contract_address())
-        //
-        // For this implementation, we use the reserve total_balance as a proxy.
-        // The actual token balance would be checked via the token interface.
-        Self::read_asset_reserve(env, asset).total_balance
     }
 }
 
@@ -421,10 +351,10 @@ impl VeilLendContract {
 ///
 /// # Returns
 /// * `i128` - The premium amount (rounded up)
-pub fn calculate_premium_rounded_up(amount: i128, premium_bps: u32) -> i128 {
+pub fn calculate_premium_rounded_up(env: &Env, amount: i128, premium_bps: u32) -> i128 {
     let numerator = amount
         .checked_mul(premium_bps as i128)
-        .unwrap_or_else(|| panic_with_error!(&env, VeilLendError::ArithmeticOverflow));
+        .unwrap_or_else(|| panic_with_error!(env, VeilLendError::ArithmeticOverflow));
     let denominator = 10_000_i128;
     (numerator + denominator - 1) / denominator
 }
@@ -432,27 +362,28 @@ pub fn calculate_premium_rounded_up(amount: i128, premium_bps: u32) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
 
     #[test]
     fn test_calculate_premium_rounded_up() {
+        let env = Env::default();
+
         // 100 * 9 / 10000 = 0.09 -> rounded up to 1
-        assert_eq!(calculate_premium_rounded_up(100, 9), 1);
+        assert_eq!(calculate_premium_rounded_up(&env, 100, 9), 1);
 
         // 1000 * 9 / 10000 = 0.9 -> rounded up to 1
-        assert_eq!(calculate_premium_rounded_up(1000, 9), 1);
+        assert_eq!(calculate_premium_rounded_up(&env, 1000, 9), 1);
 
         // 10000 * 9 / 10000 = 9 -> exactly 9
-        assert_eq!(calculate_premium_rounded_up(10000, 9), 9);
+        assert_eq!(calculate_premium_rounded_up(&env, 10000, 9), 9);
 
         // 100000 * 9 / 10000 = 90 -> exactly 90
-        assert_eq!(calculate_premium_rounded_up(100000, 9), 90);
+        assert_eq!(calculate_premium_rounded_up(&env, 100000, 9), 90);
 
         // 1 * 1 / 10000 = 0.0001 -> rounded up to 1
-        assert_eq!(calculate_premium_rounded_up(1, 1), 1);
+        assert_eq!(calculate_premium_rounded_up(&env, 1, 1), 1);
 
         // 10000 * 1000 / 10000 = 1000 -> exactly 1000 (10%)
-        assert_eq!(calculate_premium_rounded_up(10000, 1000), 1000);
+        assert_eq!(calculate_premium_rounded_up(&env, 10000, 1000), 1000);
     }
 
     #[test]
@@ -464,9 +395,11 @@ mod tests {
 
     #[test]
     fn test_premium_rounding_never_zero() {
+        let env = Env::default();
+
         // Even for very small amounts, premium should round up to at least 1
-        assert_eq!(calculate_premium_rounded_up(1, 9), 1);
-        assert_eq!(calculate_premium_rounded_up(1, 1), 1);
-        assert_eq!(calculate_premium_rounded_up(0, 9), 0);
+        assert_eq!(calculate_premium_rounded_up(&env, 1, 9), 1);
+        assert_eq!(calculate_premium_rounded_up(&env, 1, 1), 1);
+        assert_eq!(calculate_premium_rounded_up(&env, 0, 9), 0);
     }
 }
