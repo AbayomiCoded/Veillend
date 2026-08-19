@@ -2,6 +2,10 @@
 
 mod interest;
 
+// Re-export accrual constants so integration tests and external callers can
+// use them without reaching into the private `interest` module.
+pub use interest::{DEFAULT_PARAMS as INTEREST_DEFAULT_PARAMS, SECONDS_PER_YEAR, RATE_SCALE};
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
     symbol_short, Address, Env, Symbol, Vec,
@@ -118,6 +122,10 @@ pub enum DataKey {
     ReentrancyGuard,
     /// Flash loan configuration for an asset (stored in persistent storage)
     FlashLoanState(Address),
+
+    /// Per-asset interest-rate model parameters (kink/slope curve).
+    /// Falls back to `interest::DEFAULT_PARAMS` when not set.
+    InterestParams(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +148,31 @@ pub struct InterestState {
     pub supply_index: i128,
     pub borrow_index: i128,
     pub last_accrual_timestamp: u64,
+}
+
+/// Per-asset interest-rate model parameters (two-slope / kink model).
+///
+/// All rate fields are expressed as **annual basis points** (bps).
+/// 1 bps = 0.01 % per year.  The contract converts them to per-second rates
+/// internally.
+///
+/// Storage: persistent, keyed by `DataKey::InterestParams(asset)`.
+/// Missing entries fall back to `interest::DEFAULT_PARAMS`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct InterestParams {
+    /// Minimum borrow APR when utilization is zero, in annual bps.
+    pub base_rate_bps: u32,
+    /// Utilization at which the slope transitions from slope1 to slope2,
+    /// in bps (e.g. 8_000 = 80 %).
+    pub kink_util_bps: u32,
+    /// APR slope below the kink, in annual bps per 100 % utilization.
+    pub slope1_bps: u32,
+    /// APR slope above the kink, in annual bps per 100 % utilization.
+    pub slope2_bps: u32,
+    /// Fraction of borrow interest redirected to protocol reserves, in bps
+    /// (e.g. 1_000 = 10 %).
+    pub reserve_factor_bps: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,6 +326,9 @@ pub enum VeilLendError {
     InvalidFlashLoanPremium = 38,
     /// Invalid flash loan max bps (outside allowed range)
     InvalidFlashLoanMaxBps = 39,
+    /// Interest-rate model parameters are out of the allowed bounds.
+    /// See `set_interest_params` for the exact validation rules.
+    InvalidInterestParams = 40,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -429,6 +465,20 @@ pub struct InterestAccrued {
     pub supply_index_after: i128,
     pub borrow_index_after: i128,
     pub timestamp: u64,
+}
+
+#[contractevent(topics = ["veillend", "interest_params_updated"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterestParamsUpdated {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub asset: Address,
+    pub base_rate_bps: u32,
+    pub kink_util_bps: u32,
+    pub slope1_bps: u32,
+    pub slope2_bps: u32,
+    pub reserve_factor_bps: u32,
 }
 
 #[contractevent(topics = ["veillend", "admin_added"])]
@@ -1505,6 +1555,69 @@ impl VeilLendContract {
             ReserveUpdateKind::Withdraw,
         );
     }
+
+    /// Sets the interest-rate model parameters for an asset (admin-only).
+    ///
+    /// Validation bounds (panic with `InvalidInterestParams` on violation):
+    /// - `kink_util_bps` ∈ [1_000, 9_500]
+    /// - `base_rate_bps + slope1_bps + slope2_bps` ≤ 100_000  (hard yearly ceiling ≤ 1000 % APY)
+    /// - `reserve_factor_bps` ∈ [0, 5_000]  (at most 50 % of borrow interest to reserves)
+    ///
+    /// Accrues interest for the asset first so the rate change takes effect
+    /// from the current timestamp, not retroactively.
+    pub fn set_interest_params(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        params: InterestParams,
+    ) {
+        Self::require_admin(&env, &admin);
+        Self::require_supported_asset(&env, &asset);
+        admin.require_auth();
+
+        // Validate kink utilization bound.
+        if params.kink_util_bps < 1_000 || params.kink_util_bps > 9_500 {
+            panic_with_error!(&env, VeilLendError::InvalidInterestParams);
+        }
+        // Hard APY ceiling: sum of all rate components ≤ 100_000 bps (1_000 % / year).
+        let rate_sum = (params.base_rate_bps as u64)
+            .saturating_add(params.slope1_bps as u64)
+            .saturating_add(params.slope2_bps as u64);
+        if rate_sum > 100_000 {
+            panic_with_error!(&env, VeilLendError::InvalidInterestParams);
+        }
+        // Reserve factor: at most 50 %.
+        if params.reserve_factor_bps > 5_000 {
+            panic_with_error!(&env, VeilLendError::InvalidInterestParams);
+        }
+
+        // Accrue with the old params first so interest up to now is settled.
+        Self::accrue_and_persist_interest(&env, &asset);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InterestParams(asset.clone()), &params);
+
+        InterestParamsUpdated {
+            admin,
+            asset,
+            base_rate_bps: params.base_rate_bps,
+            kink_util_bps: params.kink_util_bps,
+            slope1_bps: params.slope1_bps,
+            slope2_bps: params.slope2_bps,
+            reserve_factor_bps: params.reserve_factor_bps,
+        }
+        .publish(&env);
+    }
+
+    /// Returns the current interest-rate model parameters for an asset.
+    /// Returns `DEFAULT_PARAMS` if none have been set.
+    pub fn get_interest_params(env: Env, asset: Address) -> InterestParams {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InterestParams(asset))
+            .unwrap_or(interest::DEFAULT_PARAMS)
+    }
 }
 
 /// Describes the pending mutation being validated against the cross-asset
@@ -2052,7 +2165,16 @@ impl VeilLendContract {
         let total_supplied = Self::get_total_deposited(env.clone(), asset.clone());
         let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
 
-        let result = interest::compute_accrual(env, &state, total_supplied, total_borrowed, now);
+        // Load per-asset interest params; fall back to safe zero-rate defaults
+        // so assets without configured params accrue no interest (backward-compat).
+        let params: InterestParams = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestParams(asset.clone()))
+            .unwrap_or(interest::DEFAULT_PARAMS);
+
+        let result =
+            interest::compute_accrual(env, &state, &params, total_supplied, total_borrowed, now);
 
         Self::write_interest_state(env, asset, &result.state);
         if result.interest_to_suppliers != 0 {
@@ -2115,7 +2237,13 @@ impl VeilLendContract {
         let total_borrowed = Self::get_total_borrowed(env.clone(), asset.clone());
         let now = env.ledger().timestamp();
 
-        interest::compute_accrual(env, &state, total_supplied, total_borrowed, now).state
+        let params: InterestParams = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InterestParams(asset.clone()))
+            .unwrap_or(interest::DEFAULT_PARAMS);
+
+        interest::compute_accrual(env, &state, &params, total_supplied, total_borrowed, now).state
     }
 
     fn write_position(env: &Env, user: &Address, asset: &Address, position: &Position) {
