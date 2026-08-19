@@ -7,6 +7,17 @@ use soroban_sdk::{
     symbol_short, Address, Env, Symbol, Vec,
 };
 
+mod flash_loan;
+mod flash_loan_receiver_example;
+
+#[cfg(test)]
+mod test_flash_loan;
+
+pub use flash_loan::{
+    calculate_premium_rounded_up, FlashLoanReceiverClient, FlashLoanState,
+    DEFAULT_FLASH_LOAN_PREMIUM_BPS, MAX_FLASH_LOAN_PREMIUM_BPS, MIN_FLASH_LOAN_PREMIUM_BPS,
+};
+
 /// Increment this only when a contract interface change requires consumers to adapt.
 pub const CONTRACT_VERSION: u32 = 5;
 
@@ -102,6 +113,11 @@ pub enum DataKey {
     /// Max fraction (bps) of a position's outstanding debt that may be
     /// seized in a single `liquidate` call. Default 5_000 (50%).
     GlobalCloseFactorBps,
+
+    /// Flash loan reentrancy guard (stored in instance storage)
+    ReentrancyGuard,
+    /// Flash loan configuration for an asset (stored in persistent storage)
+    FlashLoanState(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -263,6 +279,20 @@ pub enum VeilLendError {
     SupplyCapExceeded = 31,
     /// Position's health factor is at or above 1.0; nothing to liquidate.
     PositionNotLiquidatable = 32,
+    /// Flash loan is not configured for this asset
+    FlashLoanNotConfigured = 33,
+    /// Flash loans are disabled for this asset
+    FlashLoanDisabled = 34,
+    /// Flash loan amount exceeds configured max bps of reserve
+    FlashLoanExceedsMaxBps = 35,
+    /// Flash loan receiver did not repay the required amount (principal + premium)
+    FlashLoanUnderRepayment = 36,
+    /// Flash loan reentrancy detected (nested flash loan on same asset)
+    FlashLoanReentrancy = 37,
+    /// Invalid flash loan premium (outside allowed range)
+    InvalidFlashLoanPremium = 38,
+    /// Invalid flash loan max bps (outside allowed range)
+    InvalidFlashLoanMaxBps = 39,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
