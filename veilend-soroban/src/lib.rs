@@ -1425,8 +1425,8 @@ impl VeilLendContract {
             panic_with_error!(&env, VeilLendError::ZeroAmount);
         }
 
-        let seize_amount = ((actual_repay * debt_price) / collateral_price)
-            .min(collateral_position.deposited);
+        let seize_amount =
+            ((actual_repay * debt_price) / collateral_price).min(collateral_position.deposited);
 
         let mut new_debt_position = debt_position;
         new_debt_position.borrowed -= actual_repay;
@@ -1462,7 +1462,12 @@ impl VeilLendContract {
             seized: seize_amount,
         }
         .publish(&env);
-        Self::publish_asset_reserve_updated(&env, &debt_asset, &debt_reserve, ReserveUpdateKind::Repay);
+        Self::publish_asset_reserve_updated(
+            &env,
+            &debt_asset,
+            &debt_reserve,
+            ReserveUpdateKind::Repay,
+        );
         Self::publish_asset_reserve_updated(
             &env,
             &collateral_asset,
