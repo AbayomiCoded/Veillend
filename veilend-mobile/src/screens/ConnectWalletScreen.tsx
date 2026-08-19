@@ -160,6 +160,14 @@ export default function ConnectWalletScreen() {
 
             {mode === 'choose' && (
               <>
+                {/* Inline error banner for auth failures (e.g. 401/403 from verify) */}
+                {error ? (
+                  <View style={styles.errorBanner}>
+                    <Ionicons name="warning-outline" size={16} color="#ff6b6b" style={styles.errorBannerIcon} />
+                    <Text style={styles.errorBannerText}>{error}</Text>
+                  </View>
+                ) : null}
+
                 <Animated.View style={[styles.connectButtonContainer, animatedButtonStyle]}>
                   <TouchableOpacity
                     activeOpacity={0.8}
@@ -244,7 +252,10 @@ export default function ConnectWalletScreen() {
                 )}
 
                 {error ? (
-                  <Text style={styles.errorText}>{error}</Text>
+                  <View style={styles.errorBanner}>
+                    <Ionicons name="warning-outline" size={16} color="#ff6b6b" style={styles.errorBannerIcon} />
+                    <Text style={styles.errorBannerText}>{error}</Text>
+                  </View>
                 ) : null}
 
                 <TouchableOpacity
@@ -508,5 +519,26 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 12,
     textAlign: 'center',
+  },
+  errorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 107, 107, 0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 107, 107, 0.4)',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginBottom: 16,
+    gap: 8,
+  },
+  errorBannerIcon: {
+    flexShrink: 0,
+  },
+  errorBannerText: {
+    color: '#ff6b6b',
+    fontSize: 14,
+    flex: 1,
+    lineHeight: 20,
   },
 });

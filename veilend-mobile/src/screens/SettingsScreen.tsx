@@ -88,7 +88,10 @@ export default function SettingsScreen({ navigation }: any) {
             try {
               await wipeClipboardNow();
             } catch (e) {}
-            logout();
+            // logout() is async: calls POST /auth/logout to revoke the
+            // server-side session then clears all local state. Fire-and-forget
+            // so navigation resets immediately.
+            logout().catch(() => {});
             navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
           },
         },

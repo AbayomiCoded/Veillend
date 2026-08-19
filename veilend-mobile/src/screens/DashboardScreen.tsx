@@ -71,8 +71,9 @@ export default function DashboardScreen({ navigation }: any) {
   const handleLogout = () => {
     setProfileVisible(false);
     // logout() already clears profileName/profileImage (state + persisted
-    // SecureStore keys) — see store.ts.
-    logout();
+    // SecureStore keys) — see store.ts. Fire-and-forget: navigation resets
+    // immediately so the user is never stuck waiting for the network call.
+    logout().catch(() => {});
     // Fully reset the navigation stack to avoid navigator-scope issues
     // (ConnectWallet lives on the root stack, not inside the tab navigator).
     navigationRef.reset({ index: 0, routes: [{ name: 'ConnectWallet' }] });
