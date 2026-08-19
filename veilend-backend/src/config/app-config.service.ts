@@ -69,9 +69,14 @@ export class AppConfigService {
 
   get auth(): {
     jwtSecret: string;
+    legacyAuthAllow: boolean;
   } {
     return {
       jwtSecret: this.configService.get<string>('JWT_SECRET', 'dev_secret'),
+      legacyAuthAllow: this.configService.get<boolean>(
+        'LEGACY_AUTH_ALLOW',
+        true,
+      ),
     };
   }
 

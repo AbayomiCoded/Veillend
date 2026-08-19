@@ -1,5 +1,6 @@
 import {
   Controller,
+  Delete,
   Get,
   Logger,
   Post,
@@ -8,6 +9,7 @@ import {
   Ip,
   Headers,
   Param,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { Body } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
@@ -17,6 +19,8 @@ import { AuthService } from './auth.service';
 import { VerifyWalletDto } from './dto/verify-wallet.dto';
 
 import { NonceDto } from './dto/nonce.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { RevokeSessionsDto } from './dto/revoke-sessions.dto';
 import { SessionResponseDto } from './dto/session-response.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { RequireJsonGuard } from './require-json.guard';
@@ -68,6 +72,22 @@ export class AuthController {
     );
   }
 
+  @UseGuards(RequireJsonGuard)
+  @Post('refresh')
+  async refresh(
+    @Body() dto: RefreshTokenDto,
+    @Ip() ip: string,
+    @Headers('user-agent') userAgent: string,
+    @Headers('x-correlation-id') correlationId: string,
+  ) {
+    return this.authService.refreshTokens(
+      dto.refreshToken,
+      ip,
+      userAgent,
+      correlationId,
+    );
+  }
+
   @UseGuards(JwtAuthGuard)
   @Get('session')
   getSession(@Req() req: AuthenticatedRequest): SessionResponseDto {
@@ -76,6 +96,63 @@ export class AuthController {
       sessionId: req.user.sessionId,
       expiresAt: req.user.expiresAt.toISOString(),
     };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('sessions')
+  async listSessions(@Req() req: AuthenticatedRequest) {
+    const userId = this.requireUserId(req);
+    const sessions = await this.authService.listSessions(
+      userId,
+      req.user.sessionId,
+    );
+    return { sessions };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Delete('sessions/:id')
+  async revokeOneSession(
+    @Param('id') sessionId: string,
+    @Req() req: AuthenticatedRequest,
+    @Ip() ip: string,
+    @Headers('user-agent') userAgent: string,
+    @Headers('x-correlation-id') correlationId: string,
+  ): Promise<{ revoked: boolean }> {
+    const userId = this.requireUserId(req);
+    await this.authService.revokeSessionById(
+      sessionId,
+      userId,
+      req.user.walletAddress,
+      ip,
+      userAgent,
+      correlationId,
+    );
+    return { revoked: true };
+  }
+
+  // "Logout everywhere". Defaults to keeping the caller's own session alive
+  // (`keepCurrent: true`) so this can't accidentally revoke the session the
+  // request is being made from; pass `{ keepCurrent: false }` to revoke it too.
+  @UseGuards(JwtAuthGuard)
+  @Delete('sessions')
+  async revokeAllSessions(
+    @Body() dto: RevokeSessionsDto,
+    @Req() req: AuthenticatedRequest,
+    @Ip() ip: string,
+    @Headers('user-agent') userAgent: string,
+    @Headers('x-correlation-id') correlationId: string,
+  ): Promise<{ revokedCount: number }> {
+    const userId = this.requireUserId(req);
+    const keepCurrent = dto.keepCurrent ?? true;
+
+    return this.authService.revokeAllSessions(
+      userId,
+      req.user.walletAddress,
+      keepCurrent ? req.user.sessionId : undefined,
+      ip,
+      userAgent,
+      correlationId,
+    );
   }
 
   @UseGuards(JwtAuthGuard)
@@ -102,5 +179,12 @@ export class AuthController {
   @Get('audit/:walletAddress')
   async getAuditLogs(@Param('walletAddress') walletAddress: string) {
     return this.authService.getAuditLogs(walletAddress);
+  }
+
+  private requireUserId(req: AuthenticatedRequest): string {
+    if (!req.user.userId) {
+      throw new UnauthorizedException('No user authenticated');
+    }
+    return req.user.userId;
   }
 }
