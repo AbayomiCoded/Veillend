@@ -2,6 +2,11 @@ import { create } from 'zustand';
 import { Clipboard } from 'react-native';
 import api, { fetchWithRetry } from '../utils/api';
 import { getSecureItem, setSecureItem, deleteSecureItem } from '../utils/secureStorage';
+import { TX_BUILDERS } from '../lib/soroban/transactions';
+import { signTransaction, UserRejectedError } from '../lib/soroban/signer';
+import { sendTransaction, pollTransaction } from '../lib/soroban/rpc';
+import { parseContractErrorCode, getContractErrorMessage } from '../lib/soroban/contractErrors';
+import { reportError } from '../utils/errorReporting';
 
 type Nullable<T> = T | null;
 
@@ -164,16 +169,14 @@ export const useStore = create<StoreState>(
      * Shared optimistic lending runner used by deposit/withdraw/borrow/repay.
      *
      * Flow:
-     *  1. Push a PENDING transaction + apply the optimistic balance delta.
-     *  2. Await confirmation. Today this is a short simulated confirmation
-     *     step (M9 step 2e is not implemented yet); the real Soroban
-     *     submission / broadcast will replace `simulateConfirmation()`.
-     *  3. On confirmation the PENDING row becomes CONFIRMED and the
-     *     optimistic balance is upgraded to the authoritative indexer value
-     *     via a portfolio + positions refresh (best-effort).
-     *  4. On failure the optimistic delta is rolled back atomically, the
-     *     PENDING row becomes FAILED with a reason, and the error is rethrown
-     *     so the caller can surface a toast.
+     *  1. Validate inputs and resolve asset metadata from the supported-assets list.
+     *  2. Push a PENDING transaction + apply the optimistic balance delta.
+     *  3. Build unsigned XDR via the soroban/transactions module.
+     *  4. Sign the XDR with the in-app keypair (or Freighter when bridge is added).
+     *  5. Broadcast via Soroban RPC sendTransaction.
+     *  6. Poll getTransaction every 2 s up to 60 s.
+     *  7. On confirmation: mark CONFIRMED, refresh portfolio/positions/transactions.
+     *  8. On any failure: roll back the optimistic delta atomically, mark FAILED.
      */
     const runLending = async (
       kind: LendingKind,
@@ -186,6 +189,31 @@ export const useStore = create<StoreState>(
       const addr = get().address;
       if (!addr || !get().authToken) {
         throw new Error('Connect your wallet before submitting transactions');
+      }
+
+      // ── (a) Resolve asset metadata from the already-loaded supported assets ──
+      const supportedAssets = get().supportedAssets;
+      const assetMeta = supportedAssets.find(
+        (a) => a.symbol.toUpperCase() === asset.toUpperCase(),
+      );
+      if (!assetMeta) {
+        throw new Error(`Asset "${asset}" is not supported by the protocol.`);
+      }
+      if (!assetMeta.contractId && !assetMeta.isNative) {
+        throw new Error(`Asset "${asset}" has no contract ID configured.`);
+      }
+
+      // VeilLend contract ID is injected from env; fall back to a sentinel so
+      // the build/test path doesn't hard-crash.
+      const veilLendContractId =
+        (process.env.VEIL_LEND_CONTRACT_ID as string | undefined) ?? '';
+      if (!veilLendContractId) {
+        throw new Error('VeilLend contract ID is not configured (VEIL_LEND_CONTRACT_ID).');
+      }
+
+      // Double-tap guard: reject if a lending action is already in flight.
+      if (get().lendingLoading) {
+        throw new Error('A transaction is already in progress. Please wait.');
       }
 
       const pendingTx: TransactionRecord = {
@@ -206,15 +234,53 @@ export const useStore = create<StoreState>(
       }));
 
       try {
-        // ── M9 step 2e seam ─────────────────────────────────────────────
-        // Replace with the real signed transaction submission + on-chain
-        // confirmation once the lending endpoint / Soroban broadcast lands.
-        await simulateConfirmation();
+        // ── (b) Build unsigned XDR ───────────────────────────────────────────
+        const networkPassphrase =
+          (process.env.STELLAR_NETWORK_PASSPHRASE as string | undefined) ??
+          'Test SDF Network ; September 2015';
+
+        const unsignedXdr = await TX_BUILDERS[kind]({
+          amount,
+          decimals: assetMeta.decimals,
+          fromAddress: addr,
+          contractId: veilLendContractId,
+          assetContractId: assetMeta.contractId,
+        });
+
+        // ── (c) Sign with in-app keypair (or Freighter when bridge is added) ─
+        const signedXdr = await signTransaction(unsignedXdr, networkPassphrase);
+
+        // ── (d) Broadcast to Soroban RPC ─────────────────────────────────────
+        const sendResult = await sendTransaction(signedXdr);
+        if (sendResult.status === 'ERROR') {
+          throw new Error(sendResult.error ?? 'Transaction rejected by node');
+        }
+        const txHash = sendResult.hash;
+
+        // Update the pending row with the real hash.
+        set((s) => ({
+          pendingTransactions: s.pendingTransactions.map((t) =>
+            t.id === pendingTx.id ? { ...t, txHash } : t,
+          ),
+        }));
+
+        // ── (e) Poll for confirmation (every 2 s, up to 60 s) ────────────────
+        const pollResult = await pollTransaction(txHash);
+
+        if (pollResult.status === 'FAILED') {
+          // Try to extract a human-readable contract error.
+          const xdrToCheck = pollResult.resultXdr ?? pollResult.errorResultXdr ?? '';
+          const errorCode = xdrToCheck ? parseContractErrorCode(xdrToCheck) : null;
+          const errorMsg = errorCode !== null
+            ? getContractErrorMessage(errorCode)
+            : 'Transaction failed on-chain.';
+          throw new Error(errorMsg);
+        }
 
         const confirmedTx: TransactionRecord = {
           ...pendingTx,
           status: 'CONFIRMED',
-          txHash: `sim-${Date.now().toString(16)}`,
+          txHash,
         };
 
         set((s) => ({
@@ -230,23 +296,50 @@ export const useStore = create<StoreState>(
         try {
           await get().fetchPortfolio();
           await get().fetchPositions();
-        } catch (e) {
+          await get().fetchTransactions();
+          await get().refreshProtocolStatus();
+        } catch (_e) {
           // authoritative refresh is best-effort
         }
 
         return confirmedTx;
       } catch (err: any) {
+        // Classify the error for appropriate severity + toast messaging.
+        const isUserRejection = err instanceof UserRejectedError ||
+          err?.name === 'UserRejectedError';
+        const isNetworkError =
+          !isUserRejection &&
+          (err?.message?.toLowerCase().includes('timeout') ||
+           err?.message?.toLowerCase().includes('network error') ||
+           err?.message?.toLowerCase().includes('fetch'));
+
+        const errorMessage = isUserRejection
+          ? 'Transaction rejected'
+          : isNetworkError
+          ? 'Network error, please retry'
+          : (err?.message ?? 'Transaction failed');
+
+        // Report non-rejection errors (user rejections are low severity).
+        if (!isUserRejection) {
+          reportError(err, {
+            severity: isNetworkError ? 'high' : 'medium',
+            component: 'runLending',
+            metadata: { kind, asset, amount },
+          }).catch(() => {});
+        }
+
         // Atomic rollback of the optimistic mutation + FAILED row.
         set((s) => ({
           pendingTransactions: s.pendingTransactions.map((t) =>
             t.id === pendingTx.id
-              ? { ...t, status: 'FAILED', errorReason: err?.message ?? 'Transaction failed' }
+              ? { ...t, status: 'FAILED', errorReason: errorMessage }
               : t,
           ),
           balance: s.balance - optimisticDelta(kind, numericAmount),
+          lastLendingTx: { ...pendingTx, status: 'FAILED', errorReason: errorMessage },
           lendingLoading: false,
         }));
-        throw err;
+        throw Object.assign(err, { message: errorMessage });
       }
     };
 
@@ -617,15 +710,6 @@ export const useStore = create<StoreState>(
     },
   };
   });
-
-// ──────────────────────────────────────────────
-// Simulated confirmation for optimistic lending.
-// M9 step 2e (real Soroban submission) will replace this.
-// ──────────────────────────────────────────────
-const SIMULATED_CONFIRMATION_MS = 600;
-
-const simulateConfirmation = () =>
-  new Promise<void>((resolve) => setTimeout(resolve, SIMULATED_CONFIRMATION_MS));
 
 /** Optimistic balance delta per lending kind. */
 const optimisticDelta = (kind: LendingKind, amount: number): number => {

@@ -4,7 +4,9 @@ use soroban_env_common::Compare;
 use soroban_sdk::events::Event;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::{Address, Env, Val};
-use veillend_contract::{InterestAccrued, VeilLendContract, VeilLendContractClient};
+use veillend_contract::{
+    InterestAccrued, InterestParams, VeilLendContract, VeilLendContractClient,
+};
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
 const DEFAULT_TIMELOCK: u32 = 50;
@@ -360,6 +362,7 @@ fn test_deposit_then_borrow_then_time_advances_grows_debt_matching_formula() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
 
     // 50% utilization: borrow_rate = 200 + (5000 * 2000 / 10000) = 1200 bps (12% APR)
     // supply_rate = 1200 * 5000 / 10000 = 600 bps (6% APR)
@@ -388,6 +391,7 @@ fn test_accrue_interest_grows_indexes_with_no_position_touch() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
     client.deposit(&user, &asset, &1_000_000);
     client.borrow(&user, &asset, &asset, &500_000);
 
@@ -421,6 +425,7 @@ fn test_repay_and_withdraw_operate_on_accrued_amounts() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
     client.deposit(&user, &asset, &1_000_000);
     client.borrow(&user, &asset, &asset, &500_000);
 
@@ -463,6 +468,7 @@ fn test_conservation_of_value_between_suppliers_and_borrower() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
 
     // Pure supplier: deposits only, never borrows.
     client.deposit(&supplier, &asset, &500_000);
@@ -539,6 +545,7 @@ fn test_interest_accrued_event_emission_and_values() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
     client.deposit(&user, &asset, &1_000_000);
     client.borrow(&user, &asset, &asset, &500_000);
 
@@ -1002,6 +1009,7 @@ fn test_accrue_interest_syncs_reserve_total_balance() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
 
     // 50% utilization: borrow_rate = 12% APR, supply_rate = 6% APR.
     client.deposit(&user, &asset, &1_000_000);
@@ -1044,6 +1052,8 @@ fn test_withdraw_after_implicit_accrual_uses_synced_reserve() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
+    set_legacy_interest_params(&client, &admin, &asset);
 
     client.deposit(&user, &asset, &1_000_000);
     client.borrow(&user, &asset, &asset, &500_000);
@@ -1076,6 +1086,7 @@ fn test_repay_then_withdraw_full_claim_after_accrual() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
 
     client.deposit(&user, &asset, &1_000_000);
     client.borrow(&user, &asset, &asset, &500_000);
@@ -1770,6 +1781,7 @@ fn small_amounts_dust_accrual() {
 
     configure_asset(&env, &client, &admin, &asset);
     set_oracle_price(&env, &client, &admin, &asset, &1);
+    set_legacy_interest_params(&client, &admin, &asset);
 
     // Deposit creates the supplier side; borrow creates the borrower side.
     client.deposit(&user, &asset, &15_000);
@@ -2076,20 +2088,34 @@ fn liquidate_healthy_position_reverts() {
 // ---------------------------------------------------------------------------
 
 /// Deposits 1_000_000_000 and borrows 500_000_000 of the same
-/// self-collateralized asset (50% utilization → 12% borrow APR / 6% gross
-/// supply APR, matching the hand-computed values in interest.rs's unit
-/// tests). Does not advance time or touch the reserve factor — callers set
-/// `reserve_factor_bps` (if any) before advancing the clock, so the rate
-/// change isn't retroactively applied to interest already accrued.
-fn setup_50pct_utilization(
+/// self-collateralized asset (50% utilization). `reserve_factor_bps` is
+/// applied via `set_interest_params` using the same base/slope1 as the
+/// legacy hardcoded model (200 bps base + 2000 bps slope1, no kink) so the
+/// resulting rates match the hand-computed values used throughout this
+/// file: 12% borrow APR / 6% gross (pre-reserve-factor) supply APR. Applied
+/// before any time elapses so the rate isn't retroactively applied to
+/// interest already accrued.
+fn setup_50pct_utilization_with_reserve_factor(
     env: &Env,
     client: &VeilLendContractClient,
     admin: &Address,
     asset: &Address,
     user: &Address,
+    reserve_factor_bps: u32,
 ) {
     configure_asset(env, client, admin, asset);
     set_oracle_price(env, client, admin, asset, &1);
+    client.set_interest_params(
+        admin,
+        asset,
+        &InterestParams {
+            base_rate_bps: 200,
+            kink_util_bps: 9_500,
+            slope1_bps: 2_000,
+            slope2_bps: 0,
+            reserve_factor_bps,
+        },
+    );
 
     client.deposit(user, asset, &1_000_000_000);
     client.borrow(user, asset, asset, &500_000_000);
@@ -2103,8 +2129,8 @@ fn advance_one_year(env: &Env) {
 
 #[test]
 fn reserve_factor_zero_produces_no_reserve_state_changes() {
-    // Backward compat: reserve_factor defaults to 0 (unset), so accrual must
-    // be byte-for-byte identical to pre-#342 behavior — no reserves, no
+    // Backward compat: reserve_factor defaults to 0, so accrual must be
+    // byte-for-byte identical to pre-#342 behavior — no reserves, no
     // lifetime counter movement, full interest passed through to suppliers.
     let env = Env::default();
     env.mock_all_auths();
@@ -2114,8 +2140,8 @@ fn reserve_factor_zero_produces_no_reserve_state_changes() {
     let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
     let client = VeilLendContractClient::new(&env, &contract_id);
 
-    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
-    assert_eq!(client.reserve_factor_bps(&asset), 0);
+    setup_50pct_utilization_with_reserve_factor(&env, &client, &admin, &asset, &user, 0);
+    assert_eq!(client.get_interest_params(&asset).reserve_factor_bps, 0);
     advance_one_year(&env);
 
     let total_deposited_before = client.get_total_deposited(&asset);
@@ -2142,12 +2168,9 @@ fn reserves_accumulate_when_factor_set() {
     let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
     let client = VeilLendContractClient::new(&env, &contract_id);
 
-    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
-
-    // 10% reserve factor, set before any time elapses so it applies to the
-    // whole upcoming accrual window (not retroactively).
-    client.set_reserve_factor(&admin, &asset, &1_000);
-    assert_eq!(client.reserve_factor_bps(&asset), 1_000);
+    // 10% reserve factor.
+    setup_50pct_utilization_with_reserve_factor(&env, &client, &admin, &asset, &user, 1_000);
+    assert_eq!(client.get_interest_params(&asset).reserve_factor_bps, 1_000);
     advance_one_year(&env);
 
     let total_deposited_before = client.get_total_deposited(&asset);
@@ -2179,8 +2202,7 @@ fn withdraw_reserves_fails_without_timelock() {
     let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
     let client = VeilLendContractClient::new(&env, &contract_id);
 
-    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
-    client.set_reserve_factor(&admin, &asset, &1_000);
+    setup_50pct_utilization_with_reserve_factor(&env, &client, &admin, &asset, &user, 1_000);
     advance_one_year(&env);
     client.accrue_interest(&asset);
     assert_eq!(client.get_reserves(&asset), 6_000_000);
@@ -2211,8 +2233,7 @@ fn withdraw_reserves_succeeds_via_timelock() {
     let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
     let client = VeilLendContractClient::new(&env, &contract_id);
 
-    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
-    client.set_reserve_factor(&admin, &asset, &1_000);
+    setup_50pct_utilization_with_reserve_factor(&env, &client, &admin, &asset, &user, 1_000);
     advance_one_year(&env);
     client.accrue_interest(&asset);
     assert_eq!(client.get_reserves(&asset), 6_000_000);
@@ -2241,8 +2262,7 @@ fn withdraw_reserves_exceeding_balance_reverts() {
     let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
     let client = VeilLendContractClient::new(&env, &contract_id);
 
-    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
-    client.set_reserve_factor(&admin, &asset, &1_000);
+    setup_50pct_utilization_with_reserve_factor(&env, &client, &admin, &asset, &user, 1_000);
     advance_one_year(&env);
     client.accrue_interest(&asset);
     assert_eq!(client.get_reserves(&asset), 6_000_000);
@@ -2367,4 +2387,187 @@ mod flash_loan_integration_tests {
         let disabled_state = client.get_flash_loan_state(&asset).unwrap();
         assert!(!disabled_state.enabled);
     }
+}
+
+// ── Interest-rate model tests (issue #311) ────────────────────────────────────
+
+/// Helper: register a fresh contract, configure one asset, set its oracle price.
+/// Uses MCR=10_000 (100%) so tests can achieve high utilization ratios.
+fn setup_with_asset(env: &Env) -> (VeilLendContractClient, Address, Address) {
+    env.mock_all_auths();
+    let admin = Address::generate(env);
+    let asset = Address::generate(env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(env, &contract_id);
+    configure_asset(env, &client, &admin, &asset);
+    set_oracle_price(env, &client, &admin, &asset, &1_000_000i128);
+    (client, admin, asset)
+}
+
+/// Sets interest params equivalent to the pre-#311 hardcoded rate model
+/// (BASE_RATE_BPS=200, SLOPE_BPS=2000, no kink, no reserve factor).
+/// Use this in tests that were written against the old hardcoded rates.
+fn set_legacy_interest_params(client: &VeilLendContractClient, admin: &Address, asset: &Address) {
+    use veillend_contract::InterestParams;
+    client.set_interest_params(
+        admin,
+        asset,
+        &InterestParams {
+            base_rate_bps: 200,
+            kink_util_bps: 9_500, // effectively no kink — slope2 never applies
+            slope1_bps: 2_000,
+            slope2_bps: 0,
+            reserve_factor_bps: 0, // 100% pass-through matches original supply_rate formula
+        },
+    );
+}
+
+/// AC: default parameters → supply & borrow accrual == 0 per second.
+///
+/// Assets without configured InterestParams fall back to DEFAULT_PARAMS
+/// (all rates zero), so existing snapshot expectations are not broken.
+#[test]
+fn test_interest_params_default_zero_accrual() {
+    let env = Env::default();
+    let (client, _admin, asset) = setup_with_asset(&env);
+    // Use the same user for deposit and borrow so the collateral check passes.
+    let user = Address::generate(&env);
+    client.deposit(&user, &asset, &1_000_000_000i128);
+    client.borrow(&user, &asset, &asset, &500_000_000i128);
+
+    let state_before = client.get_interest_state(&asset);
+
+    // Advance ledger time by one year.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + veillend_contract::SECONDS_PER_YEAR as u64);
+
+    let state_after = client.get_interest_state(&asset);
+
+    // With all-zero rates the indexes must not move.
+    assert_eq!(
+        state_after.supply_index, state_before.supply_index,
+        "supply index must not change with zero rates"
+    );
+    assert_eq!(
+        state_after.borrow_index, state_before.borrow_index,
+        "borrow index must not change with zero rates"
+    );
+}
+
+/// AC: kink=8000, slope1=2000 bps/year, util=9000, slope2=4000 bps →
+/// rate after kink piece computed correctly.
+#[test]
+fn test_interest_params_kink_model_above_kink() {
+    use veillend_contract::InterestParams;
+
+    let env = Env::default();
+    let (client, admin, asset) = setup_with_asset(&env);
+
+    let params = InterestParams {
+        base_rate_bps: 0,
+        kink_util_bps: 8_000,
+        slope1_bps: 2_000,
+        slope2_bps: 4_000,
+        reserve_factor_bps: 0,
+    };
+    client.set_interest_params(&admin, &asset, &params);
+
+    // Verify getter round-trips the params.
+    let stored = client.get_interest_params(&asset);
+    assert_eq!(stored.base_rate_bps, 0);
+    assert_eq!(stored.kink_util_bps, 8_000);
+    assert_eq!(stored.slope1_bps, 2_000);
+    assert_eq!(stored.slope2_bps, 4_000);
+    assert_eq!(stored.reserve_factor_bps, 0);
+
+    // Deposit + borrow to get to 90 % utilization.
+    // Same user for both so the collateral check passes.
+    let user = Address::generate(&env);
+    let total_supply: i128 = 1_000_000_000;
+    let total_borrow: i128 = 900_000_000; // 90 % util → above kink
+    client.deposit(&user, &asset, &total_supply);
+    client.borrow(&user, &asset, &asset, &total_borrow);
+
+    // Advance by one year and force accrual.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + veillend_contract::SECONDS_PER_YEAR as u64);
+    client.accrue_interest(&asset);
+
+    // Expected: annual borrow rate = 2000*8000/10000 + 4000*(9000-8000)/10000
+    //         = 1600 + 400 = 2000 bps
+    // borrow_rate_per_sec = 2000 / SECONDS_PER_YEAR
+    // borrow_growth = borrow_rate_per_sec * SECONDS_PER_YEAR * RATE_SCALE / 10_000
+    //               = 2000 * RATE_SCALE / 10_000
+    let rate_scale = veillend_contract::RATE_SCALE;
+    let borrow_growth = 2_000i128 * rate_scale / 10_000;
+    let expected_borrow_index = rate_scale + rate_scale * borrow_growth / rate_scale;
+    let state = client.get_interest_state(&asset);
+    assert_eq!(
+        state.borrow_index, expected_borrow_index,
+        "borrow index after one year at 20% APR must match hand-computed value"
+    );
+
+    // Total borrowed must have grown.
+    assert!(
+        client.get_total_borrowed(&asset) > total_borrow,
+        "total borrowed must grow after accrual with non-zero rate"
+    );
+}
+
+/// AC: out-of-range params panic with `InvalidInterestParams`.
+#[test]
+fn test_interest_params_invalid_inputs_panic() {
+    use veillend_contract::InterestParams;
+
+    // kink below 1_000 → invalid.
+    let env = Env::default();
+    let (client, admin, asset) = setup_with_asset(&env);
+    let bad_kink_low = InterestParams {
+        base_rate_bps: 0,
+        kink_util_bps: 500, // < 1_000 — invalid
+        slope1_bps: 0,
+        slope2_bps: 0,
+        reserve_factor_bps: 0,
+    };
+    let result = client.try_set_interest_params(&admin, &asset, &bad_kink_low);
+    assert!(result.is_err(), "kink_util_bps < 1_000 must panic");
+
+    // kink above 9_500 → invalid.
+    let env = Env::default();
+    let (client, admin, asset) = setup_with_asset(&env);
+    let bad_kink_high = InterestParams {
+        base_rate_bps: 0,
+        kink_util_bps: 9_600, // > 9_500 — invalid
+        slope1_bps: 0,
+        slope2_bps: 0,
+        reserve_factor_bps: 0,
+    };
+    let result = client.try_set_interest_params(&admin, &asset, &bad_kink_high);
+    assert!(result.is_err(), "kink_util_bps > 9_500 must panic");
+
+    // Sum of rates > 100_000 → invalid.
+    let env = Env::default();
+    let (client, admin, asset) = setup_with_asset(&env);
+    let bad_rate_sum = InterestParams {
+        base_rate_bps: 50_000,
+        kink_util_bps: 8_000,
+        slope1_bps: 30_000,
+        slope2_bps: 30_000, // sum = 110_000 > 100_000
+        reserve_factor_bps: 0,
+    };
+    let result = client.try_set_interest_params(&admin, &asset, &bad_rate_sum);
+    assert!(result.is_err(), "rate sum > 100_000 must panic");
+
+    // reserve_factor > 5_000 → invalid.
+    let env = Env::default();
+    let (client, admin, asset) = setup_with_asset(&env);
+    let bad_reserve = InterestParams {
+        base_rate_bps: 0,
+        kink_util_bps: 8_000,
+        slope1_bps: 0,
+        slope2_bps: 0,
+        reserve_factor_bps: 5_001, // > 5_000 — invalid
+    };
+    let result = client.try_set_interest_params(&admin, &asset, &bad_reserve);
+    assert!(result.is_err(), "reserve_factor_bps > 5_000 must panic");
 }
