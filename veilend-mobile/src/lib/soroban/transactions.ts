@@ -14,6 +14,9 @@
  *    per-asset decimals (e.g. XLM = 7 decimals → multiply by 10^7).
  */
 
+/** Transaction timeout in seconds (5 minutes). */
+const TX_TIMEOUT_SECONDS = 300;
+
 /** Stellar network passphrase.  Defaults to testnet. */
 function getNetworkPassphrase(): string {
   return (

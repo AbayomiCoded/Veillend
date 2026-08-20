@@ -78,14 +78,11 @@ export function parseContractErrorCode(resultXdr: string): number | null {
 
     if (invokeFnResult.switch().name !== 'invokeHostFunctionTrapped') return null;
 
-    const scError = invokeFnResult.trapped?.();
-    if (!scError) return null;
-
-    // ScError with contractCode variant
-    if (scError.switch().name === 'sceContract') {
-      return scError.contractCode?.() ?? null;
-    }
-
+    // The trapped result does not carry the contract error code directly in
+    // InvokeHostFunctionResult — the code is embedded in the diagnostic events
+    // or returnValue of the full transaction meta, which is not available here.
+    // Return null so callers fall back to the generic "unknown contract error"
+    // message rather than crashing.
     return null;
   } catch {
     return null;

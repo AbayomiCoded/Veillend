@@ -10,7 +10,7 @@
  * a call to the respective SDK once those bridges are added.
  */
 
-import { getSecureItem } from '../utils/secureStorage';
+import { getSecureItem } from '../../utils/secureStorage';
 
 const SECRET_KEY_STORE = 'stellar_secret_key' as const;
 
