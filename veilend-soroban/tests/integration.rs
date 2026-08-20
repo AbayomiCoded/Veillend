@@ -2071,6 +2071,210 @@ fn liquidate_healthy_position_reverts() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Protocol reserve accumulation and timelocked withdrawal (issue #342)
+// ---------------------------------------------------------------------------
+
+/// Deposits 1_000_000_000 and borrows 500_000_000 of the same
+/// self-collateralized asset (50% utilization → 12% borrow APR / 6% gross
+/// supply APR, matching the hand-computed values in interest.rs's unit
+/// tests). Does not advance time or touch the reserve factor — callers set
+/// `reserve_factor_bps` (if any) before advancing the clock, so the rate
+/// change isn't retroactively applied to interest already accrued.
+fn setup_50pct_utilization(
+    env: &Env,
+    client: &VeilLendContractClient,
+    admin: &Address,
+    asset: &Address,
+    user: &Address,
+) {
+    configure_asset(env, client, admin, asset);
+    set_oracle_price(env, client, admin, asset, &1);
+
+    client.deposit(user, asset, &1_000_000_000);
+    client.borrow(user, asset, asset, &500_000_000);
+}
+
+fn advance_one_year(env: &Env) {
+    let ledger_timestamp = env.ledger().timestamp();
+    env.ledger()
+        .set_timestamp(ledger_timestamp + SECONDS_PER_YEAR);
+}
+
+#[test]
+fn reserve_factor_zero_produces_no_reserve_state_changes() {
+    // Backward compat: reserve_factor defaults to 0 (unset), so accrual must
+    // be byte-for-byte identical to pre-#342 behavior — no reserves, no
+    // lifetime counter movement, full interest passed through to suppliers.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
+    assert_eq!(client.reserve_factor_bps(&asset), 0);
+    advance_one_year(&env);
+
+    let total_deposited_before = client.get_total_deposited(&asset);
+
+    client.accrue_interest(&asset);
+
+    assert_eq!(client.get_reserves(&asset), 0);
+    assert_eq!(client.get_reserves_and_lifetime(&asset), (0, 0));
+    // Full 60_000_000 (6% of 1_000_000_000) passes through to suppliers,
+    // exactly as it did before reserve accumulation existed.
+    assert_eq!(
+        client.get_total_deposited(&asset),
+        total_deposited_before + 60_000_000
+    );
+}
+
+#[test]
+fn reserves_accumulate_when_factor_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
+
+    // 10% reserve factor, set before any time elapses so it applies to the
+    // whole upcoming accrual window (not retroactively).
+    client.set_reserve_factor(&admin, &asset, &1_000);
+    assert_eq!(client.reserve_factor_bps(&asset), 1_000);
+    advance_one_year(&env);
+
+    let total_deposited_before = client.get_total_deposited(&asset);
+
+    client.accrue_interest(&asset);
+
+    // 10% of the 60_000_000 gross interest borrowers pay == 6_000_000.
+    assert_eq!(client.get_reserves(&asset), 6_000_000);
+    assert_eq!(
+        client.get_reserves_and_lifetime(&asset),
+        (6_000_000, 6_000_000)
+    );
+
+    // Suppliers are credited the remaining 54_000_000, not the full 60_000_000.
+    assert_eq!(
+        client.get_total_deposited(&asset),
+        total_deposited_before + 54_000_000
+    );
+}
+
+#[test]
+fn withdraw_reserves_fails_without_timelock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let to = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
+    client.set_reserve_factor(&admin, &asset, &1_000);
+    advance_one_year(&env);
+    client.accrue_interest(&asset);
+    assert_eq!(client.get_reserves(&asset), 6_000_000);
+
+    let action_id = client.propose_withdraw_reserves(&admin, &asset, &to, &1_000_000);
+
+    // Executing before the timelock window elapses must panic — there is no
+    // direct withdraw_reserves entrypoint at all, only propose/execute.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_withdraw_reserves(&admin, &action_id);
+    }));
+    assert!(
+        result.is_err(),
+        "expected TimelockNotReady when executing before the timelock elapses"
+    );
+    // Reserves must be untouched by the failed execution attempt.
+    assert_eq!(client.get_reserves(&asset), 6_000_000);
+}
+
+#[test]
+fn withdraw_reserves_succeeds_via_timelock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let to = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
+    client.set_reserve_factor(&admin, &asset, &1_000);
+    advance_one_year(&env);
+    client.accrue_interest(&asset);
+    assert_eq!(client.get_reserves(&asset), 6_000_000);
+
+    let action_id = client.propose_withdraw_reserves(&admin, &asset, &to, &4_000_000);
+    advance_ledgers(&env, DEFAULT_TIMELOCK);
+    client.execute_withdraw_reserves(&admin, &action_id);
+
+    assert_eq!(client.get_reserves(&asset), 2_000_000);
+    // The lifetime counter never decreases — it's a cumulative accounting
+    // counter, distinct from the current withdrawable balance.
+    assert_eq!(
+        client.get_reserves_and_lifetime(&asset),
+        (2_000_000, 6_000_000)
+    );
+}
+
+#[test]
+fn withdraw_reserves_exceeding_balance_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let to = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    setup_50pct_utilization(&env, &client, &admin, &asset, &user);
+    client.set_reserve_factor(&admin, &asset, &1_000);
+    advance_one_year(&env);
+    client.accrue_interest(&asset);
+    assert_eq!(client.get_reserves(&asset), 6_000_000);
+
+    // Proposing a withdrawal above the current reserve balance must revert
+    // immediately (validate_payload runs at propose time too).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.propose_withdraw_reserves(&admin, &asset, &to, &6_000_001);
+    }));
+    assert!(
+        result.is_err(),
+        "expected InsufficientReserve when amount exceeds current reserves"
+    );
+    assert_eq!(client.get_reserves(&asset), 6_000_000);
+
+    // Also reject at execute time if reserves shrink between propose and
+    // execute (e.g. another withdrawal already drained them).
+    let action_id = client.propose_withdraw_reserves(&admin, &asset, &to, &5_000_000);
+    let drain_action_id = client.propose_withdraw_reserves(&admin, &asset, &to, &6_000_000);
+    advance_ledgers(&env, DEFAULT_TIMELOCK);
+    client.execute_withdraw_reserves(&admin, &drain_action_id);
+    assert_eq!(client.get_reserves(&asset), 0);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_withdraw_reserves(&admin, &action_id);
+    }));
+    assert!(
+        result.is_err(),
+        "expected InsufficientReserve when reserves shrank below the proposed amount before execution"
+    );
+}
+
 // ============================================================================
 // Flash Loan Integration Tests
 // ============================================================================

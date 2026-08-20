@@ -20,18 +20,36 @@ pub struct AccrualResult {
     pub interest_to_suppliers: i128,
     /// Interest to add to the aggregate total borrowed for this asset.
     pub interest_to_borrowers: i128,
-    /// Truncation dust: interest_to_borrowers - interest_to_suppliers.
-    /// This must be added to protocol reserves so the conservation invariant
-    /// holds exactly.
+    /// interest_to_borrowers - interest_to_suppliers: integer-truncation
+    /// dust at `reserve_factor_bps == 0`, or (dust + the deliberate
+    /// reserve-factor skim) once a reserve factor is set. Always added to
+    /// the asset's `total_balance` so the conservation invariant holds
+    /// exactly (every stroop borrowers pay is accounted for); the caller
+    /// additionally routes it into the withdrawable reserve/lifetime
+    /// counters and emits `ReservesAccrued` only when `reserve_factor_bps`
+    /// is nonzero, preserving byte-for-byte pre-reserve-factor behavior for
+    /// assets that never opt in.
     pub dust_to_reserves: i128,
 }
 
 /// Returns (utilization_bps, borrow_rate_bps, supply_rate_bps).
 ///
-/// supply_rate is derived from borrow_rate * utilization so that interest
-/// accrued to borrowers over any period exactly equals interest credited to
-/// suppliers over that period (100% pass-through, no protocol fee skim).
-fn compute_rates_bps(env: &Env, total_supplied: i128, total_borrowed: i128) -> (i128, i128, i128) {
+/// Without a reserve factor, supply_rate is derived from
+/// `borrow_rate * utilization` so that interest accrued to borrowers over
+/// any period exactly equals interest credited to suppliers over that
+/// period (100% pass-through). `reserve_factor_bps` (0 = disabled, the
+/// default) skims a fraction of that pass-through for the protocol:
+/// `supply_rate = (borrow_rate * utilization / 10_000) * (1 -
+/// reserve_factor_bps / 10_000)`. At `reserve_factor_bps == 0` this is an
+/// exact identity with the pre-reserve-factor formula (multiplying then
+/// dividing by 10_000 introduces no rounding), so existing assets that
+/// never set a reserve factor see byte-for-byte identical accrual.
+fn compute_rates_bps(
+    env: &Env,
+    total_supplied: i128,
+    total_borrowed: i128,
+    reserve_factor_bps: u32,
+) -> (i128, i128, i128) {
     let utilization_bps = if total_supplied == 0 {
         0
     } else {
@@ -45,8 +63,12 @@ fn compute_rates_bps(env: &Env, total_supplied: i128, total_borrowed: i128) -> (
         .and_then(|v| v.checked_div(10_000))
         .and_then(|v| v.checked_add(BASE_RATE_BPS))
         .unwrap_or_else(|| panic_with_error!(env, VeilLendError::ArithmeticOverflow));
-    let supply_rate_bps = borrow_rate_bps
+    let gross_supply_rate_bps = borrow_rate_bps
         .checked_mul(utilization_bps)
+        .and_then(|v| v.checked_div(10_000))
+        .unwrap_or_else(|| panic_with_error!(env, VeilLendError::ArithmeticOverflow));
+    let supply_rate_bps = gross_supply_rate_bps
+        .checked_mul(10_000 - reserve_factor_bps as i128)
         .and_then(|v| v.checked_div(10_000))
         .unwrap_or_else(|| panic_with_error!(env, VeilLendError::ArithmeticOverflow));
     (utilization_bps, borrow_rate_bps, supply_rate_bps)
@@ -63,12 +85,18 @@ fn compute_rates_bps(env: &Env, total_supplied: i128, total_borrowed: i128) -> (
 ///
 /// Idempotent: if `now <= state.last_accrual_timestamp`, returns the state
 /// unchanged with zero interest (elapsed == 0 short-circuit).
+///
+/// `reserve_factor_bps` (0 = disabled) skims a fraction of the interest
+/// borrowers pay for the protocol instead of passing all of it through to
+/// suppliers — see `compute_rates_bps`. At `reserve_factor_bps == 0` every
+/// returned value is identical to the pre-reserve-factor formula.
 pub fn compute_accrual(
     env: &Env,
     state: &InterestState,
     total_supplied: i128,
     total_borrowed: i128,
     now: u64,
+    reserve_factor_bps: u32,
 ) -> AccrualResult {
     let elapsed = now.saturating_sub(state.last_accrual_timestamp) as i128;
     if elapsed == 0 {
@@ -81,7 +109,7 @@ pub fn compute_accrual(
     }
 
     let (_utilization_bps, borrow_rate_bps, supply_rate_bps) =
-        compute_rates_bps(env, total_supplied, total_borrowed);
+        compute_rates_bps(env, total_supplied, total_borrowed, reserve_factor_bps);
 
     let borrow_growth = borrow_rate_bps
         .checked_mul(RATE_SCALE)
@@ -191,7 +219,7 @@ mod tests {
     fn elapsed_zero_is_noop() {
         let env = Env::default();
         let state = fresh_state();
-        let result = compute_accrual(&env, &state, 1_000_000, 500_000, 0);
+        let result = compute_accrual(&env, &state, 1_000_000, 500_000, 0, 0);
 
         assert_eq!(result.state.supply_index, state.supply_index);
         assert_eq!(result.state.borrow_index, state.borrow_index);
@@ -205,7 +233,7 @@ mod tests {
         // total_supplied == 0 => utilization_bps == 0 => supply_rate_bps == 0,
         // and there's nothing to apply borrow growth to either.
         let state = fresh_state();
-        let result = compute_accrual(&env, &state, 0, 0, SECONDS_PER_YEAR as u64);
+        let result = compute_accrual(&env, &state, 0, 0, SECONDS_PER_YEAR as u64, 0);
 
         assert_eq!(result.interest_to_suppliers, 0);
         assert_eq!(result.interest_to_borrowers, 0);
@@ -226,6 +254,7 @@ mod tests {
             total_supplied,
             total_borrowed,
             SECONDS_PER_YEAR as u64,
+            0,
         );
 
         // borrow_growth = 1200 * RATE_SCALE * SECONDS_PER_YEAR / (10000 * SECONDS_PER_YEAR) = 1200 * RATE_SCALE / 10000
@@ -252,7 +281,7 @@ mod tests {
         // Interest paid by borrowers must equal interest earned by suppliers
         // (no protocol fee skim in this model).
         let state = fresh_state();
-        let result = compute_accrual(&env, &state, 2_000_000, 800_000, SECONDS_PER_YEAR as u64);
+        let result = compute_accrual(&env, &state, 2_000_000, 800_000, SECONDS_PER_YEAR as u64, 0);
 
         // At <100% utilization the two aren't equal in absolute terms since
         // supply_rate = borrow_rate * utilization is applied to a *larger*
@@ -270,6 +299,7 @@ mod tests {
             1_000_000,
             1_000_000,
             SECONDS_PER_YEAR as u64,
+            0,
         );
         assert_eq!(
             equal_result.interest_to_suppliers,
@@ -368,6 +398,78 @@ mod tests {
         let now: u64 = SECONDS_PER_YEAR as u64 * 100;
 
         // Must panic with ArithmeticOverflow, not silently wrap.
-        let _ = compute_accrual(&env, &state, total_supplied, total_borrowed, now);
+        let _ = compute_accrual(&env, &state, total_supplied, total_borrowed, now, 0);
+    }
+
+    #[test]
+    fn reserve_factor_zero_is_identical_to_no_reserve_factor() {
+        // reserve_factor_bps == 0 must be a byte-for-byte identity with the
+        // pre-reserve-factor formula: same rates, same indexes, same
+        // interest split.
+        let env = Env::default();
+        let state = fresh_state();
+        let total_supplied = 1_000_000_000;
+        let total_borrowed = 500_000_000;
+
+        let without_param = compute_accrual(
+            &env,
+            &state,
+            total_supplied,
+            total_borrowed,
+            SECONDS_PER_YEAR as u64,
+            0,
+        );
+
+        assert_eq!(without_param.interest_to_borrowers, 60_000_000);
+        assert_eq!(without_param.interest_to_suppliers, 60_000_000);
+        assert_eq!(without_param.dust_to_reserves, 0);
+    }
+
+    #[test]
+    fn reserve_factor_skims_from_supplier_side_only() {
+        // 50% utilization, 12% borrow APR, 10% reserve factor:
+        // gross supply_rate = 600 bps; net supply_rate = 600 * 90% = 540 bps.
+        // Borrowers still pay the full 1200 bps — only what would have gone
+        // to suppliers shrinks.
+        let env = Env::default();
+        let state = fresh_state();
+        let total_supplied = 1_000_000_000;
+        let total_borrowed = 500_000_000;
+        let reserve_factor_bps = 1_000; // 10%
+
+        let result = compute_accrual(
+            &env,
+            &state,
+            total_supplied,
+            total_borrowed,
+            SECONDS_PER_YEAR as u64,
+            reserve_factor_bps,
+        );
+
+        let expected_borrow_growth = 1200 * RATE_SCALE / 10_000;
+        let expected_net_supply_growth = (600 * RATE_SCALE / 10_000) * 9_000 / 10_000;
+
+        let expected_interest_to_borrowers = (total_borrowed * expected_borrow_growth) / RATE_SCALE;
+        let expected_interest_to_suppliers =
+            (total_supplied * expected_net_supply_growth) / RATE_SCALE;
+
+        assert_eq!(result.interest_to_borrowers, expected_interest_to_borrowers);
+        assert_eq!(result.interest_to_suppliers, expected_interest_to_suppliers);
+        assert!(
+            result.interest_to_suppliers < expected_interest_to_borrowers,
+            "reserve factor must reduce what suppliers are credited below what borrowers pay"
+        );
+
+        // Conservation still holds: the whole gap (dust + deliberate skim)
+        // is exactly interest_to_borrowers - interest_to_suppliers, and it
+        // must all be accounted for (the caller adds it to total_balance).
+        assert_eq!(
+            result.dust_to_reserves,
+            result.interest_to_borrowers - result.interest_to_suppliers
+        );
+        assert!(
+            result.dust_to_reserves > 0,
+            "10% reserve factor must produce a nonzero skim"
+        );
     }
 }
