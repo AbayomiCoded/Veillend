@@ -111,9 +111,11 @@ model Asset {
   decimals      Int      @default(7)
   symbol        String                        // display ticker
   name          String
+  displayName   String?                       // human-friendly admin name
   logoUrl       String?
   isNative      Boolean  @default(false)
   isSupported   Boolean  @default(false)     // set by the indexer's 'asset_configured' event
+  verified      Boolean  @default(false)
   minCollateralRatio Float?                    // per-asset LTV (0–1); null uses protocol default
   createdAt     DateTime @default(now())
 

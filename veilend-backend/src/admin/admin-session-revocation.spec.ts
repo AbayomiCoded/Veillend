@@ -6,6 +6,7 @@ import { JwtStrategy } from '../auth/jwt.strategy';
 import { AppConfigService } from '../config/app-config.service';
 import { AdminActionRepository } from './admin-action.repository';
 import { AdminTransactionBuilderService } from './admin-transaction-builder.service';
+import { SorobanRpcService } from '../stellar/soroban-rpc.service';
 
 /**
  * Integration test for admin removal and session revocation
@@ -46,6 +47,10 @@ describe('Admin Session Revocation Integration', () => {
         },
         {
           provide: AdminTransactionBuilderService,
+          useValue: {},
+        },
+        {
+          provide: SorobanRpcService,
           useValue: {},
         },
       ],

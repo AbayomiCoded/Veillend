@@ -3,6 +3,8 @@ import { AdminService } from './admin.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdminActionRepository } from './admin-action.repository';
 import { AdminTransactionBuilderService } from './admin-transaction-builder.service';
+import { SorobanRpcService } from '../stellar/soroban-rpc.service';
+import { AppConfigService } from '../config/app-config.service';
 import {
   ConflictException,
   ForbiddenException,
@@ -23,6 +25,9 @@ describe('AdminService', () => {
       delete: jest.fn(),
       findMany: jest.fn(),
       findUnique: jest.fn(),
+    },
+    asset: {
+      upsert: jest.fn(),
     },
     user: {
       findUnique: jest.fn(),
@@ -51,6 +56,16 @@ describe('AdminService', () => {
     buildActionXdr: jest.fn(),
   };
 
+  const mockRpcService = {
+    validateStellarAssetContract: jest.fn(),
+  };
+
+  const mockConfigService = {
+    stellar: {
+      verifiedAssetList: {},
+    },
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -66,6 +81,14 @@ describe('AdminService', () => {
         {
           provide: AdminTransactionBuilderService,
           useValue: mockTransactionBuilder,
+        },
+        {
+          provide: SorobanRpcService,
+          useValue: mockRpcService,
+        },
+        {
+          provide: AppConfigService,
+          useValue: mockConfigService,
         },
       ],
     }).compile();
@@ -202,6 +225,12 @@ describe('AdminService', () => {
         status: AdminActionStatus.PENDING,
       });
 
+      mockRpcService.validateStellarAssetContract.mockResolvedValue({
+        symbol: 'USDC',
+        name: 'USD Coin',
+        decimals: 7,
+      });
+
       mockAdminActionRepository.create
         .mockResolvedValueOnce(pendingRow('a1'))
         .mockResolvedValueOnce(pendingRow('a2'))
@@ -231,6 +260,11 @@ describe('AdminService', () => {
     });
 
     it('should mark the intent FAILED and rethrow when XDR building fails', async () => {
+      mockRpcService.validateStellarAssetContract.mockResolvedValue({
+        symbol: 'USDC',
+        name: 'USD Coin',
+        decimals: 7,
+      });
       mockAdminActionRepository.create.mockResolvedValue({
         id: 'a1',
         adminAddress: actorWallet,
