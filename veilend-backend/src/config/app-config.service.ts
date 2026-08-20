@@ -20,9 +20,9 @@ export class AppConfigService {
     try {
       const val = this.configService.get<string>('VERIFIED_ASSET_LIST');
       if (val) {
-        verifiedAssetList = JSON.parse(val);
+        verifiedAssetList = JSON.parse(val) as Record<string, string[]>;
       }
-    } catch (e) {
+    } catch {
       // Ignore
     }
 

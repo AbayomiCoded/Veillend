@@ -179,9 +179,9 @@ export class SorobanRpcService implements OnModuleInit {
         return String(val);
       };
 
-      const symbolVal = scValToNative(simSymbol.result.retval);
-      const nameVal = scValToNative(simName.result.retval);
-      const decimalsVal = scValToNative(simDecimals.result.retval);
+      const symbolVal = scValToNative(simSymbol.result.retval) as unknown;
+      const nameVal = scValToNative(simName.result.retval) as unknown;
+      const decimalsVal = scValToNative(simDecimals.result.retval) as unknown;
 
       return {
         symbol: parseStr(symbolVal),
