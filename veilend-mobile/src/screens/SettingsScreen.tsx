@@ -21,7 +21,6 @@ import { WalletBackupModal } from '../components/WalletBackupModal';
 import { useWalletSecurity } from '../hooks/useWalletSecurity';
 import { navigationRef } from '../navigation';
 
-const DEFAULT_PROFILE_IMAGE = 'https://i.pravatar.cc/100?img=5';
 const CURRENCIES = ['USD', 'EUR', 'GBP'];
 
 export default function SettingsScreen({ navigation }: any) {
@@ -45,7 +44,9 @@ export default function SettingsScreen({ navigation }: any) {
 
   const defaultUsername = address ? shortenAddress(address) : 'Guest';
   const username = profileName ?? defaultUsername;
-  const avatarUri = profileImage ?? DEFAULT_PROFILE_IMAGE;
+  // No third-party CDN fallback (issue #344) — undefined renders a local
+  // Ionicons glyph instead of leaking the user's IP/UA to pravatar.cc.
+  const avatarUri = profileImage ?? undefined;
 
   const [tempName, setTempName] = useState(username);
 
@@ -127,7 +128,11 @@ export default function SettingsScreen({ navigation }: any) {
       <View style={styles.card}>
         <View style={styles.avatarRow}>
           <TouchableOpacity onPress={pickImage} style={styles.avatarContainer} accessibilityRole="button" accessibilityLabel="Change profile photo">
-            <Image source={{ uri: avatarUri }} style={styles.avatar} />
+            {avatarUri ? (
+              <Image source={{ uri: avatarUri }} style={styles.avatar} />
+            ) : (
+              <Ionicons name="person-circle" size={64} color="#A1A1A1" />
+            )}
             <View style={styles.cameraIconBadge}>
               <Ionicons name="camera" size={14} color="#000" />
             </View>

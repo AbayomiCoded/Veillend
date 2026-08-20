@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { beforeEach, describe, it } from 'node:test';
+import { beforeEach, describe, it, mock } from 'node:test';
 import { useStore } from '../store/store';
 import * as SecureStoreShim from '../utils/secureStoreShim';
 import api from '../utils/api';
+import { TimeoutError } from '../utils/withTimeout';
 
 // Stub the network so optimistic lending tests never hit the real backend.
 // The store holds a live reference to this axios instance, so patching the
@@ -401,6 +402,123 @@ describe('refreshDashboard (issue #304)', () => {
     const s = useStore.getState();
     assert.equal(s.dashboardLoading, false);
     assert.equal(s.dashboardError, null);
+  });
+});
+
+describe('Dashboard fetch timeout + cancellation (issue #344)', () => {
+  beforeEach(() => {
+    useStore.setState({
+      address: 'GABC123',
+      authToken: 'tok',
+      backendSlow: false,
+      portfolioError: null,
+      transactionsError: null,
+    } as any);
+  });
+
+  it('fetchPortfolio times out at 15s when the backend hangs for 30s, and aborts the request', async () => {
+    let getAborted = false;
+    (api as any).get = (_url: string, config?: any) =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve({ data: {} }), 30_000);
+        config?.signal?.addEventListener?.('abort', () => {
+          getAborted = true;
+          clearTimeout(timer);
+        });
+      });
+
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const fetchPromise = useStore.getState().fetchPortfolio();
+      mock.timers.tick(15_000);
+      await assert.rejects(fetchPromise, TimeoutError);
+    } finally {
+      mock.timers.reset();
+    }
+
+    const s = useStore.getState();
+    assert.equal(s.portfolioLoading, false);
+    assert.equal(s.portfolioError, 'Portfolio request timed out. Please retry.');
+    assert.equal(s.backendSlow, true);
+    assert.equal(getAborted, true, 'the underlying axios request must be aborted on timeout');
+  });
+
+  it('fetchTransactions times out at 15s the same way', async () => {
+    (api as any).get = () => new Promise((resolve) => setTimeout(() => resolve({ data: [] }), 30_000));
+
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const fetchPromise = useStore.getState().fetchTransactions();
+      mock.timers.tick(15_000);
+      await assert.rejects(fetchPromise, TimeoutError);
+    } finally {
+      mock.timers.reset();
+    }
+
+    const s = useStore.getState();
+    assert.equal(s.transactionsLoading, false);
+    assert.equal(s.transactionsError, 'Transactions request timed out. Please retry.');
+    assert.equal(s.backendSlow, true);
+  });
+
+  it('a successful fetch after a prior timeout clears backendSlow', async () => {
+    useStore.setState({ backendSlow: true });
+    (api as any).get = async (url: string) =>
+      url.startsWith('/portfolios') ? { data: {} } : { data: [] };
+    await useStore.getState().fetchPortfolio();
+    assert.equal(useStore.getState().backendSlow, false);
+  });
+
+  it('cancelPendingRequests aborts every in-flight fetchPortfolio/fetchTransactions call', async () => {
+    const aborted: string[] = [];
+    (api as any).get = (url: string, config?: any) =>
+      new Promise((_resolve, reject) => {
+        config?.signal?.addEventListener?.('abort', () => {
+          aborted.push(url);
+          const e: any = new Error('canceled');
+          e.name = 'CanceledError';
+          reject(e);
+        });
+      });
+
+    const portfolioPromise = useStore.getState().fetchPortfolio();
+    const transactionsPromise = useStore.getState().fetchTransactions();
+    useStore.getState().cancelPendingRequests();
+    await Promise.all([portfolioPromise, transactionsPromise]).catch(() => {});
+
+    assert.deepEqual(aborted.sort(), ['/portfolios/GABC123', '/transactions/GABC123']);
+    const s = useStore.getState();
+    assert.equal(s.portfolioLoading, false);
+    assert.equal(s.transactionsLoading, false);
+    // Aborts are lifecycle-initiated, not real failures — no error message.
+    assert.equal(s.portfolioError, null);
+    assert.equal(s.transactionsError, null);
+  });
+
+  it('dismissBackendSlowNotice clears the banner flag', () => {
+    useStore.setState({ backendSlow: true });
+    useStore.getState().dismissBackendSlowNotice();
+    assert.equal(useStore.getState().backendSlow, false);
+  });
+
+  it('logout cancels pending requests before clearing session state', async () => {
+    let aborted = false;
+    (api as any).get = (_url: string, config?: any) =>
+      new Promise((_resolve, reject) => {
+        config?.signal?.addEventListener?.('abort', () => {
+          aborted = true;
+          const e: any = new Error('canceled');
+          e.name = 'CanceledError';
+          reject(e);
+        });
+      });
+    (api as any).post = async () => ({ data: {} });
+
+    const portfolioPromise = useStore.getState().fetchPortfolio().catch(() => {});
+    await useStore.getState().logout();
+    await portfolioPromise;
+
+    assert.equal(aborted, true);
   });
 });
 

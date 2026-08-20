@@ -7,6 +7,52 @@ import { signTransaction, UserRejectedError } from '../lib/soroban/signer';
 import { sendTransaction, pollTransaction } from '../lib/soroban/rpc';
 import { parseContractErrorCode, getContractErrorMessage } from '../lib/soroban/contractErrors';
 import { reportError } from '../utils/errorReporting';
+import { TimeoutError, withTimeout } from '../utils/withTimeout';
+
+const DASHBOARD_FETCH_TIMEOUT_MS = 15_000;
+
+// Tracks every in-flight fetchPortfolio/fetchTransactions request so
+// cancelPendingRequests() can abort them all at once (issue #344) — kept
+// module-level rather than in Zustand state since AbortControllers aren't
+// meaningful to diff/serialize as store state.
+const pendingRequestControllers = new Set<AbortController>();
+
+/**
+ * Creates an AbortController for a single tracked fetch, registers it so
+ * cancelPendingRequests() can abort it, and chains an optional
+ * caller-supplied signal (e.g. pull-to-refresh-on-unmount) into it so both
+ * cancellation paths converge on one controller passed to axios.
+ */
+function createTrackedRequest(externalSignal?: AbortSignal): AbortController {
+  const controller = new AbortController();
+  pendingRequestControllers.add(controller);
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+  }
+  return controller;
+}
+
+function releaseTrackedRequest(controller: AbortController): void {
+  pendingRequestControllers.delete(controller);
+}
+
+/**
+ * Classifies a caught fetch error for Promise.all aggregation: aborts are
+ * user/lifecycle-initiated and must not surface as a scary dashboardError,
+ * everything else is pushed onto `errors` for the aggregate message.
+ * Returns true when the error was an abort.
+ */
+function classifyFetchError(err: any, label: string, errors: string[]): boolean {
+  if (err?.name === 'AbortError' || err?.name === 'CanceledError') {
+    return true;
+  }
+  errors.push(err?.message ?? label);
+  return false;
+}
 
 type Nullable<T> = T | null;
 
@@ -140,6 +186,10 @@ type PortfolioState = {
   // One-shot dashboard hydration: single loading flag + aggregate error state.
   dashboardLoading: boolean;
   dashboardError: string | null;
+  // True once a portfolio/transactions fetch has timed out at least once and
+  // not yet been dismissed or recovered by a subsequent successful fetch —
+  // drives the dismissible "backend is slow" banner (issue #344).
+  backendSlow: boolean;
   // Optimistically-inserted lending transactions (PENDING / CONFIRMED / FAILED).
   pendingTransactions: TransactionRecord[];
   fetchPortfolio: (signal?: AbortSignal) => Promise<void>;
@@ -150,6 +200,12 @@ type PortfolioState = {
   // Pull-to-refresh: refetches portfolio + transactions concurrently and is
   // abortable so screens can cancel in-flight work on unmount.
   refreshDashboard: (signal?: AbortSignal) => Promise<void>;
+  // Aborts every in-flight fetchPortfolio/fetchTransactions request (issue
+  // #344) — called when the user cancels the loading spinner, or logs out
+  // while a fetch is still in flight, so no stale response can write to
+  // state after the session is torn down.
+  cancelPendingRequests: () => void;
+  dismissBackendSlowNotice: () => void;
 };
 
 type StoreState = AuthState & UiState & LendingState & PortfolioState;
@@ -369,6 +425,10 @@ export const useStore = create<StoreState>(
       }
     },
     logout: async () => {
+      // Abort any in-flight dashboard fetches first (issue #344) so a
+      // response that lands after the session is torn down can't write
+      // stale data (or log a confusing error) into the post-logout state.
+      get().cancelPendingRequests();
       // Attempt to revoke the server-side session before clearing local state.
       // Fire-and-forget: a network failure must NOT block the local logout so
       // the user is never stuck with a locally-live session they cannot clear.
@@ -565,13 +625,19 @@ export const useStore = create<StoreState>(
     positionsError: null,
     dashboardLoading: false,
     dashboardError: null,
+    backendSlow: false,
     pendingTransactions: [],
     fetchPortfolio: async (signal?: AbortSignal) => {
       const addr = get().address;
       if (!addr) return;
       set({ portfolioLoading: true, portfolioError: null });
+      const controller = createTrackedRequest(signal);
       try {
-        const res = await fetchWithRetry(`/portfolios/${addr}`, undefined, { signal });
+        const res = await withTimeout(
+          fetchWithRetry(`/portfolios/${addr}`, undefined, { signal: controller.signal }),
+          DASHBOARD_FETCH_TIMEOUT_MS,
+          'portfolio',
+        );
         const data = res.data?.data ?? res.data;
         set({
           balance: data?.balance ?? 0,
@@ -581,8 +647,22 @@ export const useStore = create<StoreState>(
           healthFactor: data?.healthFactor ?? 0,
           assetBalances: Array.isArray(data?.balances) ? data.balances : [],
           portfolioLoading: false,
+          backendSlow: false,
         });
       } catch (err: any) {
+        if (err instanceof TimeoutError) {
+          // The underlying axios request has no way to know we've given up
+          // on it — abort it for real so it doesn't keep the connection
+          // (and, on a stale-write race, the store) busy after we've moved
+          // on to showing an error.
+          controller.abort();
+          set({
+            portfolioError: 'Portfolio request timed out. Please retry.',
+            portfolioLoading: false,
+            backendSlow: true,
+          });
+          throw err;
+        }
         if (err?.name === 'AbortError' || err?.name === 'CanceledError') {
           set({ portfolioLoading: false });
           throw err;
@@ -592,20 +672,37 @@ export const useStore = create<StoreState>(
           portfolioLoading: false,
         });
         throw err;
+      } finally {
+        releaseTrackedRequest(controller);
       }
     },
     fetchTransactions: async (signal?: AbortSignal) => {
       const addr = get().address;
       if (!addr) return;
       set({ transactionsLoading: true, transactionsError: null });
+      const controller = createTrackedRequest(signal);
       try {
-        const res = await fetchWithRetry(`/transactions/${addr}`, undefined, { signal });
+        const res = await withTimeout(
+          fetchWithRetry(`/transactions/${addr}`, undefined, { signal: controller.signal }),
+          DASHBOARD_FETCH_TIMEOUT_MS,
+          'transactions',
+        );
         const data = res.data?.data ?? res.data;
         set({
           transactions: Array.isArray(data) ? data : [],
           transactionsLoading: false,
+          backendSlow: false,
         });
       } catch (err: any) {
+        if (err instanceof TimeoutError) {
+          controller.abort();
+          set({
+            transactionsError: 'Transactions request timed out. Please retry.',
+            transactionsLoading: false,
+            backendSlow: true,
+          });
+          throw err;
+        }
         if (err?.name === 'AbortError' || err?.name === 'CanceledError') {
           set({ transactionsLoading: false });
           throw err;
@@ -615,6 +712,8 @@ export const useStore = create<StoreState>(
           transactionsLoading: false,
         });
         throw err;
+      } finally {
+        releaseTrackedRequest(controller);
       }
     },
     fetchSupportedAssets: async () => {
@@ -666,16 +765,36 @@ export const useStore = create<StoreState>(
         return;
       }
       set({ dashboardLoading: true, dashboardError: null });
+      let aborted = false;
       const errors: string[] = [];
       await Promise.all([
-        get().fetchSupportedAssets().catch((e: any) => errors.push(e?.message ?? 'assets')),
-        get().fetchPortfolio().catch((e: any) => errors.push(e?.message ?? 'portfolio')),
-        get().fetchPositions().catch((e: any) => errors.push(e?.message ?? 'positions')),
-        get().fetchTransactions().catch((e: any) => errors.push(e?.message ?? 'transactions')),
+        get()
+          .fetchSupportedAssets()
+          .catch((e: any) => {
+            if (classifyFetchError(e, 'assets', errors)) aborted = true;
+          }),
+        get()
+          .fetchPortfolio()
+          .catch((e: any) => {
+            if (classifyFetchError(e, 'portfolio', errors)) aborted = true;
+          }),
+        get()
+          .fetchPositions()
+          .catch((e: any) => {
+            if (classifyFetchError(e, 'positions', errors)) aborted = true;
+          }),
+        get()
+          .fetchTransactions()
+          .catch((e: any) => {
+            if (classifyFetchError(e, 'transactions', errors)) aborted = true;
+          }),
       ]);
       set({
         dashboardLoading: false,
-        dashboardError: errors.length ? errors.join('; ') : null,
+        // A user-triggered cancel (cancelPendingRequests, e.g. tapping
+        // "Cancel Loading" or logging out mid-fetch) must not surface as an
+        // error — the user asked for exactly this outcome.
+        dashboardError: errors.length && !aborted ? errors.join('; ') : null,
       });
     },
     refreshDashboard: async (signal?: AbortSignal) => {
@@ -688,26 +807,27 @@ export const useStore = create<StoreState>(
       let aborted = false;
       const errors: string[] = [];
       await Promise.all([
-        get().fetchPortfolio(signal).catch((e: any) => {
-          if (e?.name === 'AbortError' || e?.name === 'CanceledError') {
-            aborted = true;
-            return;
-          }
-          errors.push(e?.message ?? 'portfolio');
-        }),
-        get().fetchTransactions(signal).catch((e: any) => {
-          if (e?.name === 'AbortError' || e?.name === 'CanceledError') {
-            aborted = true;
-            return;
-          }
-          errors.push(e?.message ?? 'transactions');
-        }),
+        get()
+          .fetchPortfolio(signal)
+          .catch((e: any) => {
+            if (classifyFetchError(e, 'portfolio', errors)) aborted = true;
+          }),
+        get()
+          .fetchTransactions(signal)
+          .catch((e: any) => {
+            if (classifyFetchError(e, 'transactions', errors)) aborted = true;
+          }),
       ]);
       set({
         dashboardLoading: false,
         dashboardError: errors.length && !aborted ? errors.join('; ') : null,
       });
     },
+    cancelPendingRequests: () => {
+      pendingRequestControllers.forEach((controller) => controller.abort());
+      pendingRequestControllers.clear();
+    },
+    dismissBackendSlowNotice: () => set({ backendSlow: false }),
   };
   });
 

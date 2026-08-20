@@ -6,13 +6,18 @@ export type ProtocolStatusInput = {
   now?: number;
   maxSyncLagMs?: number;
   isOnline?: boolean;
+  // True while the backend has timed out on a dashboard fetch and the user
+  // hasn't dismissed the notice (issue #344) — distinct from `sync-lag`,
+  // which reflects a stale-but-successful sync rather than a hung request.
+  backendSlow?: boolean;
 };
 
 export type ProtocolStatusBannerId =
   | 'wallet-disconnected'
   | 'network-mismatch'
   | 'sync-lag'
-  | 'offline';
+  | 'offline'
+  | 'backend-slow';
 
 export type ProtocolStatusBanner = {
   id: ProtocolStatusBannerId;
@@ -20,6 +25,9 @@ export type ProtocolStatusBanner = {
   title: string;
   message: string;
   actionLabel?: string;
+  // When true, the banner shows a dismiss (×) control instead of/alongside
+  // its action button and disappears once the caller acknowledges it.
+  dismissible?: boolean;
 };
 
 const DEFAULT_SYNC_LAG_MS = 120_000;
@@ -36,6 +44,7 @@ export function getProtocolStatusBanners({
   now = Date.now(),
   maxSyncLagMs = DEFAULT_SYNC_LAG_MS,
   isOnline = true,
+  backendSlow = false,
 }: ProtocolStatusInput): ProtocolStatusBanner[] {
   const banners: ProtocolStatusBanner[] = [];
   const normalizedExpected = expectedNetwork.trim().toLowerCase();
@@ -77,6 +86,16 @@ export function getProtocolStatusBanners({
       title: 'Sync delayed',
       message: 'Protocol data may be stale. Refresh status before making a lending decision.',
       actionLabel: 'Retry sync',
+    });
+  }
+
+  if (backendSlow) {
+    banners.push({
+      id: 'backend-slow',
+      severity: 'warning',
+      title: 'Backend is responding slowly',
+      message: 'A recent request timed out. Your data may be out of date — retry when ready.',
+      dismissible: true,
     });
   }
 
