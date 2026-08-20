@@ -10,8 +10,11 @@ import { AppModule } from './app.module';
 import { AppLoggerService } from './common/logging/app-logger.service';
 import { AppConfigService } from './config/app-config.service';
 import { createOriginCheckMiddleware } from './middleware/origin-check';
+import { validateProductionJwtConfig } from './config/config.module';
 
 async function bootstrap() {
+  validateProductionJwtConfig();
+
   const app = await NestFactory.create(AppModule, {
     bufferLogs: true,
     bodyParser: false,

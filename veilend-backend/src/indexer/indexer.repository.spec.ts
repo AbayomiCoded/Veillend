@@ -55,7 +55,9 @@ describe('IndexerRepository', () => {
       },
       // withSerializable passthrough: delegates directly to the callback
       // with `prisma` itself so unit tests don't need a real DB.
-      withSerializable: jest.fn(async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma)),
+      withSerializable: jest.fn(
+        async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma),
+      ),
       // Keep $transaction for the resetDatabase batch path (array form).
       $transaction: jest.fn(async (arg: unknown) => {
         if (Array.isArray(arg)) return Promise.all(arg);

@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { PrismaClient, Prisma } from '@prisma/client';
 
 /** Postgres error codes we want to retry on. */
@@ -18,7 +23,7 @@ function isRetryable(error: unknown): boolean {
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     if (RETRYABLE_PG_CODES.has(error.code)) return true;
     // Prisma wraps the raw Postgres code in meta.code for some driver configs.
-    const meta = error.meta as Record<string, unknown> | undefined;
+    const meta = error.meta;
     if (meta && typeof meta['code'] === 'string') {
       return RETRYABLE_PG_CODES.has(meta['code']);
     }
@@ -69,17 +74,13 @@ export class PrismaService
    */
   async withSerializable<T>(
     fn: (db: Prisma.TransactionClient) => Promise<T>,
-    opts?: Omit<
-      Parameters<PrismaClient['$transaction']>[1],
-      'isolationLevel'
-    >,
+    opts?: Omit<Parameters<PrismaClient['$transaction']>[1], 'isolationLevel'>,
   ): Promise<T> {
-    return this._withRetry(
-      () =>
-        this.$transaction(fn, {
-          ...opts,
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-        }),
+    return this._withRetry(() =>
+      this.$transaction(fn, {
+        ...opts,
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      }),
     );
   }
 
@@ -90,10 +91,7 @@ export class PrismaService
    */
   async withRepeatableRead<T>(
     fn: (db: Prisma.TransactionClient) => Promise<T>,
-    opts?: Omit<
-      Parameters<PrismaClient['$transaction']>[1],
-      'isolationLevel'
-    >,
+    opts?: Omit<Parameters<PrismaClient['$transaction']>[1], 'isolationLevel'>,
   ): Promise<T> {
     return this.$transaction(fn, {
       ...opts,

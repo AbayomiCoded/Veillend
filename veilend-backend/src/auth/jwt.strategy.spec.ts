@@ -11,7 +11,15 @@ describe('JwtStrategy', () => {
     session: { findUnique: jest.Mock };
     jtiRegistry: { findUnique: jest.Mock };
   };
-  let configService: { auth: { jwtSecret: string; legacyAuthAllow: boolean } };
+  let configService: {
+    auth: {
+      jwtSecret: string;
+      jwtExpiresIn: string;
+      jwtIssuer: string;
+      jwtAudience: string;
+      legacyAuthAllow: boolean;
+    };
+  };
 
   beforeEach(async () => {
     prisma = {
@@ -21,6 +29,9 @@ describe('JwtStrategy', () => {
     configService = {
       auth: {
         jwtSecret: 'test',
+        jwtExpiresIn: '15m',
+        jwtIssuer: 'veilend',
+        jwtAudience: 'veilend-app',
         legacyAuthAllow: true,
       },
     };
@@ -30,21 +41,7 @@ describe('JwtStrategy', () => {
         JwtStrategy,
         {
           provide: AppConfigService,
-          useValue: {
-            stellar: {
-              sorobanRpcUrl: 'https://test',
-              horizonUrl: 'https://test',
-              network: 'testnet',
-              networkPassphrase: 'Test SDF Network ; September 2015',
-            },
-            auth: configService.auth,
-            indexer: {
-              contractId:
-                'CCW57ZST4NV43YS7JZKMGLG62624NV43YS7JZKMGLG62624NV43YS7JZ',
-              startLedger: 1,
-              pollIntervalMs: 5000,
-            },
-          },
+          useValue: configService,
         },
         { provide: PrismaService, useValue: prisma },
       ],
@@ -55,6 +52,110 @@ describe('JwtStrategy', () => {
 
   it('should be defined', () => {
     expect(strategy).toBeDefined();
+  });
+
+  describe('validate — issuer and audience verification', () => {
+    it('succeeds with correct issuer and audience', async () => {
+      const expiresAt = new Date(Date.now() + 900_000);
+      prisma.jtiRegistry.findUnique.mockResolvedValue({
+        jti: 'jti-1',
+        userId: 'user-1',
+        sessionId: 'session-1',
+        expiresAt,
+        revokedAt: null,
+      });
+      prisma.session.findUnique.mockResolvedValue({
+        id: 'session-1',
+        userId: 'user-1',
+        expiresAt,
+      });
+
+      const req = {
+        headers: { authorization: 'Bearer some-jwt-token' },
+      } as unknown as Request;
+
+      const result = await strategy.validate(req, {
+        walletAddress: 'GABC',
+        sub: 'user-1',
+        jti: 'jti-1',
+        sid: 'session-1',
+        iss: 'veilend',
+        aud: 'veilend-app',
+      });
+
+      expect(result).toEqual({
+        walletAddress: 'GABC',
+        sessionId: 'session-1',
+        userId: 'user-1',
+        expiresAt,
+      });
+    });
+
+    it('throws UnauthorizedException for audience mismatch', async () => {
+      const req = {
+        headers: { authorization: 'Bearer some-jwt-token' },
+      } as unknown as Request;
+
+      await expect(
+        strategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          jti: 'jti-1',
+          sid: 'session-1',
+          iss: 'veilend',
+          aud: 'wrong-audience',
+        }),
+      ).rejects.toThrow(new UnauthorizedException('Invalid token audience'));
+    });
+
+    it('throws UnauthorizedException for issuer mismatch', async () => {
+      const req = {
+        headers: { authorization: 'Bearer some-jwt-token' },
+      } as unknown as Request;
+
+      await expect(
+        strategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          jti: 'jti-1',
+          sid: 'session-1',
+          iss: 'wrong-issuer',
+          aud: 'veilend-app',
+        }),
+      ).rejects.toThrow(new UnauthorizedException('Invalid token issuer'));
+    });
+
+    it('throws UnauthorizedException when audience is missing from payload', async () => {
+      const req = {
+        headers: { authorization: 'Bearer some-jwt-token' },
+      } as unknown as Request;
+
+      await expect(
+        strategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          jti: 'jti-1',
+          sid: 'session-1',
+          iss: 'veilend',
+        }),
+      ).rejects.toThrow(new UnauthorizedException('Invalid token audience'));
+    });
+
+    it('throws UnauthorizedException when issuer is missing from payload', async () => {
+      const req = {
+        headers: { authorization: 'Bearer some-jwt-token' },
+      } as unknown as Request;
+
+      await expect(
+        strategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          jti: 'jti-1',
+          sid: 'session-1',
+          aud: 'veilend-app',
+        }),
+      ).rejects.toThrow(new UnauthorizedException('Invalid token issuer'));
+    });
   });
 
   describe('validate — new-format token (jti + sid)', () => {
@@ -82,6 +183,8 @@ describe('JwtStrategy', () => {
         sub: 'user-1',
         jti: 'jti-1',
         sid: 'session-1',
+        iss: 'veilend',
+        aud: 'veilend-app',
       });
 
       expect(result).toEqual({
@@ -116,6 +219,8 @@ describe('JwtStrategy', () => {
           sub: 'user-1',
           jti: 'jti-1',
           sid: 'session-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
         }),
       ).rejects.toThrow('Session not found or revoked');
     });
@@ -139,6 +244,8 @@ describe('JwtStrategy', () => {
           sub: 'user-1',
           jti: 'jti-1',
           sid: 'session-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
         }),
       ).rejects.toThrow(UnauthorizedException);
     });
@@ -162,6 +269,8 @@ describe('JwtStrategy', () => {
           sub: 'user-1',
           jti: 'jti-1',
           sid: 'session-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
         }),
       ).rejects.toThrow(UnauthorizedException);
     });
@@ -186,13 +295,15 @@ describe('JwtStrategy', () => {
           sub: 'user-1',
           jti: 'jti-1',
           sid: 'session-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
         }),
       ).rejects.toThrow('Session not found or revoked');
     });
   });
 
   describe('validate — legacy token (no jti/sid)', () => {
-    it('falls back to raw-token session lookup when LEGACY_AUTH_ALLOW is true', async () => {
+    it('falls back to hashed-token session lookup when LEGACY_AUTH_ALLOW is true', async () => {
       const expiresAt = new Date(Date.now() + 604800_000);
       prisma.session.findUnique.mockResolvedValue({
         id: 'session-1',
@@ -208,6 +319,8 @@ describe('JwtStrategy', () => {
       const result = await strategy.validate(req, {
         walletAddress: 'GABC',
         sub: 'user-1',
+        iss: 'veilend',
+        aud: 'veilend-app',
       });
 
       expect(result).toEqual({
@@ -216,10 +329,14 @@ describe('JwtStrategy', () => {
         userId: 'user-1',
         expiresAt,
       });
-      expect(prisma.session.findUnique).toHaveBeenCalledWith({
-        where: { token: 'some-jwt-token' },
-        include: { user: true },
-      });
+      // The token is hashed before lookup.
+      expect(prisma.session.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          where: { token: expect.any(String) },
+          include: { user: true },
+        }),
+      );
     });
 
     it('throws UnauthorizedException when session is revoked', async () => {
@@ -230,7 +347,12 @@ describe('JwtStrategy', () => {
       } as unknown as Request;
 
       await expect(
-        strategy.validate(req, { walletAddress: 'GABC', sub: 'user-1' }),
+        strategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
+        }),
       ).rejects.toThrow(UnauthorizedException);
     });
 
@@ -247,7 +369,12 @@ describe('JwtStrategy', () => {
       } as unknown as Request;
 
       await expect(
-        strategy.validate(req, { walletAddress: 'GABC', sub: 'user-1' }),
+        strategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
+        }),
       ).rejects.toThrow('Session has expired');
     });
 
@@ -259,21 +386,7 @@ describe('JwtStrategy', () => {
           JwtStrategy,
           {
             provide: AppConfigService,
-            useValue: {
-              stellar: {
-                sorobanRpcUrl: 'https://test',
-                horizonUrl: 'https://test',
-                network: 'testnet',
-                networkPassphrase: 'Test SDF Network ; September 2015',
-              },
-              auth: { jwtSecret: 'test', legacyAuthAllow: false },
-              indexer: {
-                contractId:
-                  'CCW57ZST4NV43YS7JZKMGLG62624NV43YS7JZKMGLG62624NV43YS7JZ',
-                startLedger: 1,
-                pollIntervalMs: 5000,
-              },
-            },
+            useValue: configService,
           },
           { provide: PrismaService, useValue: prisma },
         ],
@@ -285,7 +398,12 @@ describe('JwtStrategy', () => {
       } as unknown as Request;
 
       await expect(
-        strictStrategy.validate(req, { walletAddress: 'GABC', sub: 'user-1' }),
+        strictStrategy.validate(req, {
+          walletAddress: 'GABC',
+          sub: 'user-1',
+          iss: 'veilend',
+          aud: 'veilend-app',
+        }),
       ).rejects.toThrow('Legacy token format no longer accepted');
       expect(prisma.session.findUnique).not.toHaveBeenCalled();
     });
