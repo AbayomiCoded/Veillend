@@ -28,6 +28,7 @@ interface FakeRefreshToken {
   sessionId: string;
   tokenHash: string;
   jti: string;
+  familyId: string;
   expiresAt: Date;
   revokedAt: Date | null;
 }
@@ -202,17 +203,35 @@ class FakePrismaService {
     findUnique: ({ where }: { where: { tokenHash: string } }) => {
       return Promise.resolve(this.refreshTokens.get(where.tokenHash) ?? null);
     },
+    findMany: ({
+      where,
+      select,
+    }: {
+      where: { familyId?: string };
+      select?: { jti?: boolean };
+    }) => {
+      let results = [...this.refreshTokens.values()];
+      if (where.familyId !== undefined) {
+        results = results.filter((rt) => rt.familyId === where.familyId);
+      }
+      if (select?.jti) {
+        return Promise.resolve(results.map((rt) => ({ jti: rt.jti })));
+      }
+      return Promise.resolve(results);
+    },
     updateMany: ({
       where,
       data,
     }: {
-      where: { id: string; revokedAt: null };
+      where: { id?: string; familyId?: string; revokedAt: null | undefined };
       data: { revokedAt: Date };
     }) => {
       let count = 0;
       for (const [key, rt] of this.refreshTokens.entries()) {
-        if (rt.id !== where.id) continue;
-        if (rt.revokedAt !== null) continue;
+        if (where.id !== undefined && rt.id !== where.id) continue;
+        if (where.familyId !== undefined && rt.familyId !== where.familyId)
+          continue;
+        if (where.revokedAt === null && rt.revokedAt !== null) continue;
         this.refreshTokens.set(key, { ...rt, revokedAt: data.revokedAt });
         count += 1;
       }
@@ -228,6 +247,23 @@ class FakePrismaService {
     },
     findUnique: ({ where }: { where: { jti: string } }) => {
       return Promise.resolve(this.jtis.get(where.jti) ?? null);
+    },
+    updateMany: ({
+      where,
+      data,
+    }: {
+      where: { jti?: { in: string[] }; revokedAt?: null };
+      data: { revokedAt: Date };
+    }) => {
+      let count = 0;
+      for (const [key, jti] of this.jtis.entries()) {
+        if (where.jti?.in !== undefined && !where.jti.in.includes(key))
+          continue;
+        if (where.revokedAt === null && jti.revokedAt !== null) continue;
+        this.jtis.set(key, { ...jti, revokedAt: data.revokedAt });
+        count += 1;
+      }
+      return Promise.resolve({ count });
     },
   };
 

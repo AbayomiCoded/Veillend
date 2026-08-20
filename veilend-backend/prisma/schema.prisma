@@ -67,6 +67,7 @@ model RefreshToken {
   session       Session   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   tokenHash     String    @unique // SHA-256 of the opaque token; the raw token is never stored
   jti           String              // jti of the access token minted alongside this refresh token
+  familyId      String              // rotation-chain identifier; all tokens in one chain share this
   expiresAt     DateTime
   createdAt     DateTime  @default(now())
   lastRotatedAt DateTime  @default(now())
@@ -76,6 +77,7 @@ model RefreshToken {
 
   @@index([userId])
   @@index([sessionId])
+  @@index([familyId])
   @@index([expiresAt])
 }
 

@@ -10,10 +10,11 @@ This describes how clients authenticate with a Stellar wallet, inspect their act
 2. Client signs the nonce with their Stellar wallet.
 3. **`POST /auth/verify`** — client submits `walletAddress`, `nonce`, and `signature`. On a valid signature the server:
    - Finds or creates a `User` row for the wallet address.
-   - Signs a JWT (`walletAddress` claim, 7-day expiry).
-   - Persists a `Session` row (`userId`, `token`, `expiresAt`) in the database.
-   - Returns `{ accessToken }`.
+   - Signs a short-lived JWT (`walletAddress` claim, `iss`/`aud`/`jti`/`sid` claims, configurable expiry via `JWT_EXPIRES_IN`).
+   - Persists a `Session` row (`userId`, `token` = SHA-256(jwt), `expiresAt`) in the database.
+   - Returns `{ accessToken, refreshToken, sessionId, expiresAt, refreshExpiresAt }`.
 4. Client includes `Authorization: Bearer <accessToken>` on subsequent requests.
+5. The access token can be refreshed via `POST /auth/refresh` before it expires, receiving a new access/refresh pair while the old refresh token is revoked.
 
 ## 🔍 Session Introspection
 
@@ -46,5 +47,5 @@ Revocation is scoped to a single session (`jti`-equivalent: the `Session.token` 
 ## ⚙️ Notes
 
 - Every authenticated route (including `/admin/*`, which uses the same `JwtAuthGuard`) now requires an active database session, not just a validly-signed token. Revoking a session therefore also signs the wallet out of admin routes.
-- The JWT secret is read from the `JWT_SECRET` environment variable (falls back to a `dev_secret` default outside of production — set `JWT_SECRET` explicitly in any real deployment).
+- The JWT secret is read from the `JWT_SECRET` environment variable (falls back to a `dev_secret` default outside of production — set `JWT_SECRET` explicitly in any real deployment).  In production, `JWT_SECRET`, `JWT_EXPIRES_IN`, `JWT_ISSUER`, and `JWT_AUDIENCE` must all be set; the application will refuse to start with `dev_secret` in production.
 - Session persistence requires `DATABASE_URL` to be configured for the Prisma-backed Postgres connection (see `.env.example`).

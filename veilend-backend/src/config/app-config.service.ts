@@ -69,10 +69,19 @@ export class AppConfigService {
 
   get auth(): {
     jwtSecret: string;
+    jwtExpiresIn: string;
+    jwtIssuer: string;
+    jwtAudience: string;
     legacyAuthAllow: boolean;
   } {
     return {
       jwtSecret: this.configService.get<string>('JWT_SECRET', 'dev_secret'),
+      jwtExpiresIn: this.configService.get<string>('JWT_EXPIRES_IN', '15m'),
+      jwtIssuer: this.configService.get<string>('JWT_ISSUER', 'veilend'),
+      jwtAudience: this.configService.get<string>(
+        'JWT_AUDIENCE',
+        'veilend-app',
+      ),
       legacyAuthAllow: this.configService.get<boolean>(
         'LEGACY_AUTH_ALLOW',
         true,

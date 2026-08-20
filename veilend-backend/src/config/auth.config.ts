@@ -6,6 +6,21 @@ export class AuthConfig {
   @IsString()
   JWT_SECRET: string = 'dev_secret';
 
+  /** Access-token lifetime, e.g. '15m', '1h'. */
+  @IsOptional()
+  @IsString()
+  JWT_EXPIRES_IN: string = '15m';
+
+  /** Issuer claim embedded in every issued access JWT. */
+  @IsOptional()
+  @IsString()
+  JWT_ISSUER: string = 'veilend';
+
+  /** Audience claim embedded in every issued access JWT. */
+  @IsOptional()
+  @IsString()
+  JWT_AUDIENCE: string = 'veilend-app';
+
   // Accepts legacy long-lived JWTs (issued before refresh-token rotation,
   // carrying no `jti`/`sid` claims) via the pre-existing session-token
   // lookup path, logging a deprecation warning per use. Flip to 'false' once

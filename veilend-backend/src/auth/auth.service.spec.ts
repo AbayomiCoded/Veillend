@@ -5,11 +5,21 @@ import { Prisma } from '@prisma/client';
 import { AuthService } from './auth.service';
 import { WalletService } from '../wallet/wallet.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AppConfigService } from '../config/app-config.service';
 
 describe('AuthService', () => {
   let service: AuthService;
   let walletService: { verifySignature: jest.Mock };
   let jwtService: { sign: jest.Mock; decode: jest.Mock };
+  let configService: {
+    auth: {
+      jwtSecret: string;
+      jwtExpiresIn: string;
+      jwtIssuer: string;
+      jwtAudience: string;
+      legacyAuthAllow: boolean;
+    };
+  };
   let prisma: {
     withSerializable: jest.Mock;
     user: { upsert: jest.Mock; findUnique: jest.Mock };
@@ -34,18 +44,37 @@ describe('AuthService', () => {
     refreshToken: {
       create: jest.Mock;
       findUnique: jest.Mock;
+      findMany: jest.Mock;
       updateMany: jest.Mock;
       deleteMany: jest.Mock;
     };
     jtiRegistry: {
       create: jest.Mock;
+      findMany: jest.Mock;
+      updateMany: jest.Mock;
       deleteMany: jest.Mock;
     };
   };
 
   beforeEach(async () => {
     walletService = { verifySignature: jest.fn() };
-    jwtService = { sign: jest.fn(), decode: jest.fn() };
+    // jwtService.decode returns a payload with an `exp` claim so that
+    // issueTokenPair can derive accessExpiresAt without parsing durations.
+    jwtService = {
+      sign: jest.fn(),
+      decode: jest
+        .fn()
+        .mockReturnValue({ exp: Math.floor(Date.now() / 1000) + 900 }),
+    };
+    configService = {
+      auth: {
+        jwtSecret: 'test-secret',
+        jwtExpiresIn: '15m',
+        jwtIssuer: 'veilend',
+        jwtAudience: 'veilend-app',
+        legacyAuthAllow: true,
+      },
+    };
     prisma = {
       // Passthrough: runs the callback with a proxy that delegates to `prisma`.
       withSerializable: jest.fn(
@@ -73,11 +102,14 @@ describe('AuthService', () => {
       refreshToken: {
         create: jest.fn(),
         findUnique: jest.fn(),
+        findMany: jest.fn(),
         updateMany: jest.fn(),
         deleteMany: jest.fn(),
       },
       jtiRegistry: {
         create: jest.fn(),
+        findMany: jest.fn(),
+        updateMany: jest.fn(),
         deleteMany: jest.fn(),
       },
     };
@@ -88,6 +120,7 @@ describe('AuthService', () => {
         { provide: WalletService, useValue: walletService },
         { provide: JwtService, useValue: jwtService },
         { provide: PrismaService, useValue: prisma },
+        { provide: AppConfigService, useValue: configService },
       ],
     }).compile();
 
@@ -241,7 +274,7 @@ describe('AuthService', () => {
         update: {},
       });
 
-      // Access token: 15-minute JWT carrying walletAddress/sub/jti/sid.
+      // Access token: JWT carrying walletAddress/sub/jti/sid, iss, aud.
       expect(jwtService.sign).toHaveBeenCalledWith(
         expect.objectContaining({
           walletAddress: 'GABC',
@@ -250,7 +283,11 @@ describe('AuthService', () => {
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
           jti: expect.any(String),
         }),
-        { expiresIn: 15 * 60 },
+        {
+          expiresIn: '15m',
+          issuer: 'veilend',
+          audience: 'veilend-app',
+        },
       );
 
       // A JtiRegistry row and a hashed RefreshToken row are written for the pair.
@@ -271,18 +308,32 @@ describe('AuthService', () => {
             sessionId: 'session-1',
             // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
             tokenHash: expect.any(String),
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+            familyId: expect.any(String),
           }),
         }),
       );
 
-      // The session row's token/expiresAt are updated to the real access token.
+      // The session row's token is stored as a SHA-256 hash, not plaintext.
       expect(prisma.session.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'session-1' },
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-          data: expect.objectContaining({ token: 'signed-access-token' }),
+          data: expect.objectContaining({
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+            token: expect.any(String),
+          }),
         }),
       );
+      // Verify the stored token is NOT the plaintext access token.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const sessionUpdateCall = prisma.session.update.mock.calls.find(
+        (call: [{ where: { id: string } }]) => call[0].where.id === 'session-1',
+      );
+      if (sessionUpdateCall) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        expect(sessionUpdateCall[0].data.token).not.toBe('signed-access-token');
+      }
 
       expect(result).toEqual(
         expect.objectContaining({
@@ -306,6 +357,7 @@ describe('AuthService', () => {
       userId: 'user-1',
       sessionId: 'session-1',
       tokenHash: 'irrelevant-because-lookup-is-mocked',
+      familyId: 'family-1',
       expiresAt: new Date(Date.now() + 1000),
       revokedAt: null as Date | null,
     };
@@ -350,13 +402,23 @@ describe('AuthService', () => {
       });
       expect(prisma.jtiRegistry.create).toHaveBeenCalledTimes(1);
       expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
+      // The session token is updated to the SHA-256 hash of the new access token.
       expect(prisma.session.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'session-1' },
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-          data: expect.objectContaining({ token: 'signed-access-token' }),
+          data: expect.objectContaining({ token: expect.any(String) }),
         }),
       );
+      // Verify the stored token is not the plaintext access token.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const sessionUpdateCall = prisma.session.update.mock.calls.find(
+        (call: [{ where: { id: string } }]) => call[0].where.id === 'session-1',
+      );
+      if (sessionUpdateCall) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        expect(sessionUpdateCall[0].data.token).not.toBe('signed-access-token');
+      }
       expect(prisma.authAuditLog.create).toHaveBeenCalledWith(
         expect.objectContaining({
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -374,7 +436,7 @@ describe('AuthService', () => {
       );
     });
 
-    it('treats replay of an already-revoked token as family compromise and tears down every session', async () => {
+    it('treats replay of an already-revoked token as family compromise and revokes the entire family', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({
         ...existingRow,
         revokedAt: new Date(),
@@ -383,14 +445,26 @@ describe('AuthService', () => {
         id: 'user-1',
         walletAddress: 'GABC',
       });
-      prisma.session.deleteMany.mockResolvedValue({ count: 3 });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      prisma.refreshToken.findMany.mockResolvedValue([
+        { jti: 'jti-A' },
+        { jti: 'jti-B' },
+      ]);
+      prisma.jtiRegistry.updateMany.mockResolvedValue({ count: 2 });
 
       await expect(service.refreshTokens('deadbeef')).rejects.toThrow(
         'refresh_token_compromised_log_back_in',
       );
 
-      expect(prisma.session.deleteMany).toHaveBeenCalledWith({
-        where: { userId: 'user-1' },
+      // All refresh tokens in the family are revoked.
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { familyId: 'family-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) as Date },
+      });
+      // All associated jtis are revoked.
+      expect(prisma.jtiRegistry.updateMany).toHaveBeenCalledWith({
+        where: { jti: { in: ['jti-A', 'jti-B'] } },
+        data: { revokedAt: expect.any(Date) as Date },
       });
       expect(prisma.authAuditLog.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -412,15 +486,24 @@ describe('AuthService', () => {
         walletAddress: 'GABC',
       });
       // Someone else revoked it first between our read and our claim attempt.
-      prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
-      prisma.session.deleteMany.mockResolvedValue({ count: 1 });
+      prisma.refreshToken.updateMany
+        .mockResolvedValueOnce({ count: 0 })
+        .mockResolvedValueOnce({ count: 1 });
+      prisma.refreshToken.findMany.mockResolvedValue([{ jti: 'jti-A' }]);
+      prisma.jtiRegistry.updateMany.mockResolvedValue({ count: 1 });
 
       await expect(service.refreshTokens('deadbeef')).rejects.toThrow(
         'refresh_token_compromised_log_back_in',
       );
-      expect(prisma.session.deleteMany).toHaveBeenCalledWith({
-        where: { userId: 'user-1' },
-      });
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          data: expect.objectContaining({
+            walletAddress: 'GABC',
+            event: 'TOKEN_REFRESH_REUSE_DETECTED',
+          }),
+        }),
+      );
     });
   });
 
@@ -443,6 +526,13 @@ describe('AuthService', () => {
         userId: 'user-1',
         expiresAt: futureDate,
       });
+      // The token is hashed before lookup.
+      expect(prisma.session.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          where: { token: expect.any(String) },
+        }),
+      );
     });
 
     it('throws when session is not found (revoked)', async () => {

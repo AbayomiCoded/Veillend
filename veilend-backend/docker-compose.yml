@@ -35,6 +35,10 @@ services:
     environment:
       DATABASE_URL: postgresql://veilend:veilend@postgres:5432/veilend
       JWT_SECRET: dev_secret
+      JWT_EXPIRES_IN: 15m
+      JWT_ISSUER: veilend
+      JWT_AUDIENCE: veilend-app
+      NODE_ENV: development
       PORT: '3000'
       STELLAR_NETWORK: testnet
       STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org

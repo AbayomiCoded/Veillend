@@ -23,6 +23,9 @@ describe('Admin Session Revocation Integration', () => {
   const mockConfigService = {
     auth: {
       jwtSecret: 'test-secret',
+      jwtExpiresIn: '15m',
+      jwtIssuer: 'veilend',
+      jwtAudience: 'veilend-app',
       legacyAuthAllow: true,
     },
   };
@@ -121,6 +124,8 @@ describe('Admin Session Revocation Integration', () => {
     const validatedUser = await jwtStrategy.validate(mockRequest, {
       walletAddress: adminWallet,
       sub: mockUser.id,
+      iss: 'veilend',
+      aud: 'veilend-app',
     });
     expect(validatedUser.walletAddress).toBe(adminWallet);
 
@@ -136,6 +141,8 @@ describe('Admin Session Revocation Integration', () => {
       jwtStrategy.validate(mockRequest as never, {
         walletAddress: adminWallet,
         sub: mockUser.id,
+        iss: 'veilend',
+        aud: 'veilend-app',
       }),
     ).rejects.toThrow(
       new UnauthorizedException('Session not found or revoked'),

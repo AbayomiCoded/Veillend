@@ -2,6 +2,7 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PassportStrategy } from '@nestjs/passport';
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import type { Request } from 'express';
+import { createHash } from 'crypto';
 import { AppConfigService } from '../config/app-config.service';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -10,6 +11,12 @@ interface JwtPayload {
   sub: string; // userId
   jti?: string; // present on tokens issued by the refresh-token-rotation flow
   sid?: string; // sessionId, present alongside jti
+  iss?: string;
+  aud?: string | string[];
+}
+
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input).digest('hex');
 }
 
 @Injectable()
@@ -31,14 +38,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   /**
    * Called after JWT signature + expiry are verified by Passport.
    *
-   * New-format tokens (carrying `jti` + `sid`) are authorized against the
-   * JtiRegistry, which lets a single access token be revoked without
-   * deleting its whole session. Older long-form tokens minted before
-   * refresh-token rotation shipped carry neither claim; those fall back to
-   * the original raw-token session lookup, gated by `LEGACY_AUTH_ALLOW` so
-   * the fallback can be turned off once every client has upgraded.
+   * Manually validates `iss` and `aud` claims against configuration so we
+   * can return precise error messages.  New-format tokens (carrying `jti` +
+   * `sid`) are authorized against the JtiRegistry; older long-form tokens
+   * fall back to the hashed-session-token lookup, gated by
+   * `LEGACY_AUTH_ALLOW`.
    */
   async validate(req: Request, payload: JwtPayload) {
+    this.verifyIssuer(payload.iss);
+    this.verifyAudience(payload.aud);
+
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith('Bearer ')
       ? authHeader.slice(7)
@@ -57,6 +66,27 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     return this.validateLegacyToken(token);
+  }
+
+  private verifyIssuer(iss?: string): void {
+    const expected = this.configService.auth.jwtIssuer;
+    if (iss !== expected) {
+      this.logger.warn(
+        `JWT issuer mismatch: expected "${expected}", got "${iss}"`,
+      );
+      throw new UnauthorizedException('Invalid token issuer');
+    }
+  }
+
+  private verifyAudience(aud?: string | string[]): void {
+    const expected = this.configService.auth.jwtAudience;
+    const audiences = Array.isArray(aud) ? aud : aud ? [aud] : [];
+    if (!audiences.includes(expected)) {
+      this.logger.warn(
+        `JWT audience mismatch: expected "${expected}", got "${JSON.stringify(aud)}"`,
+      );
+      throw new UnauthorizedException('Invalid token audience');
+    }
   }
 
   private async validateJtiToken(
@@ -102,8 +132,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         'client should re-authenticate to receive a refresh token.',
     );
 
+    const tokenHash = sha256Hex(token);
     const session = await this.prisma.session.findUnique({
-      where: { token },
+      where: { token: tokenHash },
       include: { user: true },
     });
 

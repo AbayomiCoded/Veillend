@@ -1,9 +1,11 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 
 import { JwtService } from '@nestjs/jwt';
+import type { StringValue } from 'ms';
 
 import { WalletService } from '../wallet/wallet.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AppConfigService } from '../config/app-config.service';
 import { Prisma } from '@prisma/client';
 
 import { randomBytes, randomUUID, createHash } from 'crypto';
@@ -11,17 +13,14 @@ import { randomBytes, randomUUID, createHash } from 'crypto';
 /** How long a nonce remains valid (5 minutes) */
 const NONCE_TTL_MS = 5 * 60 * 1000;
 
-/** Access token lifetime: short-lived, the only thing accepted by Bearer auth. */
-const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
-
 /** Refresh token lifetime: long-lived, opaque, one-time-use. */
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Entropy of the opaque refresh token (bytes, before hex-encoding). */
 const REFRESH_TOKEN_BYTES = 64;
 
-function hashRefreshToken(raw: string): string {
-  return createHash('sha256').update(raw).digest('hex');
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input).digest('hex');
 }
 
 interface IssuedTokenPair {
@@ -39,6 +38,7 @@ export class AuthService {
     private walletService: WalletService,
     private jwtService: JwtService,
     private prisma: PrismaService,
+    private configService: AppConfigService,
   ) {}
 
   /**
@@ -96,12 +96,14 @@ export class AuthService {
   /**
    * Mint a fresh access/refresh token pair for a session, inside `tx`.
    *
-   * The access token is a short-lived (15min) JWT carrying a `jti` + `sid`
-   * (session id); a matching `JtiRegistry` row is written so a single
-   * access token can be revoked without touching the rest of the session.
-   * The refresh token is an opaque, one-time-use, high-entropy random value
-   * (never a JWT) stored hashed (SHA-256) — the raw value is only ever
-   * returned to the caller, never persisted.
+   * The access token is a short-lived JWT carrying a `jti` + `sid`
+   * (session id), `iss`, and `aud` claims; a matching `JtiRegistry` row
+   * is written so a single access token can be revoked without touching
+   * the rest of the session.  The refresh token is an opaque,
+   * one-time-use, high-entropy random value (never a JWT) stored hashed
+   * (SHA-256) — the raw value is only ever returned to the caller, never
+   * persisted.  All refresh tokens in one rotation chain share a
+   * `familyId` so that reuse detection can revoke the whole chain.
    */
   private async issueTokenPair(
     tx: Prisma.TransactionClient,
@@ -109,14 +111,13 @@ export class AuthService {
       userId: string;
       walletAddress: string;
       sessionId: string;
+      familyId: string;
       ip?: string;
       userAgent?: string;
     },
   ): Promise<IssuedTokenPair> {
     const jti = randomUUID();
-    const accessExpiresAt = new Date(
-      Date.now() + ACCESS_TOKEN_TTL_SECONDS * 1000,
-    );
+    const { jwtExpiresIn, jwtIssuer, jwtAudience } = this.configService.auth;
 
     const accessToken = this.jwtService.sign(
       {
@@ -125,8 +126,17 @@ export class AuthService {
         jti,
         sid: params.sessionId,
       },
-      { expiresIn: ACCESS_TOKEN_TTL_SECONDS },
+      {
+        expiresIn: jwtExpiresIn as StringValue,
+        issuer: jwtIssuer,
+        audience: jwtAudience,
+      },
     );
+
+    // Derive the concrete expiry from the signed JWT so we don't need to
+    // parse the duration string ourselves.
+    const decoded = this.jwtService.decode<{ exp: number }>(accessToken);
+    const accessExpiresAt = new Date((decoded?.exp ?? 0) * 1000);
 
     await tx.jtiRegistry.create({
       data: {
@@ -144,8 +154,9 @@ export class AuthService {
       data: {
         userId: params.userId,
         sessionId: params.sessionId,
-        tokenHash: hashRefreshToken(refreshToken),
+        tokenHash: sha256Hex(refreshToken),
         jti,
+        familyId: params.familyId,
         expiresAt: refreshExpiresAt,
         ip: params.ip,
         userAgent: params.userAgent,
@@ -250,17 +261,23 @@ export class AuthService {
           },
         });
 
+        const familyId = randomUUID();
+
         const pair = await this.issueTokenPair(tx, {
           userId: user.id,
           walletAddress,
           sessionId: session.id,
+          familyId,
           ip,
           userAgent,
         });
 
         await tx.session.update({
           where: { id: session.id },
-          data: { token: pair.accessToken, expiresAt: pair.accessExpiresAt },
+          data: {
+            token: sha256Hex(pair.accessToken),
+            expiresAt: pair.accessExpiresAt,
+          },
         });
 
         return {
@@ -323,7 +340,7 @@ export class AuthService {
     userAgent?: string,
     correlationId?: string,
   ) {
-    const tokenHash = hashRefreshToken(refreshTokenRaw);
+    const tokenHash = sha256Hex(refreshTokenRaw);
 
     const existing = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
@@ -336,6 +353,7 @@ export class AuthService {
     if (existing.revokedAt) {
       await this.handleRefreshReuse(
         existing.userId,
+        existing.familyId,
         ip,
         userAgent,
         correlationId,
@@ -383,6 +401,7 @@ export class AuthService {
           userId: existing.userId,
           walletAddress: user.walletAddress,
           sessionId: existing.sessionId,
+          familyId: existing.familyId,
           ip,
           userAgent,
         });
@@ -390,7 +409,7 @@ export class AuthService {
         await tx.session.update({
           where: { id: existing.sessionId },
           data: {
-            token: pair.accessToken,
+            token: sha256Hex(pair.accessToken),
             expiresAt: pair.accessExpiresAt,
             lastSeenAt: new Date(),
           },
@@ -413,6 +432,7 @@ export class AuthService {
         // indistinguishable from a replay, so respond the same way.
         await this.handleRefreshReuse(
           existing.userId,
+          existing.familyId,
           ip,
           userAgent,
           correlationId,
@@ -438,23 +458,43 @@ export class AuthService {
   }
 
   /**
-   * Refresh-token-family compromise response: tear down every session the
-   * user has (cascades to all RefreshToken/JtiRegistry rows via the FK), so
-   * a leaked-and-replayed refresh token can't be used again even for the
-   * few minutes its paired access token would otherwise remain valid.
+   * Refresh-token-family compromise response: revoke every refresh token
+   * in the same rotation chain and all associated JtiRegistry entries, so
+   * a leaked-and-replayed refresh token can't be used again and any access
+   * tokens minted alongside those refresh tokens are immediately rejected.
    */
   private async handleRefreshReuse(
     userId: string,
+    familyId: string,
     ip?: string,
     userAgent?: string,
     correlationId?: string,
   ): Promise<void> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
 
-    await this.prisma.session.deleteMany({ where: { userId } });
+    // Revoke every refresh token in the compromised family.
+    await this.prisma.refreshToken.updateMany({
+      where: { familyId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    // Revoke all JtiRegistry entries associated with those refresh tokens
+    // so that any access tokens minted alongside them are immediately
+    // rejected by JwtStrategy.
+    const familyTokens = await this.prisma.refreshToken.findMany({
+      where: { familyId },
+      select: { jti: true },
+    });
+    const jtiIds = familyTokens.map((t) => t.jti);
+    if (jtiIds.length > 0) {
+      await this.prisma.jtiRegistry.updateMany({
+        where: { jti: { in: jtiIds } },
+        data: { revokedAt: new Date() },
+      });
+    }
 
     this.logger.warn(
-      `Refresh token reuse detected for user ${userId}; all sessions revoked`,
+      `Refresh token reuse detected for user ${userId}, family ${familyId}; all tokens in family revoked`,
     );
 
     if (user) {
@@ -551,10 +591,14 @@ export class AuthService {
    * Validate an active session by its JWT token.
    * Returns session info if the session exists and hasn't expired.
    * Throws if the session has been revoked or is not found.
+   *
+   * The stored token is a SHA-256 hash of the original JWT, so we hash
+   * the presented token before looking it up.
    */
   async validateSession(token: string) {
+    const tokenHash = sha256Hex(token);
     const session = await this.prisma.session.findUnique({
-      where: { token },
+      where: { token: tokenHash },
       include: { user: true },
     });
 
