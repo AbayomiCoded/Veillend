@@ -23,16 +23,16 @@ pub use flash_loan::{
 };
 
 /// Increment this only when a contract interface change requires consumers to adapt.
-pub const CONTRACT_VERSION: u32 = 5;
+pub const CONTRACT_VERSION: u32 = 6;
 
 /// Increment this only when the serialized `DataKey` or stored value layout changes.
-pub const STORAGE_SCHEMA_VERSION: u32 = 4;
+pub const STORAGE_SCHEMA_VERSION: u32 = 5;
 
 /// Values <= this amount after repay/withdraw are rounded to zero.
 pub const DUST_THRESHOLD: i128 = 100;
 
 /// A compact, stable identifier for the current `DataKey` storage layout.
-const STORAGE_SCHEMA_ID: Symbol = symbol_short!("VLENDV4");
+const STORAGE_SCHEMA_ID: Symbol = symbol_short!("VLENDV5");
 
 /// Default delay (in ledgers) before a proposed privileged action becomes
 /// executable. ~5 minutes on Futurenet.
@@ -123,9 +123,15 @@ pub enum DataKey {
     /// Flash loan configuration for an asset (stored in persistent storage)
     FlashLoanState(Address),
 
-    /// Per-asset interest-rate model parameters (kink/slope curve).
-    /// Falls back to `interest::DEFAULT_PARAMS` when not set.
+    /// Per-asset interest-rate model parameters (kink/slope curve),
+    /// including `reserve_factor_bps`. Falls back to
+    /// `interest::DEFAULT_PARAMS` when not set.
     InterestParams(Address),
+    /// Lifetime (monotonically increasing, never decremented) total of
+    /// reserve interest ever accrued for an asset — an accounting counter
+    /// for indexers, distinct from the current withdrawable balance
+    /// (`AssetReserve.protocol_fees`).
+    LifetimeReserveEarned(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +205,7 @@ pub enum ReserveUpdateKind {
     Withdraw,
     FeeAccrual,
     InterestAccrual,
+    ReservesWithdrawn,
 }
 
 /// The class of privileged mutation a pending action will perform. Used to
@@ -212,6 +219,7 @@ pub enum ActionKind {
     SetMinCollateralRatio,
     SetPaused,
     RecordProtocolFee,
+    WithdrawReserves,
 }
 
 /// The arguments captured when a privileged action is proposed. Stored in
@@ -226,6 +234,8 @@ pub enum ActionPayload {
     SetMinCollateralRatio(u32),
     SetPaused(bool),
     RecordProtocolFee(Address, i128),
+    /// (asset, to, amount)
+    WithdrawReserves(Address, Address, i128),
 }
 
 /// A proposed privileged action awaiting its timelock window.
@@ -433,6 +443,26 @@ pub struct LiquidationClipped {
     #[topic]
     pub user: Address,
     pub by_bps: u32,
+}
+
+#[contractevent(topics = ["veillend", "reserves_accrued"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservesAccrued {
+    #[topic]
+    pub asset: Address,
+    pub amount: i128,
+    pub new_total_reserve: i128,
+}
+
+#[contractevent(topics = ["veillend", "reserves_withdrawn"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservesWithdrawn {
+    #[topic]
+    pub asset: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+    pub executed_by: Address,
 }
 
 #[contractevent(topics = ["veillend", "circuit_breaker"])]
@@ -1330,6 +1360,63 @@ impl VeilLendContract {
             .set(&DataKey::MaxProtocolFeeBps, &bps);
     }
 
+    /// Returns the current withdrawable protocol reserve balance for
+    /// `asset`. No auth required — read-only, for indexers.
+    pub fn get_reserves(env: Env, asset: Address) -> i128 {
+        Self::read_asset_reserve(&env, &asset).protocol_fees
+    }
+
+    /// Returns `(current_reserve_balance, lifetime_reserve_earned)` for
+    /// `asset`. No auth required — read-only, for indexers.
+    pub fn get_reserves_and_lifetime(env: Env, asset: Address) -> (i128, i128) {
+        let current = Self::read_asset_reserve(&env, &asset).protocol_fees;
+        let lifetime = Self::read_lifetime_reserve_earned(&env, &asset);
+        (current, lifetime)
+    }
+
+    /// Proposes withdrawing `amount` of `asset`'s protocol reserve to `to`
+    /// (timelocked). Returns the action id. Admin-only.
+    ///
+    /// Withdrawal is deliberately not directly callable — routing it through
+    /// `propose_action`/`execute_action` (the same S11 multi-admin +
+    /// timelock mechanism guarding every other critical mutation) means no
+    /// single admin key can unilaterally drain accumulated reserves; a
+    /// window exists for the rest of the admin set to notice and cancel a
+    /// malicious or mistaken proposal before it executes.
+    pub fn propose_withdraw_reserves(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        to: Address,
+        amount: i128,
+    ) -> u64 {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::propose_action(
+            &env,
+            &admin,
+            ActionKind::WithdrawReserves,
+            ActionPayload::WithdrawReserves(asset, to, amount),
+        )
+    }
+
+    /// Executes a previously proposed withdraw_reserves action, if its
+    /// timelock has elapsed.
+    pub fn execute_withdraw_reserves(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, &admin);
+        admin.require_auth();
+
+        Self::execute_action(&env, &admin, action_id, ActionKind::WithdrawReserves);
+    }
+
+    /// Cancels a pending withdraw_reserves action.
+    pub fn cancel_withdraw_reserves(env: Env, admin: Address, action_id: u64) {
+        admin.require_auth();
+
+        Self::cancel_action(&env, &admin, action_id, ActionKind::WithdrawReserves);
+    }
+
     pub fn min_collateral_ratio_bps(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -1700,6 +1787,14 @@ impl VeilLendContract {
                 Self::require_supported_asset(env, asset);
                 Self::require_positive_amount(env, *amount);
             }
+            ActionPayload::WithdrawReserves(asset, _to, amount) => {
+                Self::require_supported_asset(env, asset);
+                Self::require_positive_amount(env, *amount);
+                let available = Self::read_asset_reserve(env, asset).protocol_fees;
+                if *amount > available {
+                    panic_with_error!(env, VeilLendError::InsufficientReserve);
+                }
+            }
         }
     }
 
@@ -1810,6 +1905,9 @@ impl VeilLendContract {
             ActionPayload::SetPaused(paused) => Self::apply_set_paused(env, admin, *paused),
             ActionPayload::RecordProtocolFee(asset, amount) => {
                 Self::apply_record_protocol_fee(env, asset, *amount)
+            }
+            ActionPayload::WithdrawReserves(asset, to, amount) => {
+                Self::apply_withdraw_reserves(env, admin, asset, to, *amount)
             }
         }
     }
@@ -2055,6 +2153,52 @@ impl VeilLendContract {
         Self::publish_asset_reserve_updated(env, asset, &reserve, ReserveUpdateKind::FeeAccrual);
     }
 
+    /// Applies a validated withdraw_reserves action: debits `amount` from
+    /// `asset`'s withdrawable protocol reserve (`AssetReserve.protocol_fees`
+    /// and `total_balance`). `amount <= reserves[asset]` is enforced by
+    /// `validate_payload` before this runs (both at propose time and again
+    /// here at execute time, in case reserves shrank in between).
+    ///
+    /// Internal accounting only, matching every other entrypoint in this
+    /// contract (deposit/borrow/repay/withdraw/flash_loan): `to` receives no
+    /// real token transfer here, because this contract does not yet hold
+    /// real token custody for any balance (see `flash_loan`'s repayment-model
+    /// doc comment). `to` is recorded in the emitted event so an indexer
+    /// or a follow-up token-custody migration can reconcile who reserves
+    /// were credited to.
+    fn apply_withdraw_reserves(
+        env: &Env,
+        admin: &Address,
+        asset: &Address,
+        to: &Address,
+        amount: i128,
+    ) {
+        Self::accrue_and_persist_interest(env, asset);
+
+        let mut reserve = Self::read_asset_reserve(env, asset);
+        if amount > reserve.protocol_fees {
+            panic_with_error!(env, VeilLendError::InsufficientReserve);
+        }
+
+        reserve.total_balance -= amount;
+        reserve.protocol_fees -= amount;
+        Self::write_asset_reserve(env, asset, &reserve);
+
+        ReservesWithdrawn {
+            asset: asset.clone(),
+            to: to.clone(),
+            amount,
+            executed_by: admin.clone(),
+        }
+        .publish(env);
+        Self::publish_asset_reserve_updated(
+            env,
+            asset,
+            &reserve,
+            ReserveUpdateKind::ReservesWithdrawn,
+        );
+    }
+
     fn read_asset_reserve(env: &Env, asset: &Address) -> AssetReserve {
         env.storage()
             .persistent()
@@ -2069,6 +2213,13 @@ impl VeilLendContract {
         env.storage()
             .persistent()
             .set(&DataKey::AssetReserve(asset.clone()), reserve);
+    }
+
+    fn read_lifetime_reserve_earned(env: &Env, asset: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LifetimeReserveEarned(asset.clone()))
+            .unwrap_or(0)
     }
 
     fn publish_asset_reserve_updated(
@@ -2167,6 +2318,7 @@ impl VeilLendContract {
             .persistent()
             .get(&DataKey::InterestParams(asset.clone()))
             .unwrap_or(interest::DEFAULT_PARAMS);
+        let reserve_factor_bps = params.reserve_factor_bps;
 
         let result =
             interest::compute_accrual(env, &state, &params, total_supplied, total_borrowed, now);
@@ -2199,7 +2351,39 @@ impl VeilLendContract {
         if result.dust_to_reserves > 0 {
             let mut reserve = Self::read_asset_reserve(env, asset);
             reserve.total_balance += result.dust_to_reserves;
-            Self::write_asset_reserve(env, asset, &reserve);
+
+            // With reserve_factor_bps == 0 (the default, and every asset's
+            // behavior before this reserve-accumulation feature existed)
+            // this whole gap is pure integer-truncation dust: it stays
+            // folded into total_balance only, exactly as before, with no
+            // change to protocol_fees, the lifetime counter, or events —
+            // preserving byte-for-byte backward compatibility.
+            //
+            // Once an asset has a nonzero reserve_factor_bps, this gap is
+            // (truncation dust + the deliberate reserve-factor skim); at
+            // that point it's tracked explicitly as withdrawable protocol
+            // reserve so it shows up on balance sheets instead of silently
+            // inflating total_balance with no corresponding claim.
+            if reserve_factor_bps > 0 {
+                reserve.protocol_fees += result.dust_to_reserves;
+                Self::write_asset_reserve(env, asset, &reserve);
+
+                let lifetime_reserve_earned =
+                    Self::read_lifetime_reserve_earned(env, asset) + result.dust_to_reserves;
+                env.storage().persistent().set(
+                    &DataKey::LifetimeReserveEarned(asset.clone()),
+                    &lifetime_reserve_earned,
+                );
+
+                ReservesAccrued {
+                    asset: asset.clone(),
+                    amount: result.dust_to_reserves,
+                    new_total_reserve: reserve.protocol_fees,
+                }
+                .publish(env);
+            } else {
+                Self::write_asset_reserve(env, asset, &reserve);
+            }
         }
 
         // Publish a per-asset interest accrual event only when interest
@@ -2525,9 +2709,9 @@ mod tests {
     fn test_contract_metadata_identifies_current_storage_shape() {
         let metadata = VeilLendContract::contract_metadata(Env::default());
 
-        assert_eq!(metadata.contract_version, 5);
-        assert_eq!(metadata.storage_schema_version, 4);
-        assert_eq!(metadata.storage_schema_id, symbol_short!("VLENDV4"));
+        assert_eq!(metadata.contract_version, 6);
+        assert_eq!(metadata.storage_schema_version, 5);
+        assert_eq!(metadata.storage_schema_id, symbol_short!("VLENDV5"));
     }
 
     #[test]
