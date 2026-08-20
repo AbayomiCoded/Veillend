@@ -12,7 +12,6 @@ import { ListSkeleton } from '../components/Skeletons';
 const { width } = Dimensions.get('window');
 const isSmallScreen = width < 380;
 const CARD_WIDTH = width - 48; // Padding 24 * 2
-const DEFAULT_PROFILE_IMAGE = 'https://i.pravatar.cc/100?img=5';
 
 export default function DashboardScreen({ navigation }: any) {
   const {
@@ -40,6 +39,9 @@ export default function DashboardScreen({ navigation }: any) {
     pendingTransactions,
     refreshDashboard,
     isOnline,
+    backendSlow,
+    dismissBackendSlowNotice,
+    cancelPendingRequests,
   } = useStore();
   const [initialLoad, setInitialLoad] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -61,17 +63,34 @@ export default function DashboardScreen({ navigation }: any) {
       <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0F172A' }}>
         <ActivityIndicator size="large" color="#A855F7" />
         <Text style={{ color: '#94A3B8', marginTop: 12 }}>Loading dashboard...</Text>
+        {/* If the backend hangs (RPC stall, DB lock contention) fetchPortfolio
+            /fetchTransactions still time out on their own after 15s each, but
+            the user shouldn't have to wait that out with no way forward. */}
+        <TouchableOpacity
+          onPress={() => {
+            cancelPendingRequests();
+            setInitialLoad(false);
+          }}
+          style={styles.cancelLoadingBtn}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel loading"
+        >
+          <Text style={styles.cancelLoadingText}>Cancel Loading</Text>
+        </TouchableOpacity>
       </View>
     );
   }
   const defaultUsername = address ? shortenAddress(address) : 'Guest';
   const username = profileName ?? defaultUsername;
-  const avatarUri = profileImage ?? DEFAULT_PROFILE_IMAGE;
+  // No third-party CDN fallback (issue #344 — every load leaked the user's
+  // IP/UA to pravatar.cc). undefined renders a local Ionicons glyph instead.
+  const avatarUri = profileImage ?? undefined;
 
   const handleLogout = () => {
     setProfileVisible(false);
     // logout() already clears profileName/profileImage (state + persisted
-    // SecureStore keys) — see store.ts. Fire-and-forget: navigation resets
+    // SecureStore keys) and aborts any in-flight dashboard fetches first
+    // (issue #344) — see store.ts. Fire-and-forget: navigation resets
     // immediately so the user is never stuck waiting for the network call.
     logout().catch(() => {});
     // Fully reset the navigation stack to avoid navigator-scope issues
@@ -234,10 +253,14 @@ export default function DashboardScreen({ navigation }: any) {
             accessibilityRole="button"
             accessibilityLabel="Open profile menu"
           >
-            <Image 
-              source={{ uri: avatarUri }} 
-              style={styles.avatar} 
-            />
+            {avatarUri ? (
+              <Image
+                source={{ uri: avatarUri }}
+                style={styles.avatar}
+              />
+            ) : (
+              <Ionicons name="person-circle" size={48} color="#A1A1A1" />
+            )}
           </TouchableOpacity>
         </View>
       </View>
@@ -249,8 +272,12 @@ export default function DashboardScreen({ navigation }: any) {
         lastSyncedAt={lastProtocolSyncAt}
         isRefreshing={protocolStatusLoading}
         isOnline={isOnline}
+        backendSlow={backendSlow}
         onReconnect={handleLogout}
         onRetrySync={handleStatusRetry}
+        onDismiss={(id) => {
+          if (id === 'backend-slow') dismissBackendSlowNotice();
+        }}
       />
 
       {/* Aggregate hydration error with retry */}
@@ -289,7 +316,11 @@ export default function DashboardScreen({ navigation }: any) {
 
                 {/* Profile summary */}
                 <View style={styles.profileSummary}>
-                  <Image source={{ uri: avatarUri }} style={styles.largeAvatar} />
+                  {avatarUri ? (
+                    <Image source={{ uri: avatarUri }} style={styles.largeAvatar} />
+                  ) : (
+                    <Ionicons name="person-circle" size={80} color="#A1A1A1" />
+                  )}
                   <Text style={styles.profileSummaryName}>{username}</Text>
                 </View>
 
@@ -430,6 +461,19 @@ export default function DashboardScreen({ navigation }: any) {
 }
 
 const styles = StyleSheet.create({
+  cancelLoadingBtn: {
+    marginTop: 24,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  cancelLoadingText: {
+    color: '#A1A1A1',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   container: {
     flex: 1,
     backgroundColor: '#0A0A0A',

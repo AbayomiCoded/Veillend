@@ -85,3 +85,28 @@ test('does not report an offline banner when online (default)', () => {
 
   assert.equal(banners.some((b) => b.id === 'offline'), false);
 });
+
+test('reports a dismissible backend-slow banner when backendSlow is true (issue #344)', () => {
+  const banners = getProtocolStatusBanners({
+    expectedNetwork: 'testnet',
+    currentNetwork: 'testnet',
+    walletConnected: true,
+    backendSlow: true,
+  });
+
+  assert.equal(banners.length, 1);
+  assert.equal(banners[0].id, 'backend-slow');
+  assert.equal(banners[0].severity, 'warning');
+  assert.equal(banners[0].dismissible, true);
+  assert.equal(banners[0].actionLabel, undefined);
+});
+
+test('does not report a backend-slow banner by default', () => {
+  const banners = getProtocolStatusBanners({
+    expectedNetwork: 'testnet',
+    currentNetwork: 'testnet',
+    walletConnected: true,
+  });
+
+  assert.equal(banners.some((b) => b.id === 'backend-slow'), false);
+});

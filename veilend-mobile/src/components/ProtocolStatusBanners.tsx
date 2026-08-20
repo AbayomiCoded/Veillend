@@ -1,7 +1,7 @@
 import React from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { getProtocolStatusBanners } from '../utils/protocolStatus';
+import { getProtocolStatusBanners, ProtocolStatusBannerId } from '../utils/protocolStatus';
 
 type ProtocolStatusBannersProps = {
   expectedNetwork: string;
@@ -10,8 +10,15 @@ type ProtocolStatusBannersProps = {
   lastSyncedAt?: number | null;
   isRefreshing?: boolean;
   isOnline?: boolean;
+  // True once a dashboard fetch has timed out (issue #344) — surfaces a
+  // dismissible warning banner instead of just leaving the user to notice
+  // the error screen on their own.
+  backendSlow?: boolean;
   onReconnect: () => void;
   onRetrySync: () => void;
+  // Called when the user dismisses a `dismissible` banner (currently only
+  // `backend-slow`). The caller owns clearing the underlying state.
+  onDismiss?: (id: ProtocolStatusBannerId) => void;
 };
 
 export default function ProtocolStatusBanners({
@@ -21,8 +28,10 @@ export default function ProtocolStatusBanners({
   lastSyncedAt,
   isRefreshing = false,
   isOnline = true,
+  backendSlow = false,
   onReconnect,
   onRetrySync,
+  onDismiss,
 }: ProtocolStatusBannersProps) {
   const banners = getProtocolStatusBanners({
     expectedNetwork,
@@ -30,6 +39,7 @@ export default function ProtocolStatusBanners({
     walletConnected,
     lastSyncedAt,
     isOnline,
+    backendSlow,
   });
 
   if (banners.length === 0) {
@@ -41,12 +51,15 @@ export default function ProtocolStatusBanners({
       {banners.map((banner) => {
         const isWalletBanner = banner.id === 'wallet-disconnected';
         const isOfflineBanner = banner.id === 'offline';
+        const isBackendSlowBanner = banner.id === 'backend-slow';
         const onPress = isWalletBanner ? onReconnect : onRetrySync;
         const iconName = isWalletBanner
           ? 'wallet-outline'
           : isOfflineBanner
             ? 'cloud-offline-outline'
-            : 'warning-outline';
+            : isBackendSlowBanner
+              ? 'time-outline'
+              : 'warning-outline';
 
         return (
           <View
@@ -73,6 +86,17 @@ export default function ProtocolStatusBanners({
                 <Text style={styles.actionText}>
                   {isRefreshing && !isWalletBanner ? 'Checking...' : banner.actionLabel}
                 </Text>
+              </TouchableOpacity>
+            ) : null}
+            {banner.dismissible ? (
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel={`Dismiss: ${banner.title}`}
+                onPress={() => onDismiss?.(banner.id)}
+                style={styles.dismiss}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Ionicons name="close" size={18} color="rgba(255,255,255,0.7)" />
               </TouchableOpacity>
             ) : null}
           </View>
@@ -129,5 +153,8 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 12,
     fontWeight: '700',
+  },
+  dismiss: {
+    padding: 2,
   },
 });
