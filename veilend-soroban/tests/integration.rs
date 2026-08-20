@@ -2193,11 +2193,7 @@ fn setup_with_asset(env: &Env) -> (VeilLendContractClient, Address, Address) {
 /// Sets interest params equivalent to the pre-#311 hardcoded rate model
 /// (BASE_RATE_BPS=200, SLOPE_BPS=2000, no kink, no reserve factor).
 /// Use this in tests that were written against the old hardcoded rates.
-fn set_legacy_interest_params(
-    client: &VeilLendContractClient,
-    admin: &Address,
-    asset: &Address,
-) {
+fn set_legacy_interest_params(client: &VeilLendContractClient, admin: &Address, asset: &Address) {
     use veillend_contract::InterestParams;
     client.set_interest_params(
         admin,
@@ -2228,9 +2224,8 @@ fn test_interest_params_default_zero_accrual() {
     let state_before = client.get_interest_state(&asset);
 
     // Advance ledger time by one year.
-    env.ledger().set_timestamp(
-        env.ledger().timestamp() + veillend_contract::SECONDS_PER_YEAR as u64,
-    );
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + veillend_contract::SECONDS_PER_YEAR as u64);
 
     let state_after = client.get_interest_state(&asset);
 
@@ -2280,9 +2275,8 @@ fn test_interest_params_kink_model_above_kink() {
     client.borrow(&user, &asset, &asset, &total_borrow);
 
     // Advance by one year and force accrual.
-    env.ledger().set_timestamp(
-        env.ledger().timestamp() + veillend_contract::SECONDS_PER_YEAR as u64,
-    );
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + veillend_contract::SECONDS_PER_YEAR as u64);
     client.accrue_interest(&asset);
 
     // Expected: annual borrow rate = 2000*8000/10000 + 4000*(9000-8000)/10000

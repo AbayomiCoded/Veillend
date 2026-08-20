@@ -4,7 +4,7 @@ mod interest;
 
 // Re-export accrual constants so integration tests and external callers can
 // use them without reaching into the private `interest` module.
-pub use interest::{DEFAULT_PARAMS as INTEREST_DEFAULT_PARAMS, SECONDS_PER_YEAR, RATE_SCALE};
+pub use interest::{DEFAULT_PARAMS as INTEREST_DEFAULT_PARAMS, RATE_SCALE, SECONDS_PER_YEAR};
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
@@ -1565,12 +1565,7 @@ impl VeilLendContract {
     ///
     /// Accrues interest for the asset first so the rate change takes effect
     /// from the current timestamp, not retroactively.
-    pub fn set_interest_params(
-        env: Env,
-        admin: Address,
-        asset: Address,
-        params: InterestParams,
-    ) {
+    pub fn set_interest_params(env: Env, admin: Address, asset: Address, params: InterestParams) {
         Self::require_admin(&env, &admin);
         Self::require_supported_asset(&env, &asset);
         admin.require_auth();

@@ -61,14 +61,21 @@ pub fn utilization_ratio(env: &Env, total_supplied: i128, total_borrowed: i128) 
 ///
 /// Returns annual bps (not per-second) to avoid lossy integer truncation
 /// before the elapsed-seconds multiplication in `compute_accrual`.
-pub fn borrow_rate_bps_per_second(env: &Env, params: &InterestParams, utilization_bps: u32) -> i128 {
+pub fn borrow_rate_bps_per_second(
+    env: &Env,
+    params: &InterestParams,
+    utilization_bps: u32,
+) -> i128 {
     let util = utilization_bps as i128;
     let base = params.base_rate_bps as i128;
     let kink = params.kink_util_bps as i128;
     let slope1 = params.slope1_bps as i128;
     let slope2 = params.slope2_bps as i128;
 
-    let annual = if util <= kink {
+    // NOTE: We return annual bps here. The name is kept for API compatibility.
+    // Callers (compute_accrual) fold the SECONDS_PER_YEAR denominator into the
+    // growth factor computation to avoid intermediate integer truncation to zero.
+    if util <= kink {
         slope1
             .checked_mul(util)
             .and_then(|v| v.checked_div(10_000))
@@ -86,12 +93,7 @@ pub fn borrow_rate_bps_per_second(env: &Env, params: &InterestParams, utilizatio
         base.checked_add(kink_piece)
             .and_then(|v| v.checked_add(excess_piece))
             .unwrap_or_else(|| panic_with_error!(env, VeilLendError::ArithmeticOverflow))
-    };
-
-    // NOTE: We return annual bps here. The name is kept for API compatibility.
-    // Callers (compute_accrual) fold the SECONDS_PER_YEAR denominator into the
-    // growth factor computation to avoid intermediate integer truncation to zero.
-    annual
+    }
 }
 
 /// Computes the **annual** supply rate in basis points.
@@ -345,8 +347,7 @@ mod tests {
     fn elapsed_zero_is_noop() {
         let env = Env::default();
         let state = fresh_state();
-        let result =
-            compute_accrual(&env, &state, &DEFAULT_PARAMS, 1_000_000, 500_000, 0);
+        let result = compute_accrual(&env, &state, &DEFAULT_PARAMS, 1_000_000, 500_000, 0);
         assert_eq!(result.state.supply_index, state.supply_index);
         assert_eq!(result.state.borrow_index, state.borrow_index);
         assert_eq!(result.interest_to_suppliers, 0);
@@ -357,9 +358,7 @@ mod tests {
     fn zero_supply_yields_zero_growth_with_default_params() {
         let env = Env::default();
         let state = fresh_state();
-        let result = compute_accrual(
-            &env, &state, &DEFAULT_PARAMS, 0, 0, SECONDS_PER_YEAR as u64,
-        );
+        let result = compute_accrual(&env, &state, &DEFAULT_PARAMS, 0, 0, SECONDS_PER_YEAR as u64);
         assert_eq!(result.interest_to_suppliers, 0);
         assert_eq!(result.interest_to_borrowers, 0);
     }
@@ -411,13 +410,11 @@ mod tests {
         // growth = annual * elapsed * RATE_SCALE / (10_000 * SECONDS_PER_YEAR)
         //        = 2000 * RATE_SCALE / 10_000
         let denominator = 10_000i128 * SECONDS_PER_YEAR;
-        let borrow_growth =
-            2_000i128 * SECONDS_PER_YEAR as i128 * RATE_SCALE / denominator;
+        let borrow_growth = 2_000i128 * SECONDS_PER_YEAR * RATE_SCALE / denominator;
         // supply_rate_annual = borrow_rate * util * pass_through / 10_000^2
         //                    = 2000 * 9000 * 10000 / 100_000_000 = 1800
         let supply_rate_annual = 2_000i128 * 9_000 * 10_000 / (10_000 * 10_000);
-        let supply_growth =
-            supply_rate_annual * SECONDS_PER_YEAR as i128 * RATE_SCALE / denominator;
+        let supply_growth = supply_rate_annual * SECONDS_PER_YEAR * RATE_SCALE / denominator;
 
         assert_eq!(
             result.interest_to_borrowers,
@@ -440,23 +437,47 @@ mod tests {
             slope2_bps: 4_000,
             reserve_factor_bps: 0,
         };
-        let with_reserve = InterestParams { reserve_factor_bps: 1_000, ..base.clone() };
+        let with_reserve = InterestParams {
+            reserve_factor_bps: 1_000,
+            ..base.clone()
+        };
 
         let state = fresh_state();
         // Large balances so interest * RATE_SCALE / denominator > 0 after integer division.
         let total_supplied: i128 = 1_000_000_000_000;
         let total_borrowed: i128 = 900_000_000_000; // 90 % util
 
-        let r_base = compute_accrual(&env, &state, &base, total_supplied, total_borrowed, SECONDS_PER_YEAR as u64);
-        let r_with = compute_accrual(&env, &state, &with_reserve, total_supplied, total_borrowed, SECONDS_PER_YEAR as u64);
+        let r_base = compute_accrual(
+            &env,
+            &state,
+            &base,
+            total_supplied,
+            total_borrowed,
+            SECONDS_PER_YEAR as u64,
+        );
+        let r_with = compute_accrual(
+            &env,
+            &state,
+            &with_reserve,
+            total_supplied,
+            total_borrowed,
+            SECONDS_PER_YEAR as u64,
+        );
 
-        assert!(r_base.interest_to_suppliers > 0,
-            "base case must produce non-zero supplier interest");
-        assert!(r_with.interest_to_suppliers < r_base.interest_to_suppliers,
+        assert!(
+            r_base.interest_to_suppliers > 0,
+            "base case must produce non-zero supplier interest"
+        );
+        assert!(
+            r_with.interest_to_suppliers < r_base.interest_to_suppliers,
             "reserve factor must reduce supplier share: with={} base={}",
-            r_with.interest_to_suppliers, r_base.interest_to_suppliers);
-        assert_eq!(r_with.interest_to_borrowers, r_base.interest_to_borrowers,
-            "reserve factor must not change borrower interest");
+            r_with.interest_to_suppliers,
+            r_base.interest_to_suppliers
+        );
+        assert_eq!(
+            r_with.interest_to_borrowers, r_base.interest_to_borrowers,
+            "reserve factor must not change borrower interest"
+        );
     }
 
     #[test]
@@ -474,7 +495,12 @@ mod tests {
         };
         let state = fresh_state();
         let result = compute_accrual(
-            &env, &state, &params, 1_000_000_000, 1_000_000_000, SECONDS_PER_YEAR as u64,
+            &env,
+            &state,
+            &params,
+            1_000_000_000,
+            1_000_000_000,
+            SECONDS_PER_YEAR as u64,
         );
         assert_eq!(result.interest_to_suppliers, result.interest_to_borrowers);
     }
