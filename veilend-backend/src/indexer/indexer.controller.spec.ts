@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { UnauthorizedException } from '@nestjs/common';
@@ -18,6 +17,9 @@ describe('IndexerController', () => {
     getPositions: jest.Mock;
     getTransactions: jest.Mock;
     forceReplay: jest.Mock;
+    replay: jest.Mock;
+    getSyncStats: jest.Mock;
+    getReplayState: jest.Mock;
   };
   let repository: { getCheckpoint: jest.Mock };
   let configService: { get: jest.Mock };
@@ -28,6 +30,9 @@ describe('IndexerController', () => {
       getPositions: jest.fn(),
       getTransactions: jest.fn(),
       forceReplay: jest.fn(),
+      replay: jest.fn(),
+      getSyncStats: jest.fn(),
+      getReplayState: jest.fn(),
     };
     repository = { getCheckpoint: jest.fn() };
     configService = {
@@ -48,14 +53,48 @@ describe('IndexerController', () => {
     controller = module.get(IndexerController);
   });
 
-  it('GET /indexer/status returns checkpoint + config', async () => {
-    repository.getCheckpoint.mockResolvedValue({ lastIndexedLedger: 7 });
+  it('GET /indexer/status returns sync stats + config', async () => {
+    indexerService.getSyncStats.mockResolvedValue({
+      syncStatus: 'idle',
+      currentLedger: 100,
+      lastIndexedLedger: 100,
+      latestLedger: 105,
+      lag: 5,
+      percent: 95,
+      eta: null,
+      dedupCounter: 10,
+      insertedCounter: 90,
+      lastError: null,
+      isProcessing: false,
+      replay: { status: 'idle' },
+    });
 
     const result = await controller.getStatus();
 
     expect(result).toEqual(
-      expect.objectContaining({ status: 'active', lastIndexedLedger: 7 }),
+      expect.objectContaining({
+        status: 'active',
+        currentLedger: 100,
+        latestLedger: 105,
+        lag: 5,
+        dedupCounter: 10,
+      }),
     );
+  });
+
+  it('GET /indexer/replay/status returns current replay state', () => {
+    indexerService.getReplayState.mockReturnValue({
+      status: 'running',
+      percent: 45,
+      etaSeconds: 12,
+    });
+
+    const result = controller.getReplayStatus();
+    expect(result).toEqual({
+      status: 'running',
+      percent: 45,
+      etaSeconds: 12,
+    });
   });
 
   it('GET /indexer/positions/:address returns { address, positions }', async () => {
@@ -85,36 +124,96 @@ describe('IndexerController', () => {
   });
 
   describe('POST /indexer/replay', () => {
-    it('triggers a replay, records an audit row, and returns a message', async () => {
+    it('triggers incremental replay, records an audit row, and returns progress summary', async () => {
       const req = { user: { walletAddress: VALID_ADDRESS_A } };
+      indexerService.replay.mockResolvedValue({
+        success: true,
+        message: 'Replay completed successfully from ledger 0 to 500',
+        status: 'completed',
+        fromLedger: 0,
+        toLedger: 500,
+        chunk: 100,
+        inserted: 0,
+        already_processed: 500,
+        alreadyProcessed: 500,
+        currentLedger: 500,
+        percent: 100,
+      });
 
-      const result = await controller.triggerReplay(req);
+      const result = await controller.triggerReplay(req, '0', '500', '100');
 
-      expect(indexerService.forceReplay).toHaveBeenCalled();
-      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            actorWallet: VALID_ADDRESS_A,
-            action: 'INDEXER_REPLAY',
-          }),
-        }),
-      );
+      expect(indexerService.replay).toHaveBeenCalledWith({
+        fromLedger: 0,
+        toLedger: 500,
+        chunk: 100,
+      });
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          actorWallet: VALID_ADDRESS_A,
+          action: 'INDEXER_REPLAY',
+          payload: {
+            fromLedger: 0,
+            toLedger: 500,
+            chunk: 100,
+            inserted: 0,
+            already_processed: 500,
+          },
+        },
+      });
       expect(result).toEqual(
-        expect.objectContaining({ message: expect.any(String) }),
+        expect.objectContaining({
+          fromLedger: 0,
+          toLedger: 500,
+          chunk: 100,
+          inserted: 0,
+          already_processed: 500,
+        }),
       );
     });
 
-    // Route-level auth is enforced by `@UseGuards(JwtAuthGuard, AdminGuard)`
-    // (exercised via the guards' own unit tests / e2e); this test documents
-    // that a request that somehow reaches the handler without an
-    // authenticated user is still rejected rather than silently proceeding.
+    it('triggers replay using request body parameters when query parameters are not provided', async () => {
+      const req = { user: { walletAddress: VALID_ADDRESS_A } };
+      indexerService.replay.mockResolvedValue({
+        success: true,
+        message: 'Replay completed successfully from ledger 100 to 200',
+        status: 'completed',
+        fromLedger: 100,
+        toLedger: 200,
+        chunk: 50,
+        inserted: 10,
+        already_processed: 90,
+        alreadyProcessed: 90,
+        currentLedger: 200,
+        percent: 100,
+      });
+
+      const body = { fromLedger: 100, toLedger: 200, chunk: 50 };
+      const result = await controller.triggerReplay(
+        req,
+        undefined,
+        undefined,
+        undefined,
+        body,
+      );
+
+      expect(indexerService.replay).toHaveBeenCalledWith({
+        fromLedger: 100,
+        toLedger: 200,
+        chunk: 50,
+      });
+      expect(result.fromLedger).toBe(100);
+      expect(result.toLedger).toBe(200);
+      expect(result.chunk).toBe(50);
+      expect(result.inserted).toBe(10);
+    });
+
     it('does not run a replay when no authenticated user is present', async () => {
       const req = { user: undefined };
 
-      await expect(controller.triggerReplay(req)).rejects.toThrow(
-        UnauthorizedException,
-      );
-      expect(indexerService.forceReplay).not.toHaveBeenCalled();
+      await expect(
+        controller.triggerReplay(req, '0', '500', '100'),
+      ).rejects.toThrow(UnauthorizedException);
+      expect(indexerService.replay).not.toHaveBeenCalled();
     });
   });
 });

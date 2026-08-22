@@ -14,7 +14,8 @@ export class HealthController {
     const allDown =
       result.components.prisma.status === 'down' &&
       result.components.sorobanRpc.status === 'down' &&
-      result.components.horizon.status === 'down';
+      result.components.horizon.status === 'down' &&
+      result.components.indexer.status === 'down';
 
     if (allDown) {
       throw new HttpException(result, HttpStatus.SERVICE_UNAVAILABLE);

@@ -123,7 +123,9 @@ export class AdminService {
     );
 
     if (!sacData) {
-      throw new BadRequestException('Contract does not implement SAC interface');
+      throw new BadRequestException(
+        'Contract does not implement SAC interface',
+      );
     }
 
     const { verifiedAssetList } = this.configService.stellar;

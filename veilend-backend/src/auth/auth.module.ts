@@ -8,7 +8,6 @@ import { WalletModule } from '../wallet/wallet.module';
 import { JwtStrategy } from './jwt.strategy';
 import { AppConfigService } from '../config/app-config.service';
 import { ConfigModule } from '../config/config.module';
-import type { StringValue } from 'ms';
 
 @Module({
   imports: [
@@ -21,7 +20,14 @@ import type { StringValue } from 'ms';
       useFactory: (configService: AppConfigService) => ({
         secret: configService.auth.jwtSecret,
         signOptions: {
-          expiresIn: configService.auth.jwtExpiresIn as StringValue,
+          expiresIn: configService.auth.jwtExpiresIn as
+            | `${number}h`
+            | `${number}m`
+            | `${number}s`
+            | `${number}d`
+            | `${number}w`
+            | `${number}y`
+            | number,
           issuer: configService.auth.jwtIssuer,
           audience: configService.auth.jwtAudience,
         },
