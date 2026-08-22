@@ -1,9 +1,9 @@
 use core::cmp::Ordering;
 
-use soroban_env_common::Compare;
+use soroban_env_common::{Compare, TryFromVal};
 use soroban_sdk::events::Event;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
-use soroban_sdk::{Address, Env, Val};
+use soroban_sdk::{Address, Env, Symbol, Val};
 use veillend_contract::{
     InterestAccrued, InterestParams, VeilLendContract, VeilLendContractClient,
 };
@@ -2641,8 +2641,8 @@ fn test_deposit_batch_multiple_assets_succeeds() {
 
     assert_eq!(client.get_total_deposited(&asset1), 100_000);
     assert_eq!(client.get_total_deposited(&asset2), 50_000);
-    assert_eq!(client.balance_of(&user, &asset1), 100_000);
-    assert_eq!(client.balance_of(&user, &asset2), 50_000);
+    assert_eq!(client.get_position(&user, &asset1).deposited, 100_000);
+    assert_eq!(client.get_position(&user, &asset2).deposited, 50_000);
 }
 
 #[test]
@@ -2764,14 +2764,18 @@ fn test_repay_batch_multiple_assets_succeeds() {
 
 #[test]
 fn test_withdraw_then_deposit_batch_succeeds_final_healthy() {
-    // Classic footgun: withdraw all XLM then add more ETH collateral
-    // This should succeed as a batch but fail as separate transactions
+    // Classic footgun: withdraw all XLM collateral while ETH (also held as
+    // collateral) still covers the debt. Batched, only the combined final
+    // state is checked, so this succeeds even though withdrawing all the
+    // XLM via a single, separate `withdraw` call (which only compares the
+    // withdrawn asset against the debt) would fail immediately.
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let asset_xlm = Address::generate(&env);
     let asset_eth = Address::generate(&env);
     let user = Address::generate(&env);
+    let liquidity_provider = Address::generate(&env);
     let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
     let client = VeilLendContractClient::new(&env, &contract_id);
 
@@ -2779,6 +2783,11 @@ fn test_withdraw_then_deposit_batch_succeeds_final_healthy() {
     configure_asset(&env, &client, &admin, &asset_eth);
     set_oracle_price(&env, &client, &admin, &asset_xlm, &1);
     set_oracle_price(&env, &client, &admin, &asset_eth, &100);
+
+    // Another depositor supplies extra XLM liquidity so the reserve has
+    // enough balance left for the user to withdraw all of their own XLM
+    // after having borrowed against it below.
+    client.deposit(&liquidity_provider, &asset_xlm, &5_000);
 
     // Deposit XLM as collateral
     client.deposit(&user, &asset_xlm, &10_000);
@@ -2788,8 +2797,10 @@ fn test_withdraw_then_deposit_batch_succeeds_final_healthy() {
     // Borrow against XLM
     client.borrow(&user, &asset_xlm, &asset_xlm, &5_000);
 
-    // Single transaction: withdraw all XLM then add more ETH
-    // This should succeed because final state is healthy
+    // A single separate `withdraw` of all the XLM would fail here, since it
+    // only checks XLM collateral (which would drop to 0) against the XLM
+    // debt. Batched together with a small ETH withdrawal, the combined
+    // XLM + ETH collateral value still covers the debt.
     let withdraw_ops = soroban_sdk::vec![
         &env,
         veillend_contract::BatchOperation {
@@ -2798,7 +2809,7 @@ fn test_withdraw_then_deposit_batch_succeeds_final_healthy() {
         },
         veillend_contract::BatchOperation {
             asset: asset_eth.clone(),
-            amount: 50,
+            amount: 20,
         }
     ];
 
@@ -2809,7 +2820,7 @@ fn test_withdraw_then_deposit_batch_succeeds_final_healthy() {
     let xlm_position = client.get_position(&user, &asset_xlm);
     let eth_position = client.get_position(&user, &asset_eth);
     assert_eq!(xlm_position.deposited, 0);
-    assert_eq!(eth_position.deposited, 150);
+    assert_eq!(eth_position.deposited, 80);
 
     // Should still have debt
     assert!(xlm_position.borrowed > 0);
@@ -2913,16 +2924,22 @@ fn test_batch_events_emitted() {
         if topics.len() >= 2 {
             let topic0 = topics.get(0).unwrap();
             let topic1 = topics.get(1).unwrap();
-            // Check for deposit event
-            if topic0 == Symbol::new(&env, "veillend") {
-                if let Ok(sym) = Symbol::try_from_val(&env, &topic1) {
-                    if sym == Symbol::new(&env, "deposit") {
-                        deposit_events += 1;
+            // Check for deposit and batch_executed events
+            if let Ok(sym0) = Symbol::try_from_val(&env, &topic0) {
+                if sym0 == Symbol::new(&env, "veillend") {
+                    if let Ok(sym) = Symbol::try_from_val(&env, &topic1) {
+                        if sym == Symbol::new(&env, "deposit") {
+                            deposit_events += 1;
+                        } else if sym == Symbol::new(&env, "batch_executed") {
+                            batch_events += 1;
+                        }
                     }
                 }
             }
         }
     }
+
+    assert_eq!(batch_events, 1);
 
     assert_eq!(deposit_events, 1);
 }

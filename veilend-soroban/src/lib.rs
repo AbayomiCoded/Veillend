@@ -11,9 +11,6 @@ use soroban_sdk::{
     symbol_short, Address, Env, Symbol, Vec,
 };
 
-pub use crate::BatchOperation;
-
-
 mod flash_loan;
 mod flash_loan_receiver_example;
 
@@ -1796,9 +1793,8 @@ impl VeilLendContract {
             total_operations += 1;
         }
 
-        // Single health factor check at the end
-        // We need to check all assets the user has positions in
-        Self::check_user_health_factor(&env, &user);
+        // A deposit only ever increases collateral, so it can never worsen
+        // the user's health factor — no post-batch check is needed here.
 
         // Emit batch summary event
         Self::emit_batch_executed(&env, &user, "deposit_batch", total_operations);
@@ -1898,8 +1894,8 @@ impl VeilLendContract {
             total_operations += 1;
         }
 
-        // Single health factor check at the end
-        Self::check_user_health_factor(&env, &user);
+        // Single health factor check at the end, against each withdrawn asset
+        Self::enforce_batch_health_factor_for_withdraw(&env, &user, &debt_asset, &operations);
 
         // Emit batch summary event
         Self::emit_batch_executed(&env, &user, "withdraw_batch", total_operations);
@@ -1998,8 +1994,8 @@ impl VeilLendContract {
             total_operations += 1;
         }
 
-        // Single health factor check at the end
-        Self::check_user_health_factor(&env, &user);
+        // Single health factor check at the end, against each borrowed asset
+        Self::enforce_batch_health_factor_for_borrow(&env, &user, &collateral_asset, &operations);
 
         // Emit batch summary event
         Self::emit_batch_executed(&env, &user, "borrow_batch", total_operations);
@@ -2086,14 +2082,12 @@ impl VeilLendContract {
             total_operations += 1;
         }
 
-        // Single health factor check at the end (only if user still has debt)
-        // We check all assets the user has positions in
-        Self::check_user_health_factor(&env, &user);
+        // A repayment only ever decreases debt, so it can never worsen the
+        // user's health factor — no post-batch check is needed here.
 
         // Emit batch summary event
         Self::emit_batch_executed(&env, &user, "repay_batch", total_operations);
     }
-
 }
 
 /// Describes the pending mutation being validated against the cross-asset
@@ -3058,7 +3052,7 @@ impl VeilLendContract {
     /// `accrue_and_persist_interest`.
     fn accrue_assets_once(env: &Env, assets: &Vec<Address>) {
         for asset in assets.iter() {
-            Self::accrue_and_persist_interest(env, asset);
+            Self::accrue_and_persist_interest(env, &asset);
         }
     }
 
@@ -3088,9 +3082,9 @@ impl VeilLendContract {
         // Check each asset's final total against its cap
         for (asset, total_amount) in totals.iter() {
             // Check deposit cap
-            Self::check_deposit_cap(env, asset, *total_amount);
+            Self::check_deposit_cap(env, &asset, total_amount);
             // Check supply cap
-            Self::enforce_supply_cap(env, asset, *total_amount);
+            Self::enforce_supply_cap(env, &asset, total_amount);
         }
     }
 
@@ -3117,151 +3111,92 @@ impl VeilLendContract {
         // Check each asset's final total against its cap
         for (asset, total_amount) in totals.iter() {
             // Check borrow cap
-            Self::check_borrow_cap(env, asset, *total_amount);
+            Self::check_borrow_cap(env, &asset, total_amount);
             // Check borrow cap (aggregate)
-            Self::enforce_borrow_cap(env, asset, *total_amount);
+            Self::enforce_borrow_cap(env, &asset, total_amount);
         }
     }
 
-    /// Checks the user's health factor across all positions.
+    /// Enforces the collateral ratio after a batch withdrawal.
     ///
-    /// This is the single health factor check at the end of a batch.
-    /// It validates that the user's collateral ratio is above the minimum
-    /// across all assets they have positions in.
+    /// Positions have already been written to storage by the time this is
+    /// called, so each unique withdrawn asset is checked as collateral
+    /// against `debt_asset` with a zero delta (the withdrawal is already
+    /// reflected in the stored position).
+    ///
+    /// Unlike a single `withdraw`, which only compares the one withdrawn
+    /// asset against the debt, this aggregates collateral value across every
+    /// unique asset touched by the batch. This is what makes batching
+    /// meaningfully different from issuing the same withdrawals as separate
+    /// transactions: moving value out of one asset while another asset in
+    /// the same batch still covers the debt is allowed, since only the
+    /// combined final state matters.
     ///
     /// # Panics
-    /// * If the user has no positions or no debt
-    /// * If the health factor is below the minimum
-    fn check_user_health_factor(env: &Env, user: &Address) {
-        // We need to find all assets the user has positions in.
-        // Since we can't enumerate keys directly, we use the fact that
-        // we know which assets are supported.
-        // For efficiency, we track which assets were touched during the batch.
-        // As a fallback, we check the user's positions against all supported assets.
-        // This is O(number of supported assets) but acceptable for this use case.
+    /// * If the aggregated collateral value of the touched assets is
+    ///   insufficient to cover the debt in `debt_asset`
+    fn enforce_batch_health_factor_for_withdraw(
+        env: &Env,
+        user: &Address,
+        debt_asset: &Address,
+        operations: &Vec<BatchOperation>,
+    ) {
+        let debt_borrowed = Self::read_accrued_position(env, user, debt_asset).borrowed;
+        if debt_borrowed == 0 {
+            return;
+        }
 
-        // For the batch operations, we check the health factor based on the
-        // collateral and debt assets passed to the batch functions.
-        // The individual entrypoints handle this via assert_collateralized.
+        let touched_assets = Self::deduplicate_assets(env, operations);
+        let mut collateral_value: i128 = 0;
+        for asset in touched_assets.iter() {
+            let deposited = Self::read_accrued_position(env, user, &asset).deposited;
+            collateral_value += deposited * Self::read_oracle_price(env, &asset);
+        }
 
-        // We use a conservative approach: if the user has any debt and any
-        // collateral, we validate the ratio is sufficient.
-        // The actual check is performed by checking each position pair.
-
-        // The health factor check is already performed by assert_collateralized
-        // in the individual operations. For batch, we need to validate the
-        // final state across all assets.
-
-        // For simplicity and correctness, we re-use the same logic as the
-        // single-operation entrypoints but applied to the final state.
-
-        // This is a simplified check - for full correctness, we would need
-        // to compute the health factor across all positions.
-
-        // The individual entrypoints call assert_collateralized with specific
-        // collateral/debt asset pairs. For batch, we validate that all
-        // positions are healthy together.
-
-        // We'll check each debt position against the user's total collateral
-        // as a safety net. The exact health factor is already validated
-        // during the batch execution.
-
-        // This function serves as a final guard against any edge cases where
-        // intermediate states might have left the user undercollateralized.
-
-        // For now, we rely on the individual assert_collateralized calls in
-        // the batch operations, which are performed for each operation.
-
-        // We also validate that the batch doesn't leave the user with
-        // insufficient collateral.
-        Self::enforce_batch_health_factor(env, user);
+        let debt_value = debt_borrowed * Self::read_oracle_price(env, debt_asset);
+        let collateral_ratio_bps = Self::min_collateral_ratio_bps(env.clone()) as i128;
+        if collateral_value * 10_000 < debt_value * collateral_ratio_bps {
+            panic_with_error!(env, VeilLendError::InsufficientCollateral);
+        }
     }
 
-    /// Enforces health factor for a user across all positions.
+    /// Enforces the collateral ratio after a batch borrow.
     ///
-    /// This is the single end-of-batch health factor check.
-    fn enforce_batch_health_factor(env: &Env, user: &Address) {
-        // This is a simplified implementation that checks the user's
-        // total collateral against total debt.
-        // A full implementation would check each debt asset against all
-        // collateral assets.
-
-        // Read all positions for the user across supported assets.
-        // Since we can't enumerate keys, we use a conservative approach.
-
-        // For the batch operations, the health factor is checked per operation
-        // via assert_collateralized. This function adds an extra layer of
-        // safety for the final state.
-
-        // We'll check that the user's total collateral value exceeds
-        // the minimum required.
-
-        // This is a placeholder for the full implementation.
-        // The actual health factor check is performed in the individual
-        // assert_collateralized calls during the batch execution.
-
-        // As a final safety check, we ensure the user's debt doesn't exceed
-        // their collateral value.
-
-        // We can use the existing assert_collateralized logic by checking
-        // each debt asset against all collateral assets.
-        // For simplicity, we check against the most recently used asset pair.
-
-        // The batch operations already call assert_collateralized for each
-        // operation, so this is an additional safety net.
-        let debt_assets = Self::get_user_debt_assets(env, user);
-        let collateral_assets = Self::get_user_collateral_assets(env, user);
-
-        if debt_assets.is_empty() {
-            return; // No debt, no health factor to check
+    /// Positions have already been written to storage by the time this is
+    /// called. Unlike a single `borrow`, which only compares the one
+    /// borrowed asset against the collateral, this aggregates debt value
+    /// across every unique asset touched by the batch and compares it
+    /// against the single named collateral asset, since only the combined
+    /// final state matters for a batch.
+    ///
+    /// # Panics
+    /// * If `collateral_asset` is insufficient to cover the aggregated debt
+    ///   value of the touched assets
+    fn enforce_batch_health_factor_for_borrow(
+        env: &Env,
+        user: &Address,
+        collateral_asset: &Address,
+        operations: &Vec<BatchOperation>,
+    ) {
+        let touched_assets = Self::deduplicate_assets(env, operations);
+        let mut debt_value: i128 = 0;
+        for asset in touched_assets.iter() {
+            let borrowed = Self::read_accrued_position(env, user, &asset).borrowed;
+            debt_value += borrowed * Self::read_oracle_price(env, &asset);
         }
 
-        // Check each debt asset against each collateral asset
-        for debt_asset in debt_assets.iter() {
-            let mut found_collateral = false;
-            for collateral_asset in collateral_assets.iter() {
-                // Check if the user has this collateral asset
-                let position = Self::read_accrued_position(env, user, collateral_asset);
-                if position.deposited > 0 {
-                    found_collateral = true;
-                    // Validate the health factor for this pair
-                    Self::assert_collateralized(
-                        env,
-                        collateral_asset,
-                        debt_asset,
-                        user,
-                        CollateralAction::Borrow { amount: 0 },
-                    );
-                    break;
-                }
-            }
-            if !found_collateral {
-                // User has debt but no collateral - this should be caught by
-                // the individual assert_collateralized calls
-            }
+        if debt_value == 0 {
+            return;
         }
-    }
 
-    /// Gets all debt assets for a user.
-    /// This is a helper for health factor checking.
-    fn get_user_debt_assets(env: &Env, user: &Address) -> Vec<Address> {
-        // In a real implementation, we would track which assets the user has
-        // debt in. For this implementation, we'll iterate over supported assets.
-        let mut debt_assets: Vec<Address> = Vec::new(env);
-        // This would need to iterate over all supported assets.
-        // For now, we return an empty vector and rely on the individual
-        // assert_collateralized calls during batch execution.
-        debt_assets
-    }
-
-    /// Gets all collateral assets for a user.
-    /// This is a helper for health factor checking.
-    fn get_user_collateral_assets(env: &Env, user: &Address) -> Vec<Address> {
-        // In a real implementation, we would track which assets the user has
-        // collateral in. For this implementation, we'll iterate over supported assets.
-        let mut collateral_assets: Vec<Address> = Vec::new(env);
-        // For now, return an empty vector.
-        collateral_assets
+        let collateral_deposited =
+            Self::read_accrued_position(env, user, collateral_asset).deposited;
+        let collateral_value =
+            collateral_deposited * Self::read_oracle_price(env, collateral_asset);
+        let collateral_ratio_bps = Self::min_collateral_ratio_bps(env.clone()) as i128;
+        if collateral_value * 10_000 < debt_value * collateral_ratio_bps {
+            panic_with_error!(env, VeilLendError::InsufficientCollateral);
+        }
     }
 
     /// Emits a batch summary event.
