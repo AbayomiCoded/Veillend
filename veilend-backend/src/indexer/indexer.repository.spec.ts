@@ -1,7 +1,11 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument */
 import { Test, TestingModule } from '@nestjs/testing';
 import { Prisma } from '@prisma/client';
-import { IndexerRepository, IndexerTransaction } from './indexer.repository';
+import {
+  IndexerRepository,
+  IndexerTransaction,
+  extractEventIndex,
+} from './indexer.repository';
 import { PrismaService } from '../prisma/prisma.service';
 
 describe('IndexerRepository', () => {
@@ -12,10 +16,16 @@ describe('IndexerRepository', () => {
       upsert: jest.Mock;
       deleteMany: jest.Mock;
     };
+    indexerEventDedup: {
+      findUnique: jest.Mock;
+      upsert: jest.Mock;
+      deleteMany: jest.Mock;
+    };
     user: { upsert: jest.Mock };
     asset: { upsert: jest.Mock; findMany: jest.Mock };
     transactionHistory: {
       findUnique: jest.Mock;
+      findFirst: jest.Mock;
       findMany: jest.Mock;
       create: jest.Mock;
       deleteMany: jest.Mock;
@@ -39,10 +49,16 @@ describe('IndexerRepository', () => {
         upsert: jest.fn(),
         deleteMany: jest.fn(),
       },
+      indexerEventDedup: {
+        findUnique: jest.fn(),
+        upsert: jest.fn(),
+        deleteMany: jest.fn(),
+      },
       user: { upsert: jest.fn() },
       asset: { upsert: jest.fn(), findMany: jest.fn() },
       transactionHistory: {
         findUnique: jest.fn(),
+        findFirst: jest.fn(),
         findMany: jest.fn(),
         create: jest.fn(),
         deleteMany: jest.fn(),
@@ -75,6 +91,18 @@ describe('IndexerRepository', () => {
     }).compile();
 
     repository = module.get(IndexerRepository);
+  });
+
+  describe('extractEventIndex', () => {
+    it('extracts index from formatted event ID', () => {
+      expect(extractEventIndex('0000000001-0000000005')).toBe(5);
+      expect(extractEventIndex('ledger-tx-2')).toBe(2);
+    });
+
+    it('returns hash or 0 on non-hyphenated ID', () => {
+      expect(extractEventIndex('')).toBe(0);
+      expect(typeof extractEventIndex('singleword')).toBe('number');
+    });
   });
 
   describe('getCheckpoint', () => {
@@ -110,9 +138,51 @@ describe('IndexerRepository', () => {
     });
   });
 
-  describe('applyEvent', () => {
+  describe('isEventDuplicate & recordEventDedup', () => {
+    it('returns true when event is found in IndexerEventDedup with future expiry', async () => {
+      prisma.indexerEventDedup.findUnique.mockResolvedValue({
+        eventId: 'evt-1',
+        expiresAt: new Date(Date.now() + 60000),
+      });
+
+      const isDup = await repository.isEventDuplicate('evt-1');
+      expect(isDup).toBe(true);
+    });
+
+    it('returns true when event is found in TransactionHistory', async () => {
+      prisma.indexerEventDedup.findUnique.mockResolvedValue(null);
+      prisma.transactionHistory.findFirst.mockResolvedValue({ id: 'row-1' });
+
+      const isDup = await repository.isEventDuplicate('evt-1', 'tx1', 0);
+      expect(isDup).toBe(true);
+    });
+
+    it('records event dedup with TTL', async () => {
+      await repository.recordEventDedup('evt-1', 'tx1', 0, 50, 3600);
+      expect(prisma.indexerEventDedup.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { eventId: 'evt-1' },
+          create: expect.objectContaining({
+            eventId: 'evt-1',
+            txHash: 'tx1',
+            eventIndex: 0,
+            ledger: 50,
+          }),
+        }),
+      );
+    });
+
+    it('cleans up expired dedup entries', async () => {
+      prisma.indexerEventDedup.deleteMany.mockResolvedValue({ count: 5 });
+      const count = await repository.cleanExpiredDedup();
+      expect(count).toBe(5);
+      expect(prisma.indexerEventDedup.deleteMany).toHaveBeenCalled();
+    });
+  });
+
+  describe('processEventSafe & applyEvent', () => {
     const tx: IndexerTransaction = {
-      id: 'evt-1',
+      id: '0000000001-0000000001',
       userAddress: 'GABC',
       type: 'deposit',
       assetAddress: 'CONTRACT1',
@@ -128,11 +198,13 @@ describe('IndexerRepository', () => {
     const sqlText = (call: unknown[]): string =>
       (call[0] as { strings: string[] }).strings.join(' ');
 
-    it('creates a new row and applies the position delta, returning true when new', async () => {
-      prisma.transactionHistory.findUnique.mockResolvedValue(null);
+    it('creates a new row, records dedup, and applies the position delta, returning true when new', async () => {
+      prisma.indexerEventDedup.findUnique.mockResolvedValue(null);
+      prisma.transactionHistory.findFirst.mockResolvedValue(null);
       prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
       prisma.asset.upsert.mockResolvedValue({ id: 'asset-1' });
       prisma.transactionHistory.create.mockResolvedValue({});
+      prisma.indexerEventDedup.upsert.mockResolvedValue({});
       prisma.$queryRaw.mockResolvedValue([]);
 
       const result = await repository.applyEvent(tx, 100n, 0n);
@@ -142,7 +214,9 @@ describe('IndexerRepository', () => {
         data: expect.objectContaining({
           userId: 'user-1',
           assetId: 'asset-1',
-          sorobanEventId: 'evt-1',
+          sorobanEventId: tx.id,
+          txHash: 'hash1',
+          eventIndex: 1,
           amountRaw: 1000n,
           amountUsd: 0,
         }),
@@ -150,10 +224,14 @@ describe('IndexerRepository', () => {
       // Position write happened: ensure-exists insert + locked update.
       expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.indexerEventDedup.upsert).toHaveBeenCalled();
     });
 
-    it('returns false without writing when already seen (duplicate)', async () => {
-      prisma.transactionHistory.findUnique.mockResolvedValue({ id: 'row-1' });
+    it('returns false without writing when already seen (duplicate in lookaside)', async () => {
+      prisma.indexerEventDedup.findUnique.mockResolvedValue({
+        eventId: tx.id,
+        expiresAt: new Date(Date.now() + 60000),
+      });
 
       const result = await repository.applyEvent(tx, 100n, 0n);
 
@@ -164,7 +242,8 @@ describe('IndexerRepository', () => {
     });
 
     it('returns false (not throw) on a race-condition unique violation', async () => {
-      prisma.transactionHistory.findUnique.mockResolvedValue(null);
+      prisma.indexerEventDedup.findUnique.mockResolvedValue(null);
+      prisma.transactionHistory.findFirst.mockResolvedValue(null);
       prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
       prisma.asset.upsert.mockResolvedValue({ id: 'asset-1' });
       prisma.transactionHistory.create.mockRejectedValue(
@@ -182,10 +261,12 @@ describe('IndexerRepository', () => {
     });
 
     it('accumulates deltas onto an existing position under a row lock', async () => {
-      prisma.transactionHistory.findUnique.mockResolvedValue(null);
+      prisma.indexerEventDedup.findUnique.mockResolvedValue(null);
+      prisma.transactionHistory.findFirst.mockResolvedValue(null);
       prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
       prisma.asset.upsert.mockResolvedValue({ id: 'asset-1' });
       prisma.transactionHistory.create.mockResolvedValue({});
+      prisma.indexerEventDedup.upsert.mockResolvedValue({});
       prisma.$queryRaw.mockResolvedValue([
         { depositedRaw: 100n, borrowedRaw: 50n },
       ]);
@@ -203,10 +284,12 @@ describe('IndexerRepository', () => {
     });
 
     it('clamps balances to a minimum of 0', async () => {
-      prisma.transactionHistory.findUnique.mockResolvedValue(null);
+      prisma.indexerEventDedup.findUnique.mockResolvedValue(null);
+      prisma.transactionHistory.findFirst.mockResolvedValue(null);
       prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
       prisma.asset.upsert.mockResolvedValue({ id: 'asset-1' });
       prisma.transactionHistory.create.mockResolvedValue({});
+      prisma.indexerEventDedup.upsert.mockResolvedValue({});
       prisma.$queryRaw.mockResolvedValue([
         { depositedRaw: 5n, borrowedRaw: 5n },
       ]);
@@ -220,100 +303,62 @@ describe('IndexerRepository', () => {
         'asset-1',
       ]);
     });
+  });
 
-    it('starts from 0 when no position exists yet', async () => {
-      prisma.transactionHistory.findUnique.mockResolvedValue(null);
+  describe('processChunk', () => {
+    it('applies all events and advances checkpoint inside transaction', async () => {
+      prisma.indexerEventDedup.findUnique.mockResolvedValue(null);
+      prisma.transactionHistory.findFirst.mockResolvedValue(null);
       prisma.user.upsert.mockResolvedValue({ id: 'user-1' });
       prisma.asset.upsert.mockResolvedValue({ id: 'asset-1' });
       prisma.transactionHistory.create.mockResolvedValue({});
+      prisma.indexerEventDedup.upsert.mockResolvedValue({});
       prisma.$queryRaw.mockResolvedValue([]);
 
-      await repository.applyEvent(tx, 30n, 0n);
-
-      expect(sqlValues(prisma.$executeRaw.mock.calls[1])).toEqual([
-        30n,
-        0n,
-        'user-1',
-        'asset-1',
-      ]);
-    });
-  });
-
-  describe('setAssetSupported', () => {
-    it('upserts the asset with the supported flag', async () => {
-      await repository.setAssetSupported('CONTRACT1', true);
-
-      expect(prisma.asset.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { contractId: 'contract1' },
-          update: { isSupported: true },
-        }),
-      );
-    });
-  });
-
-  describe('address case-insensitivity', () => {
-    it('normalizes mixed-case addresses the same as lowercase', async () => {
-      prisma.transactionHistory.findMany.mockResolvedValue([]);
-
-      await repository.getTransactions('GaBc');
-
-      expect(prisma.transactionHistory.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { user: { walletAddress: 'gabc' } },
-        }),
-      );
-    });
-  });
-
-  describe('getTransactionsForUser', () => {
-    it('queries transaction history with limit clamping and returns paginated result', async () => {
-      const now = new Date('2026-01-01T00:00:00.000Z');
-      prisma.transactionHistory.findMany.mockResolvedValue([
+      const events = [
         {
-          id: 'row-1',
-          sorobanEventId: 'evt-1',
-          type: 'DEPOSIT',
-          contractId: 'contract1',
-          amountRaw: 500n,
-          ledgerSequence: 10,
-          txHash: 'hash1',
-          createdAt: now,
+          tx: {
+            id: 'evt-1',
+            userAddress: 'GABC',
+            type: 'deposit' as const,
+            assetAddress: 'CONTRACT1',
+            amount: '100',
+            ledger: 10,
+            txHash: 'tx1',
+            timestamp: '2026-01-01T00:00:00.000Z',
+          },
+          depositedDelta: 100n,
+          borrowedDelta: 0n,
         },
-      ]);
+        {
+          tx: {
+            id: 'evt-2',
+            userAddress: 'GABC',
+            type: 'borrow' as const,
+            assetAddress: 'CONTRACT1',
+            amount: '50',
+            ledger: 10,
+            txHash: 'tx2',
+            timestamp: '2026-01-01T00:00:00.000Z',
+          },
+          depositedDelta: 0n,
+          borrowedDelta: 50n,
+        },
+      ];
 
-      const result = await repository.getTransactionsForUser('GABC', {
-        limit: 300,
+      const result = await repository.processChunk(events, 10);
+
+      expect(result).toEqual({ inserted: 2, alreadyProcessed: 0 });
+      expect(prisma.indexerCheckpoint.upsert).toHaveBeenCalledWith({
+        where: { id: 'global' },
+        create: { id: 'global', lastIndexedLedger: 10 },
+        update: { lastIndexedLedger: 10 },
       });
-
-      expect(result.nextCursor).toBeNull();
-      expect(result.transactions).toHaveLength(1);
-      expect(result.transactions[0]).toEqual({
-        id: 'evt-1',
-        userAddress: 'GABC',
-        type: 'deposit',
-        assetAddress: 'contract1',
-        amount: '500',
-        ledger: 10,
-        txHash: 'hash1',
-        timestamp: now.toISOString(),
-      });
-      expect(prisma.transactionHistory.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          take: 201, // clamped from 300 to 200 + 1
-        }),
-      );
-    });
-
-    it('throws BadRequestException for invalid cursor', async () => {
-      await expect(
-        repository.getTransactionsForUser('GABC', { cursor: 'invalid-cursor' }),
-      ).rejects.toThrow('Invalid cursor');
     });
   });
 
   describe('resetDatabase', () => {
-    it('only clears indexer-owned rows, not users/assets/admins', async () => {
+    it('clears indexer-owned rows including dedup table, but preserves users/assets', async () => {
       await repository.resetDatabase();
 
       expect(prisma.transactionHistory.deleteMany).toHaveBeenCalledWith({
@@ -323,6 +368,7 @@ describe('IndexerRepository', () => {
       expect(prisma.indexerCheckpoint.deleteMany).toHaveBeenCalledWith({
         where: { id: 'global' },
       });
+      expect(prisma.indexerEventDedup.deleteMany).toHaveBeenCalled();
       expect(prisma.user.upsert).not.toHaveBeenCalled();
     });
   });

@@ -17,7 +17,7 @@ jest.mock('@stellar/stellar-sdk', () => {
 
 describe('IndexerService', () => {
   let service: IndexerService;
-  let mockRpcClient: {
+  let mockRpcService: {
     getHealth: jest.Mock;
     getLatestLedger: jest.Mock;
     getEvents: jest.Mock;
@@ -26,6 +26,9 @@ describe('IndexerService', () => {
     getCheckpoint: jest.Mock;
     saveCheckpoint: jest.Mock;
     applyEvent: jest.Mock;
+    processEventSafe: jest.Mock;
+    processChunk: jest.Mock;
+    cleanExpiredDedup: jest.Mock;
     setAssetSupported: jest.Mock;
     resetDatabase: jest.Mock;
   };
@@ -33,7 +36,7 @@ describe('IndexerService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
 
-    mockRpcClient = {
+    mockRpcService = {
       getHealth: jest.fn().mockResolvedValue({
         oldestLedger: 10,
         latestLedger: 100,
@@ -47,6 +50,14 @@ describe('IndexerService', () => {
       getCheckpoint: jest.fn().mockResolvedValue({ lastIndexedLedger: 0 }),
       saveCheckpoint: jest.fn().mockResolvedValue(undefined),
       applyEvent: jest.fn().mockResolvedValue(true),
+      processEventSafe: jest.fn().mockResolvedValue({ isNew: true }),
+      processChunk: jest.fn().mockImplementation((events: unknown[]) =>
+        Promise.resolve({
+          inserted: Array.isArray(events) ? events.length : 0,
+          alreadyProcessed: 0,
+        }),
+      ),
+      cleanExpiredDedup: jest.fn().mockResolvedValue(0),
       setAssetSupported: jest.fn().mockResolvedValue(undefined),
       resetDatabase: jest.fn().mockResolvedValue(undefined),
     };
@@ -58,13 +69,9 @@ describe('IndexerService', () => {
           provide: AppConfigService,
           useValue: {
             stellar: {
-              sorobanRpcUrl: 'https://test',
-              horizonUrl: 'https://test',
-              network: 'testnet',
+              sorobanRpcUrls: ['https://test'],
+              horizonUrls: ['https://test'],
               networkPassphrase: 'Test SDF Network ; September 2015',
-            },
-            auth: {
-              jwtSecret: 'test',
             },
             indexer: {
               contractId:
@@ -80,7 +87,7 @@ describe('IndexerService', () => {
         },
         {
           provide: SorobanRpcService,
-          useValue: mockRpcClient,
+          useValue: mockRpcService,
         },
       ],
     }).compile();
@@ -93,13 +100,12 @@ describe('IndexerService', () => {
   });
 
   describe('runIndexer', () => {
-    it('should query RPC for events and update checkpoint', async () => {
+    it('should query RPC for events and process chunks inside transactions', async () => {
       mockRepository.getCheckpoint.mockResolvedValueOnce({
         lastIndexedLedger: 20,
       });
-      mockRpcClient.getLatestLedger.mockResolvedValueOnce({ sequence: 25 });
+      mockRpcService.getLatestLedger.mockResolvedValueOnce({ sequence: 25 });
 
-      // Mock an event return
       const mockEvent = {
         id: 'evt-1',
         topic: ['veillend', 'deposit', 'user-addr', 'asset-addr'],
@@ -109,63 +115,145 @@ describe('IndexerService', () => {
         ledger: 22,
       };
 
-      mockRpcClient.getEvents.mockResolvedValueOnce({
+      mockRpcService.getEvents.mockResolvedValueOnce({
         events: [mockEvent],
         cursor: 'next-page-cursor',
       });
 
-      // Mock mock scValToNative return behavior
       const mockScValToNative = scValToNative as jest.Mock;
       mockScValToNative.mockImplementation((val) => val);
 
       await service.runIndexer();
 
-      expect(mockRpcClient.getLatestLedger).toHaveBeenCalled();
-      expect(mockRpcClient.getEvents).toHaveBeenCalled();
-      expect(mockRepository.applyEvent).toHaveBeenCalledWith(
-        {
-          id: 'evt-1',
-          userAddress: 'user-addr',
-          type: 'deposit',
-          assetAddress: 'asset-addr',
-          amount: '1000',
-          ledger: 22,
-          txHash: 'txhash123',
-          timestamp: '2026-06-16T17:00:00Z',
-        },
-        1000n,
-        0n,
+      expect(mockRpcService.getLatestLedger).toHaveBeenCalled();
+      expect(mockRpcService.getEvents).toHaveBeenCalled();
+      expect(mockRepository.processChunk).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            tx: expect.objectContaining({
+              id: 'evt-1',
+              userAddress: 'user-addr',
+              type: 'deposit',
+              assetAddress: 'asset-addr',
+              amount: '1000',
+              ledger: 22,
+              txHash: 'txhash123',
+              timestamp: '2026-06-16T17:00:00Z',
+            }),
+            depositedDelta: 1000n,
+            borrowedDelta: 0n,
+          }),
+        ],
+        25,
       );
-      expect(mockRepository.saveCheckpoint).toHaveBeenCalledWith(22);
     });
 
     it('should forward checkpoint if lastIndexedLedger is older than RPC oldestLedger', async () => {
       mockRepository.getCheckpoint.mockResolvedValueOnce({
         lastIndexedLedger: 5,
       });
-      mockRpcClient.getHealth.mockResolvedValueOnce({
+      mockRpcService.getHealth.mockResolvedValueOnce({
         oldestLedger: 20,
         latestLedger: 100,
       });
-      mockRpcClient.getLatestLedger.mockResolvedValueOnce({ sequence: 30 });
-      mockRpcClient.getEvents.mockResolvedValueOnce({ events: [] });
+      mockRpcService.getLatestLedger.mockResolvedValueOnce({ sequence: 30 });
+      mockRpcService.getEvents.mockResolvedValueOnce({ events: [] });
 
       await service.runIndexer();
 
-      // Should check events starting from 20 (oldestLedger)
-      expect(mockRpcClient.getEvents).toHaveBeenCalledWith(
+      expect(mockRpcService.getEvents).toHaveBeenCalledWith(
         expect.objectContaining({
           startLedger: 20,
+          endLedger: 30,
         }),
       );
-      expect(mockRepository.saveCheckpoint).toHaveBeenCalledWith(30);
+      expect(mockRepository.processChunk).toHaveBeenCalledWith([], 30);
+    });
+  });
+
+  describe('replay', () => {
+    it('replays ledger range in chunks with progress reporting and ETA', async () => {
+      mockRpcService.getEvents.mockResolvedValue({
+        events: [
+          {
+            id: 'evt-1',
+            topic: ['veillend', 'borrow', 'user-addr', 'asset-addr'],
+            value: 500n,
+            ledger: 50,
+          },
+        ],
+      });
+
+      mockRepository.processChunk.mockResolvedValue({
+        inserted: 1,
+        alreadyProcessed: 0,
+      });
+
+      const result = await service.replay({
+        fromLedger: 0,
+        toLedger: 100,
+        chunk: 50,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.fromLedger).toBe(0);
+      expect(result.toLedger).toBe(100);
+      expect(result.chunk).toBe(50);
+      expect(result.percent).toBe(100);
+      expect(mockRepository.processChunk).toHaveBeenCalledTimes(3); // 0..49, 50..99, 100..100
+    });
+
+    it('returns inserted: 0 and already_processed on duplicate replay run', async () => {
+      mockRpcService.getEvents.mockResolvedValue({
+        events: [
+          {
+            id: 'evt-dup',
+            topic: ['veillend', 'deposit', 'user-addr', 'asset-addr'],
+            value: 100n,
+            ledger: 10,
+          },
+        ],
+      });
+
+      // Simulate all events already processed
+      mockRepository.processChunk.mockResolvedValue({
+        inserted: 0,
+        alreadyProcessed: 100,
+      });
+
+      const result = await service.replay({
+        fromLedger: 0,
+        toLedger: 100,
+        chunk: 100,
+      });
+
+      expect(result.inserted).toBe(0);
+      expect(result.already_processed).toBe(200); // chunk 0..99 and 100..100
+      expect(result.alreadyProcessed).toBe(200);
+      expect(result.currentLedger).toBe(100);
+    });
+  });
+
+  describe('getSyncStats', () => {
+    it('computes lag and status metrics', async () => {
+      mockRepository.getCheckpoint.mockResolvedValue({
+        lastIndexedLedger: 1500,
+      });
+      mockRpcService.getLatestLedger.mockResolvedValue({ sequence: 2600 });
+
+      const stats = await service.getSyncStats();
+
+      expect(stats.currentLedger).toBe(1500);
+      expect(stats.latestLedger).toBe(2600);
+      expect(stats.lag).toBe(1100);
+      expect(stats.dedupCounter).toBe(0);
     });
   });
 
   describe('processEvent scenarios', () => {
     beforeEach(() => {
       mockRepository.getCheckpoint.mockResolvedValue({ lastIndexedLedger: 10 });
-      mockRpcClient.getLatestLedger.mockResolvedValue({ sequence: 15 });
+      mockRpcService.getLatestLedger.mockResolvedValue({ sequence: 15 });
     });
 
     it('should process borrow event', async () => {
@@ -175,17 +263,22 @@ describe('IndexerService', () => {
         value: 500n,
         ledger: 12,
       };
-      mockRpcClient.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
+      mockRpcService.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
 
       await service.runIndexer();
 
-      expect(mockRepository.applyEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'borrow',
-          amount: '500',
-        }),
-        0n,
-        500n,
+      expect(mockRepository.processChunk).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            tx: expect.objectContaining({
+              type: 'borrow',
+              amount: '500',
+            }),
+            depositedDelta: 0n,
+            borrowedDelta: 500n,
+          }),
+        ],
+        15,
       );
     });
 
@@ -196,17 +289,22 @@ describe('IndexerService', () => {
         value: 200n,
         ledger: 13,
       };
-      mockRpcClient.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
+      mockRpcService.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
 
       await service.runIndexer();
 
-      expect(mockRepository.applyEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'withdraw',
-          amount: '200',
-        }),
-        -200n,
-        0n,
+      expect(mockRepository.processChunk).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            tx: expect.objectContaining({
+              type: 'withdraw',
+              amount: '200',
+            }),
+            depositedDelta: -200n,
+            borrowedDelta: 0n,
+          }),
+        ],
+        15,
       );
     });
 
@@ -217,17 +315,22 @@ describe('IndexerService', () => {
         value: 100n,
         ledger: 14,
       };
-      mockRpcClient.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
+      mockRpcService.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
 
       await service.runIndexer();
 
-      expect(mockRepository.applyEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'repay',
-          amount: '100',
-        }),
-        0n,
-        -100n,
+      expect(mockRepository.processChunk).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({
+            tx: expect.objectContaining({
+              type: 'repay',
+              amount: '100',
+            }),
+            depositedDelta: 0n,
+            borrowedDelta: -100n,
+          }),
+        ],
+        15,
       );
     });
 
@@ -238,7 +341,7 @@ describe('IndexerService', () => {
         value: true,
         ledger: 15,
       };
-      mockRpcClient.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
+      mockRpcService.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
 
       await service.runIndexer();
 
@@ -246,33 +349,6 @@ describe('IndexerService', () => {
         'asset-addr',
         true,
       );
-    });
-
-    it('should call applyEvent once when it returns false (duplicate event)', async () => {
-      const mockEvent = {
-        id: 'evt-dup',
-        topic: ['veillend', 'borrow', 'user-addr', 'asset-addr'],
-        value: 500n,
-        ledger: 12,
-      };
-      mockRpcClient.getEvents.mockResolvedValueOnce({ events: [mockEvent] });
-
-      // Return false to simulate a duplicate event
-      mockRepository.applyEvent.mockResolvedValueOnce(false);
-
-      await service.runIndexer();
-
-      // Dedup + position update are handled atomically inside applyEvent, so
-      // the service calls it exactly once and never touches the position again.
-      expect(mockRepository.applyEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'borrow',
-          amount: '500',
-        }),
-        0n,
-        500n,
-      );
-      expect(mockRepository.applyEvent).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -1,7 +1,6 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 
 import { JwtService } from '@nestjs/jwt';
-import type { StringValue } from 'ms';
 
 import { WalletService } from '../wallet/wallet.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -127,7 +126,15 @@ export class AuthService {
         sid: params.sessionId,
       },
       {
-        expiresIn: jwtExpiresIn as StringValue,
+        expiresIn:
+          (jwtExpiresIn as
+            | `${number}h`
+            | `${number}m`
+            | `${number}s`
+            | `${number}d`
+            | `${number}w`
+            | `${number}y`
+            | number) ?? '24h',
         issuer: jwtIssuer,
         audience: jwtAudience,
       },

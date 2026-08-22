@@ -196,7 +196,8 @@ model TransactionHistory {
   amountUsd       Decimal           @db.Decimal(28, 7)
 
   // Stellar identifiers
-  txHash          String?           @unique         // Stellar transaction hash
+  txHash          String?                           // Stellar transaction hash
+  eventIndex      Int?                              // Event index within transaction
   ledgerSequence  Int?                              // ledger it was included in
   operationId     String?                           // Stellar operation ID
 
@@ -208,6 +209,7 @@ model TransactionHistory {
   createdAt       DateTime          @default(now())
   confirmedAt     DateTime?
 
+  @@unique([txHash, eventIndex])
   @@index([userId, createdAt])
   @@index([assetId])
   @@index([txHash])
@@ -340,3 +342,20 @@ model IndexerCheckpoint {
   lastIndexedLedger Int      @default(0)
   updatedAt         DateTime @updatedAt
 }
+
+// ─── Indexer Event Deduplication Lookaside ───────────────────────────────────
+
+model IndexerEventDedup {
+  id         String   @id @default(uuid())
+  eventId    String   @unique
+  txHash     String?
+  eventIndex Int?
+  ledger     Int?
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([expiresAt])
+  @@index([eventId])
+  @@index([txHash, eventIndex])
+}
+

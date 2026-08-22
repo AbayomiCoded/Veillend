@@ -15,7 +15,14 @@ export interface IndexerTransaction {
   amount: string; // i128 values represented as strings to preserve precision
   ledger: number;
   txHash: string;
+  eventIndex?: number;
   timestamp: string;
+}
+
+export interface IndexerParsedEvent {
+  tx: IndexerTransaction;
+  depositedDelta: bigint;
+  borrowedDelta: bigint;
 }
 
 export interface GetTransactionsOptions {
@@ -66,6 +73,24 @@ function isUniqueConstraintError(error: unknown): boolean {
     error instanceof Prisma.PrismaClientKnownRequestError &&
     error.code === 'P2002'
   );
+}
+
+/**
+ * Derives a deterministic integer eventIndex from the event ID if not explicitly provided.
+ */
+export function extractEventIndex(eventId: string): number {
+  if (!eventId) return 0;
+  const parts = eventId.split('-');
+  if (parts.length > 1) {
+    const lastPart = parts[parts.length - 1];
+    const num = parseInt(lastPart, 10);
+    if (!isNaN(num)) return num;
+  }
+  let hash = 0;
+  for (let i = 0; i < eventId.length; i++) {
+    hash = (hash * 31 + eventId.charCodeAt(i)) & 0x7fffffff;
+  }
+  return hash;
 }
 
 const CHECKPOINT_ID = 'global';
@@ -121,19 +146,106 @@ export class IndexerRepository {
     });
   }
 
-  async getCheckpoint(): Promise<IndexerCheckpoint> {
-    const row = await this.prisma.indexerCheckpoint.findUnique({
+  async getCheckpoint(
+    db?: Prisma.TransactionClient,
+  ): Promise<IndexerCheckpoint> {
+    const client = db ?? this.prisma;
+    const row = await client.indexerCheckpoint.findUnique({
       where: { id: CHECKPOINT_ID },
     });
     return { lastIndexedLedger: row?.lastIndexedLedger ?? 0 };
   }
 
-  async saveCheckpoint(ledger: number): Promise<void> {
-    await this.prisma.indexerCheckpoint.upsert({
+  async saveCheckpoint(
+    ledger: number,
+    db?: Prisma.TransactionClient,
+  ): Promise<void> {
+    const client = db ?? this.prisma;
+    await client.indexerCheckpoint.upsert({
       where: { id: CHECKPOINT_ID },
       create: { id: CHECKPOINT_ID, lastIndexedLedger: ledger },
       update: { lastIndexedLedger: ledger },
     });
+  }
+
+  /**
+   * Checks if an event is a duplicate using the IndexerEventDedup lookaside table
+   * or existing TransactionHistory rows before inserting.
+   */
+  async isEventDuplicate(
+    eventId: string,
+    txHash?: string,
+    eventIndex?: number,
+    db?: Prisma.TransactionClient,
+  ): Promise<boolean> {
+    const client = db ?? this.prisma;
+
+    // 1. Check lookaside table (with active TTL)
+    const dedupEntry = await client.indexerEventDedup.findUnique({
+      where: { eventId },
+    });
+    if (dedupEntry && dedupEntry.expiresAt > new Date()) {
+      return true;
+    }
+
+    // 2. Check TransactionHistory
+    const orConditions: Prisma.TransactionHistoryWhereInput[] = [
+      { sorobanEventId: eventId },
+    ];
+    if (txHash && eventIndex !== undefined) {
+      orConditions.push({ txHash, eventIndex });
+    }
+
+    const existingTx = await client.transactionHistory.findFirst({
+      where: { OR: orConditions },
+    });
+
+    return Boolean(existingTx);
+  }
+
+  /**
+   * Records an event in the IndexerEventDedup lookaside table with short TTL (e.g. 1 hour).
+   */
+  async recordEventDedup(
+    eventId: string,
+    txHash?: string,
+    eventIndex?: number,
+    ledger?: number,
+    ttlSeconds = 3600,
+    db?: Prisma.TransactionClient,
+  ): Promise<void> {
+    const client = db ?? this.prisma;
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+
+    await client.indexerEventDedup.upsert({
+      where: { eventId },
+      create: {
+        eventId,
+        txHash: txHash || null,
+        eventIndex: eventIndex !== undefined ? eventIndex : null,
+        ledger: ledger !== undefined ? ledger : null,
+        expiresAt,
+      },
+      update: {
+        expiresAt,
+        txHash: txHash || null,
+        eventIndex: eventIndex !== undefined ? eventIndex : null,
+        ledger: ledger !== undefined ? ledger : null,
+      },
+    });
+  }
+
+  /**
+   * Cleans up expired deduplication lookaside records.
+   */
+  async cleanExpiredDedup(db?: Prisma.TransactionClient): Promise<number> {
+    const client = db ?? this.prisma;
+    const result = await client.indexerEventDedup.deleteMany({
+      where: {
+        expiresAt: { lt: new Date() },
+      },
+    });
+    return result.count;
   }
 
   async getTransactions(userAddress: string): Promise<IndexerTransaction[]> {
@@ -150,6 +262,7 @@ export class IndexerRepository {
       amount: row.amountRaw.toString(),
       ledger: row.ledgerSequence ?? 0,
       txHash: row.txHash ?? '',
+      eventIndex: row.eventIndex ?? undefined,
       timestamp: row.createdAt.toISOString(),
     }));
   }
@@ -233,6 +346,7 @@ export class IndexerRepository {
       amount: row.amountRaw.toString(),
       ledger: row.ledgerSequence ?? 0,
       txHash: row.txHash ?? '',
+      eventIndex: row.eventIndex ?? undefined,
       timestamp: row.createdAt.toISOString(),
     }));
 
@@ -240,52 +354,53 @@ export class IndexerRepository {
   }
 
   /**
-   * Atomically applies a single indexed event: dedupes on the event's
-   * sorobanEventId, inserts the TransactionHistory row, and applies the
-   * Position delta in ONE database transaction under Serializable isolation.
+   * Atomically and idempotently processes a single indexed event:
+   * 1. Checks lookaside table and DB for duplicate events before writing.
+   * 2. Resolves User and Asset FKs.
+   * 3. Creates the TransactionHistory row.
+   * 4. Updates Position balance under a row-level lock (FOR UPDATE).
+   * 5. Records event in the IndexerEventDedup lookaside table.
    *
-   * Returns `true` when this call newly indexed the event (and updated the
-   * position); returns `false` when the event's sorobanEventId was already
-   * indexed (duplicate delivery/replay), in which case nothing is written.
-   *
-   * The Position read-modify-write acquires a row-level lock (SELECT … FOR
-   * UPDATE) so concurrent writers on the same (user, asset) cannot lose
-   * deltas.  Serializable isolation guards against write-skew on overlapping
-   * reads within the same snapshot.
+   * Returns `{ isNew: true }` if newly indexed; `{ isNew: false }` if skipped duplicate.
    */
-  async applyEvent(
-    tx: IndexerTransaction,
-    depositedDelta: bigint,
-    borrowedDelta: bigint,
-  ): Promise<boolean> {
+  async processEventSafe(
+    params: {
+      tx: IndexerTransaction;
+      depositedDelta: bigint;
+      borrowedDelta: bigint;
+    },
+    db?: Prisma.TransactionClient,
+  ): Promise<{ isNew: boolean }> {
+    const { tx, depositedDelta, borrowedDelta } = params;
     const timestamp = new Date(tx.timestamp);
-    let isNew = false;
+    const eventIndex = tx.eventIndex ?? extractEventIndex(tx.id);
 
-    try {
-      await this.prisma.withSerializable(async (db) => {
-        const existing = await db.transactionHistory.findUnique({
-          where: { sorobanEventId: tx.id },
-        });
-        if (existing) {
-          // Duplicate delivery/replay: do not double-count balances.
-          return;
-        }
+    const execute = async (client: Prisma.TransactionClient) => {
+      // 1. Lookaside + DB deduplication check
+      const isDup = await this.isEventDuplicate(
+        tx.id,
+        tx.txHash,
+        eventIndex,
+        client,
+      );
+      if (isDup) {
+        return { isNew: false };
+      }
 
-        const user = await this.resolveUser(db, tx.userAddress);
-        const asset = await this.resolveAsset(db, tx.assetAddress);
+      const user = await this.resolveUser(client, tx.userAddress);
+      const asset = await this.resolveAsset(client, tx.assetAddress);
 
-        await db.transactionHistory.create({
+      try {
+        await client.transactionHistory.create({
           data: {
             userId: user.id,
             assetId: asset.id,
             type: TX_TYPE_MAP[tx.type],
-            // Indexed events are already-confirmed on-chain activity.
             status: TransactionStatus.CONFIRMED,
             amountRaw: BigInt(tx.amount),
-            // No price-oracle integration exists yet anywhere in the codebase;
-            // defaulted to 0 pending that separate, unscoped effort.
             amountUsd: 0,
             txHash: tx.txHash || null,
+            eventIndex,
             ledgerSequence: tx.ledger,
             contractId: this.normalize(tx.assetAddress),
             sorobanEventId: tx.id,
@@ -295,34 +410,88 @@ export class IndexerRepository {
         });
 
         await this.applyPositionDelta(
-          db,
+          client,
           user.id,
           asset.id,
           depositedDelta,
           borrowedDelta,
         );
 
-        isNew = true;
-      });
-    } catch (error) {
-      // Race: another writer committed the same sorobanEventId between our
-      // existence check and this create. The whole transaction rolls back, so
-      // neither the TransactionHistory row nor the Position delta survives.
-      if (isUniqueConstraintError(error)) {
-        return false;
+        // Record in lookaside table for fast subsequent dedup
+        await this.recordEventDedup(
+          tx.id,
+          tx.txHash,
+          eventIndex,
+          tx.ledger,
+          3600,
+          client,
+        );
+
+        return { isNew: true };
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          return { isNew: false };
+        }
+        throw error;
       }
-      throw error;
+    };
+
+    if (db) {
+      return execute(db);
     }
 
-    return isNew;
+    return this.prisma.$transaction(execute);
+  }
+
+  /**
+   * Applies all parsed events for a chunk and updates the ledger checkpoint
+   * within a SINGLE atomic Prisma transaction. If killed or failed mid-chunk,
+   * the entire chunk rolls back and the checkpoint remains at the previous boundary.
+   */
+  async processChunk(
+    events: IndexerParsedEvent[],
+    chunkEndLedger: number,
+  ): Promise<{ inserted: number; alreadyProcessed: number }> {
+    return this.prisma.$transaction(async (tx) => {
+      let inserted = 0;
+      let alreadyProcessed = 0;
+
+      for (const item of events) {
+        const result = await this.processEventSafe(item, tx);
+        if (result.isNew) {
+          inserted++;
+        } else {
+          alreadyProcessed++;
+        }
+      }
+
+      if (chunkEndLedger > 0) {
+        await this.saveCheckpoint(chunkEndLedger, tx);
+      }
+
+      return { inserted, alreadyProcessed };
+    });
+  }
+
+  /**
+   * Backward-compatible helper for applying a single event.
+   */
+  async applyEvent(
+    tx: IndexerTransaction,
+    depositedDelta: bigint,
+    borrowedDelta: bigint,
+  ): Promise<boolean> {
+    const result = await this.processEventSafe({
+      tx,
+      depositedDelta,
+      borrowedDelta,
+    });
+    return result.isNew;
   }
 
   /**
    * Applies deltas to a user's position for one asset under a row-level lock,
-   * clamping balances to a minimum of 0. The ensure-exists insert + SELECT …
-   * FOR UPDATE + UPDATE sequence is safe under concurrency: concurrent
-   * writers on the same (user, asset) serialize on the row lock and therefore
-   * cannot lose each other's deltas.
+   * clamping balances to a minimum of 0.
    */
   private async applyPositionDelta(
     db: Prisma.TransactionClient,
@@ -331,17 +500,12 @@ export class IndexerRepository {
     depositedDelta: bigint,
     borrowedDelta: bigint,
   ): Promise<void> {
-    // Ensure the row exists so the FOR UPDATE lock below is taken on a real
-    // row even for brand-new positions (idempotent; concurrent callers race
-    // benignly on the unique index).
     await db.$executeRaw(Prisma.sql`
       INSERT INTO "Position" ("id", "userId", "assetId", "updatedAt")
       VALUES (${randomUUID()}, ${userId}, ${assetId}, CURRENT_TIMESTAMP)
       ON CONFLICT ("userId", "assetId") DO NOTHING
     `);
 
-    // Row-level lock: serialize concurrent read-modify-writes on this
-    // (user, asset) pair.
     const rows = await db.$queryRaw<
       Array<{ depositedRaw: bigint; borrowedRaw: bigint }>
     >(Prisma.sql`
@@ -415,12 +579,8 @@ export class IndexerRepository {
   }
 
   /**
-   * Clears indexer-owned read models (positions, indexed transactions, the
-   * ledger checkpoint) so a replay can rebuild them from scratch. Unlike the
-   * old JSON-file store, these tables are shared with other subsystems
-   * (User/Asset rows may also come from auth/admin), so this intentionally
-   * does NOT wipe Users, Assets, Sessions, or Admins — only rows the
-   * indexer itself produces.
+   * Clears indexer-owned read models (positions, indexed transactions, checkpoints,
+   * and dedup lookaside rows) so a replay can rebuild them from scratch.
    */
   async resetDatabase(): Promise<void> {
     this.logger.log('Resetting indexer database read models (for replay)...');
@@ -432,6 +592,7 @@ export class IndexerRepository {
       this.prisma.indexerCheckpoint.deleteMany({
         where: { id: CHECKPOINT_ID },
       }),
+      this.prisma.indexerEventDedup.deleteMany({}),
     ]);
   }
 }

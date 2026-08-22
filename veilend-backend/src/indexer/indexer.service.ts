@@ -11,13 +11,89 @@ import {
   IndexerRepository,
   IndexerTransaction,
   IndexerPosition,
+  IndexerParsedEvent,
+  extractEventIndex,
 } from './indexer.repository';
+
+export interface ReplayState {
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  fromLedger: number;
+  toLedger: number;
+  currentLedger: number;
+  targetLedger: number;
+  chunkSize: number;
+  percent: number;
+  etaSeconds: number | null;
+  insertedCount: number;
+  alreadyProcessedCount: number;
+  startedAt: string | null;
+  completedAt: string | null;
+  lastError: string | null;
+}
+
+export interface ReplayOptions {
+  fromLedger?: number;
+  toLedger?: number;
+  chunk?: number;
+}
+
+export interface ReplayResult {
+  success: boolean;
+  message: string;
+  status: string;
+  fromLedger: number;
+  toLedger: number;
+  chunk: number;
+  inserted: number;
+  already_processed: number;
+  alreadyProcessed: number;
+  currentLedger: number;
+  percent: number;
+}
+
+export interface SyncStats {
+  syncStatus: 'idle' | 'syncing' | 'replaying' | 'error';
+  currentLedger: number;
+  lastIndexedLedger: number;
+  latestLedger: number | null;
+  lag: number;
+  percent: number;
+  eta: number | null;
+  dedupCounter: number;
+  insertedCounter: number;
+  lastError: string | null;
+  isProcessing: boolean;
+  replay: ReplayState;
+}
+
+const DEFAULT_CHUNK_SIZE = 100;
 
 @Injectable()
 export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(IndexerService.name);
   private isProcessing = false;
   private pollTimeout?: NodeJS.Timeout;
+
+  private syncStatus: 'idle' | 'syncing' | 'replaying' | 'error' = 'idle';
+  private lastError: string | null = null;
+  private dedupCounter = 0;
+  private insertedCounter = 0;
+
+  private replayState: ReplayState = {
+    status: 'idle',
+    fromLedger: 0,
+    toLedger: 0,
+    currentLedger: 0,
+    targetLedger: 0,
+    chunkSize: DEFAULT_CHUNK_SIZE,
+    percent: 0,
+    etaSeconds: null,
+    insertedCount: 0,
+    alreadyProcessedCount: 0,
+    startedAt: null,
+    completedAt: null,
+    lastError: null,
+  };
 
   constructor(
     private readonly configService: AppConfigService,
@@ -50,6 +126,8 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
       return;
     }
     this.isProcessing = true;
+    this.syncStatus = 'syncing';
+    this.lastError = null;
 
     try {
       const configStartLedger = this.configService.indexer.startLedger;
@@ -59,8 +137,18 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
         this.logger.warn(
           'Stellar contract ID not configured. Skipping event indexing.',
         );
+        this.syncStatus = 'idle';
         this.isProcessing = false;
         return;
+      }
+
+      // Periodically clean expired dedup cache rows
+      try {
+        await this.repository.cleanExpiredDedup();
+      } catch (cleanErr) {
+        this.logger.debug(
+          `Dedup cache cleanup notice: ${cleanErr instanceof Error ? cleanErr.message : String(cleanErr)}`,
+        );
       }
 
       const checkpoint = await this.repository.getCheckpoint();
@@ -88,26 +176,253 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
       const latestLedger = latestLedgerResp.sequence;
 
       if (latestLedger > lastLedger) {
+        const startLedger = lastLedger + 1;
         this.logger.log(
-          `Indexing ledgers from ${lastLedger + 1} to ${latestLedger}...`,
+          `Indexing ledgers in transactional chunks from ${startLedger} to ${latestLedger}...`,
         );
-        await this.indexEvents(lastLedger + 1, latestLedger, contractId);
+        await this.indexEventsInChunks(startLedger, latestLedger, contractId);
       }
+      this.syncStatus = 'idle';
     } catch (error) {
-      this.logger.error(
-        `Error in event indexer cycle: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const errMsg = error instanceof Error ? error.message : String(error);
+      this.lastError = errMsg;
+      this.syncStatus = 'error';
+      this.logger.error(`Error in event indexer cycle: ${errMsg}`);
     } finally {
       this.isProcessing = false;
     }
   }
 
+  /**
+   * Processes a ledger range in transactional chunks.
+   * Every chunk commits all event writes, position deltas, dedup lookaside rows,
+   * and the checkpoint advance in a SINGLE prisma.$transaction.
+   */
+  async indexEventsInChunks(
+    startLedger: number,
+    endLedger: number,
+    contractId: string,
+    chunkSize: number = DEFAULT_CHUNK_SIZE,
+    onChunkProcessed?: (chunkProgress: {
+      chunkStart: number;
+      chunkEnd: number;
+      inserted: number;
+      alreadyProcessed: number;
+    }) => void,
+  ): Promise<{ inserted: number; alreadyProcessed: number }> {
+    let totalInserted = 0;
+    let totalAlreadyProcessed = 0;
+
+    for (
+      let chunkStart = startLedger;
+      chunkStart <= endLedger;
+      chunkStart += chunkSize
+    ) {
+      const chunkEnd = Math.min(chunkStart + chunkSize - 1, endLedger);
+      this.logger.debug(
+        `Fetching events for chunk ledgers ${chunkStart}..${chunkEnd}`,
+      );
+
+      const parsedEvents = await this.fetchAndParseEvents(
+        chunkStart,
+        chunkEnd,
+        contractId,
+      );
+
+      const { inserted, alreadyProcessed } = await this.repository.processChunk(
+        parsedEvents,
+        chunkEnd,
+      );
+
+      totalInserted += inserted;
+      totalAlreadyProcessed += alreadyProcessed;
+      this.insertedCounter += inserted;
+      this.dedupCounter += alreadyProcessed;
+
+      if (onChunkProcessed) {
+        onChunkProcessed({
+          chunkStart,
+          chunkEnd,
+          inserted,
+          alreadyProcessed,
+        });
+      }
+    }
+
+    return {
+      inserted: totalInserted,
+      alreadyProcessed: totalAlreadyProcessed,
+    };
+  }
+
+  /**
+   * Legacy wrapper kept for backwards-compatibility.
+   */
   async indexEvents(
     startLedger: number,
     endLedger: number,
     contractId: string,
-  ) {
-    let currentLedger = startLedger - 1;
+  ): Promise<void> {
+    await this.indexEventsInChunks(startLedger, endLedger, contractId);
+  }
+
+  /**
+   * Replays indexing across a given ledger range in incremental chunks
+   * with progress tracking, ETA estimation, and deduplication statistics.
+   */
+  async replay(options?: ReplayOptions): Promise<ReplayResult> {
+    const contractId = this.configService.indexer.contractId;
+    if (!contractId) {
+      throw new Error(
+        'Stellar contract ID not configured. Cannot perform replay.',
+      );
+    }
+
+    let latestLedger = 0;
+    try {
+      const latestResp = await this.rpcService.getLatestLedger();
+      latestLedger = latestResp.sequence;
+    } catch {
+      latestLedger = 0;
+    }
+
+    const fromLedger =
+      typeof options?.fromLedger === 'number' && !isNaN(options.fromLedger)
+        ? Math.max(0, options.fromLedger)
+        : this.configService.indexer.startLedger;
+
+    const toLedger =
+      typeof options?.toLedger === 'number' && !isNaN(options.toLedger)
+        ? options.toLedger
+        : latestLedger > 0
+          ? latestLedger
+          : fromLedger;
+
+    const chunkSize =
+      typeof options?.chunk === 'number' && options.chunk > 0
+        ? options.chunk
+        : DEFAULT_CHUNK_SIZE;
+
+    if (toLedger < fromLedger) {
+      return {
+        success: true,
+        message: 'No ledgers to replay (toLedger < fromLedger)',
+        status: 'completed',
+        fromLedger,
+        toLedger,
+        chunk: chunkSize,
+        inserted: 0,
+        already_processed: 0,
+        alreadyProcessed: 0,
+        currentLedger: fromLedger,
+        percent: 100,
+      };
+    }
+
+    this.isProcessing = true;
+    this.syncStatus = 'replaying';
+    this.lastError = null;
+
+    const startTime = Date.now();
+    const totalLedgers = Math.max(1, toLedger - fromLedger + 1);
+
+    this.replayState = {
+      status: 'running',
+      fromLedger,
+      toLedger,
+      currentLedger: fromLedger,
+      targetLedger: toLedger,
+      chunkSize,
+      percent: 0,
+      etaSeconds: null,
+      insertedCount: 0,
+      alreadyProcessedCount: 0,
+      startedAt: new Date(startTime).toISOString(),
+      completedAt: null,
+      lastError: null,
+    };
+
+    try {
+      this.logger.log(
+        `Starting replay from ledger ${fromLedger} to ${toLedger} (chunk size ${chunkSize})...`,
+      );
+
+      const result = await this.indexEventsInChunks(
+        fromLedger,
+        toLedger,
+        contractId,
+        chunkSize,
+        ({ chunkEnd, inserted, alreadyProcessed }) => {
+          this.replayState.currentLedger = chunkEnd;
+          this.replayState.insertedCount += inserted;
+          this.replayState.alreadyProcessedCount += alreadyProcessed;
+
+          const ledgersProcessed = Math.max(1, chunkEnd - fromLedger + 1);
+          const percent = Math.min(
+            100,
+            Math.round((ledgersProcessed / totalLedgers) * 100),
+          );
+          this.replayState.percent = percent;
+
+          const elapsedMs = Date.now() - startTime;
+          const remainingLedgers = Math.max(0, toLedger - chunkEnd);
+          if (remainingLedgers > 0 && ledgersProcessed > 0) {
+            const msPerLedger = elapsedMs / ledgersProcessed;
+            this.replayState.etaSeconds = Math.round(
+              (remainingLedgers * msPerLedger) / 1000,
+            );
+          } else {
+            this.replayState.etaSeconds = 0;
+          }
+        },
+      );
+
+      this.replayState.status = 'completed';
+      this.replayState.percent = 100;
+      this.replayState.etaSeconds = 0;
+      this.replayState.currentLedger = toLedger;
+      this.replayState.completedAt = new Date().toISOString();
+      this.syncStatus = 'idle';
+
+      this.logger.log(
+        `Replay finished: ${result.inserted} inserted, ${result.alreadyProcessed} already processed.`,
+      );
+
+      return {
+        success: true,
+        message: `Replay completed successfully from ledger ${fromLedger} to ${toLedger}`,
+        status: 'completed',
+        fromLedger,
+        toLedger,
+        chunk: chunkSize,
+        inserted: result.inserted,
+        already_processed: result.alreadyProcessed,
+        alreadyProcessed: result.alreadyProcessed,
+        currentLedger: toLedger,
+        percent: 100,
+      };
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      this.replayState.status = 'failed';
+      this.replayState.lastError = errMsg;
+      this.syncStatus = 'error';
+      this.lastError = errMsg;
+      this.logger.error(`Replay error: ${errMsg}`);
+      throw error;
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+
+  /**
+   * Fetches events for a ledger chunk from Soroban RPC and parses them.
+   */
+  private async fetchAndParseEvents(
+    startLedger: number,
+    endLedger: number,
+    contractId: string,
+  ): Promise<IndexerParsedEvent[]> {
+    const parsedItems: IndexerParsedEvent[] = [];
     let cursor: string | undefined = undefined;
 
     while (true) {
@@ -123,37 +438,26 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
         const requestParams = {
           filters,
           limit: 100,
-          ...(cursor
-            ? { cursor }
-            : { startLedger: currentLedger + 1, endLedger }),
+          ...(cursor ? { cursor } : { startLedger, endLedger }),
         } as unknown as rpc.Api.GetEventsRequest;
 
-        // fetch events using current pagination state
         const response = await this.rpcService.getEvents(requestParams);
         const events = response.events || [];
 
         for (const event of events) {
-          await this.processEvent(event);
+          const parsed = await this.parseEventToItem(event);
+          if (parsed) {
+            parsedItems.push(parsed);
+          }
         }
 
-        if (events.length > 0) {
-          const lastEvent = events[events.length - 1];
-          currentLedger = lastEvent.ledger;
-        } else {
-          currentLedger = endLedger;
-        }
-
-        if (
-          !response.cursor ||
-          events.length < 100 ||
-          currentLedger >= endLedger
-        ) {
+        if (!response.cursor || events.length < 100) {
           break;
         }
         cursor = response.cursor;
       } catch (error) {
         this.logger.error(
-          `Failed to fetch events for range ${currentLedger + 1} to ${endLedger}: ${
+          `Failed to fetch events for range ${startLedger} to ${endLedger}: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -161,20 +465,20 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
       }
     }
 
-    if (currentLedger >= startLedger) {
-      await this.repository.saveCheckpoint(currentLedger);
-      this.logger.log(`Checkpoint updated to ledger: ${currentLedger}`);
-    }
+    return parsedItems;
   }
 
-  private async processEvent(event: {
+  /**
+   * Parses a raw Soroban contract event into an IndexerParsedEvent.
+   */
+  private async parseEventToItem(event: {
     id: string;
     topic: unknown[];
     value: unknown;
     ledgerClosedAt?: string;
     txHash?: string;
     ledger: number;
-  }) {
+  }): Promise<IndexerParsedEvent | null> {
     try {
       const parsedTopics = event.topic.map(
         (t) => scValToNative(t as xdr.ScVal) as unknown,
@@ -182,7 +486,7 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
       const topic0 = this.topicToString(parsedTopics[0]);
 
       if (topic0 !== 'veillend') {
-        return;
+        return null;
       }
 
       const topic1 = this.topicToString(parsedTopics[1]);
@@ -193,15 +497,15 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
       const txHash = event.txHash || '';
       const ledger = event.ledger;
       const id = event.id;
-
-      this.logger.log(
-        `Processing contract event: [${topic1}] for user: ${userAddress} on asset: ${assetAddress}`,
-      );
+      const eventIndex = extractEventIndex(id);
 
       if (topic1 === 'asset_configured') {
         const supported = scValToNative(event.value as xdr.ScVal) as boolean;
         await this.repository.setAssetSupported(assetAddress, supported);
-      } else if (['deposit', 'borrow', 'repay', 'withdraw'].includes(topic1)) {
+        return null;
+      }
+
+      if (['deposit', 'borrow', 'repay', 'withdraw'].includes(topic1)) {
         const amountVal = scValToNative(event.value as xdr.ScVal) as unknown;
         const amount = this.parseAmount(amountVal);
         const amountStr = amount.toString();
@@ -219,33 +523,31 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
           borrowedDelta = -amount;
         }
 
-        // applyEvent already runs under Serializable + deadlock retry inside
-        // the repository; the retry counter and warn logs live in PrismaService.
-        const isNewTx = await this.repository.applyEvent(
-          {
-            id,
-            userAddress,
-            type: topic1 as 'deposit' | 'borrow' | 'repay' | 'withdraw',
-            assetAddress,
-            amount: amountStr,
-            ledger,
-            txHash,
-            timestamp,
-          },
+        const tx: IndexerTransaction = {
+          id,
+          userAddress,
+          type: topic1 as 'deposit' | 'borrow' | 'repay' | 'withdraw',
+          assetAddress,
+          amount: amountStr,
+          ledger,
+          txHash,
+          eventIndex,
+          timestamp,
+        };
+
+        return {
+          tx,
           depositedDelta,
           borrowedDelta,
-        );
-
-        if (!isNewTx) {
-          this.logger.warn(
-            `Skipping duplicate event processing for tx id: ${id}`,
-          );
-        }
+        };
       }
+
+      return null;
     } catch (error) {
       this.logger.error(
-        `Error processing event ${event.id}: ${error instanceof Error ? error.message : String(error)}`,
+        `Error parsing event ${event.id}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      return null;
     }
   }
 
@@ -300,10 +602,62 @@ export class IndexerService implements OnApplicationBootstrap, OnModuleDestroy {
 
   async forceReplay(): Promise<void> {
     await this.repository.resetDatabase();
+    this.dedupCounter = 0;
+    this.insertedCounter = 0;
     this.logger.log(
-      'Force replay requested. Database reset and indexing from start ledger.',
+      'Force replay requested. Database reset and replay triggered.',
     );
-    // Trigger run immediately in the background
-    void this.runIndexer();
+    void this.replay({ fromLedger: this.configService.indexer.startLedger });
+  }
+
+  /**
+   * Returns comprehensive indexer statistics, lag metrics, and replay state.
+   */
+  async getSyncStats(): Promise<SyncStats> {
+    const checkpoint = await this.repository.getCheckpoint();
+    const currentLedger = checkpoint.lastIndexedLedger;
+
+    let latestLedger: number | null = null;
+    try {
+      const resp = await this.rpcService.getLatestLedger();
+      latestLedger = resp.sequence;
+    } catch {
+      latestLedger = null;
+    }
+
+    const lag =
+      latestLedger !== null ? Math.max(0, latestLedger - currentLedger) : 0;
+
+    let percent = 100;
+    let eta: number | null = null;
+
+    if (this.replayState.status === 'running') {
+      percent = this.replayState.percent;
+      eta = this.replayState.etaSeconds;
+    } else if (latestLedger && latestLedger > currentLedger) {
+      const configStart = this.configService.indexer.startLedger;
+      const totalSpan = Math.max(1, latestLedger - configStart);
+      const doneSpan = Math.max(0, currentLedger - configStart);
+      percent = Math.min(100, Math.round((doneSpan / totalSpan) * 100));
+    }
+
+    return {
+      syncStatus: this.syncStatus,
+      currentLedger,
+      lastIndexedLedger: currentLedger,
+      latestLedger,
+      lag,
+      percent,
+      eta,
+      dedupCounter: this.dedupCounter,
+      insertedCounter: this.insertedCounter,
+      lastError: this.lastError,
+      isProcessing: this.isProcessing,
+      replay: { ...this.replayState },
+    };
+  }
+
+  getReplayState(): ReplayState {
+    return { ...this.replayState };
   }
 }
