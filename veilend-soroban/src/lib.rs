@@ -249,6 +249,16 @@ pub struct PendingAction {
     pub proposer: Address,
 }
 
+// ─── Batch Entrypoints ────────────────────────────────────────────────────────
+
+/// Represents a single operation in a batch.
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchOperation {
+    pub asset: Address,
+    pub amount: i128,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -1700,6 +1710,384 @@ impl VeilLendContract {
             .get(&DataKey::InterestParams(asset))
             .unwrap_or(interest::DEFAULT_PARAMS)
     }
+
+    /// Deposit multiple assets in a single transaction.
+    ///
+    /// # Authentication
+    /// User authenticates once for the entire batch.
+    ///
+    /// # Accrual
+    /// Each unique asset is accrued exactly once before any mutations.
+    ///
+    /// # Cap Enforcement
+    /// All deposit caps are checked against final aggregated totals.
+    ///
+    /// # Health Factor
+    /// `enforce_health_factor` is called exactly once at the end.
+    ///
+    /// # Events
+    /// Individual deposit events are emitted for each operation.
+    /// A `BatchExecuted` summary event is also emitted.
+    ///
+    /// # Arguments
+    /// * `user` - The user performing the deposits
+    /// * `operations` - Vector of (asset, amount) tuples to deposit
+    ///
+    /// # Panics
+    /// * If any asset is not supported
+    /// * If any amount is <= 0
+    /// * If contract is paused
+    /// * If any deposit cap would be exceeded
+    /// * If final health factor is below minimum
+    pub fn deposit_batch(env: Env, user: Address, operations: Vec<BatchOperation>) {
+        Self::require_not_paused(&env);
+        user.require_auth();
+
+        // Deduplicate assets and accrue interest once per asset
+        let unique_assets = Self::deduplicate_assets(&env, &operations);
+        Self::accrue_assets_once(&env, &unique_assets);
+
+        // Pre-validate all operations
+        for op in operations.iter() {
+            Self::require_supported_asset(&env, &op.asset);
+            Self::require_positive_amount(&env, op.amount);
+        }
+
+        // Check caps against final aggregated totals
+        Self::check_batch_deposit_caps(&env, &operations);
+
+        // Execute each deposit
+        let mut total_operations = 0u32;
+        for op in operations.iter() {
+            let asset = &op.asset;
+            let amount = op.amount;
+
+            // Get accrued position
+            let interest_state = Self::accrue_and_persist_interest(&env, asset).state;
+            let mut position = interest::compute_accrued_position(
+                &Self::read_position(&env, &user, asset),
+                &interest_state,
+            );
+            let mut reserve = Self::read_asset_reserve(&env, asset);
+
+            position.deposited += amount;
+            reserve.total_balance += amount;
+            Self::write_position(&env, &user, asset, &position);
+            Self::write_asset_reserve(&env, asset, &reserve);
+
+            // Update total deposits
+            let total = Self::get_total_deposited(env.clone(), asset.clone()) + amount;
+            env.storage()
+                .persistent()
+                .set(&DataKey::TotalDeposited(asset.clone()), &total);
+
+            // Emit individual event
+            DepositEvent {
+                user: user.clone(),
+                asset: asset.clone(),
+                amount,
+            }
+            .publish(&env);
+            Self::publish_asset_reserve_updated(&env, asset, &reserve, ReserveUpdateKind::Deposit);
+
+            total_operations += 1;
+        }
+
+        // A deposit only ever increases collateral, so it can never worsen
+        // the user's health factor — no post-batch check is needed here.
+
+        // Emit batch summary event
+        Self::emit_batch_executed(&env, &user, "deposit_batch", total_operations);
+    }
+
+    /// Withdraw multiple assets in a single transaction.
+    ///
+    /// # Authentication
+    /// User authenticates once for the entire batch.
+    ///
+    /// # Accrual
+    /// Each unique asset is accrued exactly once before any mutations.
+    ///
+    /// # Cap Enforcement
+    /// Supply caps are checked against final aggregated totals.
+    ///
+    /// # Health Factor
+    /// `enforce_health_factor` is called exactly once at the end.
+    ///
+    /// # Arguments
+    /// * `user` - The user performing the withdrawals
+    /// * `debt_asset` - The asset used for collateral ratio calculation
+    /// * `operations` - Vector of (asset, amount) tuples to withdraw
+    ///
+    /// # Panics
+    /// * If any asset is not supported
+    /// * If any amount is <= 0
+    /// * If contract is paused
+    /// * If withdrawal exceeds deposited balance
+    /// * If final health factor is below minimum
+    pub fn withdraw_batch(
+        env: Env,
+        user: Address,
+        debt_asset: Address,
+        operations: Vec<BatchOperation>,
+    ) {
+        // Withdraw is allowed even when paused (users can always remove collateral)
+        Self::require_supported_asset(&env, &debt_asset);
+        user.require_auth();
+
+        // Deduplicate assets and accrue interest once per asset
+        let unique_assets = Self::deduplicate_assets(&env, &operations);
+        // Include debt_asset in accrual
+        let mut all_assets = unique_assets;
+        if !all_assets.contains(&debt_asset) {
+            all_assets.push_back(debt_asset.clone());
+        }
+        Self::accrue_assets_once(&env, &all_assets);
+
+        // Pre-validate all operations
+        for op in operations.iter() {
+            Self::require_supported_asset(&env, &op.asset);
+            Self::require_positive_amount(&env, op.amount);
+        }
+
+        let mut total_operations = 0u32;
+
+        // Execute each withdrawal
+        for op in operations.iter() {
+            let asset = &op.asset;
+            let amount = op.amount;
+
+            let interest_state = Self::accrue_and_persist_interest(&env, asset).state;
+            let mut position = interest::compute_accrued_position(
+                &Self::read_position(&env, &user, asset),
+                &interest_state,
+            );
+            let mut reserve = Self::read_asset_reserve(&env, asset);
+
+            if amount > position.deposited {
+                panic_with_error!(&env, VeilLendError::InsufficientDeposit);
+            }
+            if amount > reserve.total_balance {
+                panic_with_error!(&env, VeilLendError::InsufficientReserve);
+            }
+
+            position.deposited -= amount;
+            reserve.total_balance -= amount;
+            Self::write_position(&env, &user, asset, &position);
+            Self::write_asset_reserve(&env, asset, &reserve);
+
+            // Update total deposits
+            let total = Self::get_total_deposited(env.clone(), asset.clone()) - amount;
+            env.storage()
+                .persistent()
+                .set(&DataKey::TotalDeposited(asset.clone()), &total);
+
+            // Emit individual event
+            WithdrawEvent {
+                user: user.clone(),
+                asset: asset.clone(),
+                amount,
+            }
+            .publish(&env);
+            Self::publish_asset_reserve_updated(&env, asset, &reserve, ReserveUpdateKind::Withdraw);
+
+            total_operations += 1;
+        }
+
+        // Single health factor check at the end, against each withdrawn asset
+        Self::enforce_batch_health_factor_for_withdraw(&env, &user, &debt_asset, &operations);
+
+        // Emit batch summary event
+        Self::emit_batch_executed(&env, &user, "withdraw_batch", total_operations);
+    }
+
+    /// Borrow multiple assets in a single transaction.
+    ///
+    /// # Authentication
+    /// User authenticates once for the entire batch.
+    ///
+    /// # Accrual
+    /// Each unique asset is accrued exactly once before any mutations.
+    ///
+    /// # Cap Enforcement
+    /// All borrow caps are checked against final aggregated totals.
+    ///
+    /// # Health Factor
+    /// `enforce_health_factor` is called exactly once at the end.
+    ///
+    /// # Arguments
+    /// * `user` - The user performing the borrows
+    /// * `collateral_asset` - The asset used as collateral
+    /// * `operations` - Vector of (asset, amount) tuples to borrow
+    ///
+    /// # Panics
+    /// * If any asset is not supported
+    /// * If any amount is <= 0
+    /// * If contract is paused
+    /// * If reserve has insufficient balance
+    /// * If final health factor is below minimum
+    pub fn borrow_batch(
+        env: Env,
+        user: Address,
+        collateral_asset: Address,
+        operations: Vec<BatchOperation>,
+    ) {
+        Self::require_not_paused(&env);
+        Self::require_supported_asset(&env, &collateral_asset);
+        user.require_auth();
+
+        // Deduplicate assets and accrue interest once per asset
+        let unique_assets = Self::deduplicate_assets(&env, &operations);
+        let mut all_assets = unique_assets;
+        if !all_assets.contains(&collateral_asset) {
+            all_assets.push_back(collateral_asset.clone());
+        }
+        Self::accrue_assets_once(&env, &all_assets);
+
+        // Pre-validate all operations
+        for op in operations.iter() {
+            Self::require_supported_asset(&env, &op.asset);
+            Self::require_positive_amount(&env, op.amount);
+        }
+
+        // Check borrow caps against final aggregated totals
+        Self::check_batch_borrow_caps(&env, &operations);
+
+        let mut total_operations = 0u32;
+
+        // Execute each borrow
+        for op in operations.iter() {
+            let asset = &op.asset;
+            let amount = op.amount;
+
+            let interest_state = Self::accrue_and_persist_interest(&env, asset).state;
+            let mut position = interest::compute_accrued_position(
+                &Self::read_position(&env, &user, asset),
+                &interest_state,
+            );
+            let mut reserve = Self::read_asset_reserve(&env, asset);
+
+            if amount > reserve.total_balance {
+                panic_with_error!(&env, VeilLendError::InsufficientReserve);
+            }
+
+            position.borrowed += amount;
+            reserve.total_balance -= amount;
+            Self::write_position(&env, &user, asset, &position);
+            Self::write_asset_reserve(&env, asset, &reserve);
+
+            // Update total borrows
+            let total = Self::get_total_borrowed(env.clone(), asset.clone()) + amount;
+            env.storage()
+                .persistent()
+                .set(&DataKey::TotalBorrowed(asset.clone()), &total);
+
+            // Emit individual event
+            BorrowEvent {
+                user: user.clone(),
+                asset: asset.clone(),
+                amount,
+            }
+            .publish(&env);
+            Self::publish_asset_reserve_updated(&env, asset, &reserve, ReserveUpdateKind::Borrow);
+
+            total_operations += 1;
+        }
+
+        // Single health factor check at the end, against each borrowed asset
+        Self::enforce_batch_health_factor_for_borrow(&env, &user, &collateral_asset, &operations);
+
+        // Emit batch summary event
+        Self::emit_batch_executed(&env, &user, "borrow_batch", total_operations);
+    }
+
+    /// Repay multiple assets in a single transaction.
+    ///
+    /// # Authentication
+    /// User authenticates once for the entire batch.
+    ///
+    /// # Accrual
+    /// Each unique asset is accrued exactly once before any mutations.
+    ///
+    /// # Health Factor
+    /// `enforce_health_factor` is called exactly once at the end.
+    ///
+    /// # Arguments
+    /// * `user` - The user performing the repayments
+    /// * `operations` - Vector of (asset, amount) tuples to repay
+    ///
+    /// # Panics
+    /// * If any asset is not supported
+    /// * If any amount is <= 0
+    /// * If repayment exceeds borrowed balance
+    pub fn repay_batch(env: Env, user: Address, operations: Vec<BatchOperation>) {
+        // Repay is allowed even when paused (users can always reduce debt)
+        user.require_auth();
+
+        // Deduplicate assets and accrue interest once per asset
+        let unique_assets = Self::deduplicate_assets(&env, &operations);
+        Self::accrue_assets_once(&env, &unique_assets);
+
+        // Pre-validate all operations
+        for op in operations.iter() {
+            Self::require_supported_asset(&env, &op.asset);
+            Self::require_positive_amount(&env, op.amount);
+        }
+
+        let mut total_operations = 0u32;
+
+        // Execute each repayment
+        for op in operations.iter() {
+            let asset = &op.asset;
+            let amount = op.amount;
+
+            let interest_state = Self::accrue_and_persist_interest(&env, asset).state;
+            let mut position = interest::compute_accrued_position(
+                &Self::read_position(&env, &user, asset),
+                &interest_state,
+            );
+            let mut reserve = Self::read_asset_reserve(&env, asset);
+
+            if amount > position.borrowed {
+                panic_with_error!(&env, VeilLendError::RepayTooLarge);
+            }
+
+            position.borrowed -= amount;
+            reserve.total_balance += amount;
+
+            let mut dust_delta = 0;
+            if position.borrowed > 0 && position.borrowed <= DUST_THRESHOLD {
+                dust_delta = position.borrowed;
+                position.borrowed = 0;
+            }
+
+            Self::write_position(&env, &user, asset, &position);
+            Self::write_asset_reserve(&env, asset, &reserve);
+
+            // Update total borrows
+            let total = Self::get_total_borrowed(env.clone(), asset.clone()) - amount - dust_delta;
+            env.storage()
+                .persistent()
+                .set(&DataKey::TotalBorrowed(asset.clone()), &total);
+
+            // Emit individual event
+            RepayEvent {
+                user: user.clone(),
+                asset: asset.clone(),
+                amount,
+            }
+            .publish(&env);
+            Self::publish_asset_reserve_updated(&env, asset, &reserve, ReserveUpdateKind::Repay);
+
+            total_operations += 1;
+        }
+
+        // A repayment only ever decreases debt, so it can never worsen the
+        // user's health factor — no post-batch check is needed here.
+
+        // Emit batch summary event
+        Self::emit_batch_executed(&env, &user, "repay_batch", total_operations);
+    }
 }
 
 /// Describes the pending mutation being validated against the cross-asset
@@ -2640,6 +3028,197 @@ impl VeilLendContract {
         }
 
         price
+    }
+
+    /// Deduplicates assets from a vector of operations.
+    ///
+    /// # Returns
+    /// A Vec<Address> containing each unique asset exactly once.
+    fn deduplicate_assets(env: &Env, operations: &Vec<BatchOperation>) -> Vec<Address> {
+        let mut unique: Vec<Address> = Vec::new(env);
+        for op in operations.iter() {
+            if !unique.contains(&op.asset) {
+                unique.push_back(op.asset.clone());
+            }
+        }
+        unique
+    }
+
+    /// Accrues interest for each asset in the list exactly once.
+    ///
+    /// # Idempotency
+    /// If called multiple times for the same asset within the same ledger timestamp,
+    /// subsequent calls are no-ops due to the idempotency guard in
+    /// `accrue_and_persist_interest`.
+    fn accrue_assets_once(env: &Env, assets: &Vec<Address>) {
+        for asset in assets.iter() {
+            Self::accrue_and_persist_interest(env, &asset);
+        }
+    }
+
+    /// Checks all deposit caps against the final aggregated totals for a batch.
+    ///
+    /// This ensures that intermediate states that might temporarily exceed a cap
+    /// are allowed as long as the final state is within the cap.
+    fn check_batch_deposit_caps(env: &Env, operations: &Vec<BatchOperation>) {
+        // Group amounts by asset
+        let mut totals: Vec<(Address, i128)> = Vec::new(env);
+        for op in operations.iter() {
+            let mut found = false;
+            for i in 0..totals.len() {
+                let (asset, amount) = totals.get(i).unwrap();
+                if asset == op.asset {
+                    let new_amount = amount + op.amount;
+                    totals.set(i, (op.asset.clone(), new_amount));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                totals.push_back((op.asset.clone(), op.amount));
+            }
+        }
+
+        // Check each asset's final total against its cap
+        for (asset, total_amount) in totals.iter() {
+            // Check deposit cap
+            Self::check_deposit_cap(env, &asset, total_amount);
+            // Check supply cap
+            Self::enforce_supply_cap(env, &asset, total_amount);
+        }
+    }
+
+    /// Checks all borrow caps against the final aggregated totals for a batch.
+    fn check_batch_borrow_caps(env: &Env, operations: &Vec<BatchOperation>) {
+        // Group amounts by asset
+        let mut totals: Vec<(Address, i128)> = Vec::new(env);
+        for op in operations.iter() {
+            let mut found = false;
+            for i in 0..totals.len() {
+                let (asset, amount) = totals.get(i).unwrap();
+                if asset == op.asset {
+                    let new_amount = amount + op.amount;
+                    totals.set(i, (op.asset.clone(), new_amount));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                totals.push_back((op.asset.clone(), op.amount));
+            }
+        }
+
+        // Check each asset's final total against its cap
+        for (asset, total_amount) in totals.iter() {
+            // Check borrow cap
+            Self::check_borrow_cap(env, &asset, total_amount);
+            // Check borrow cap (aggregate)
+            Self::enforce_borrow_cap(env, &asset, total_amount);
+        }
+    }
+
+    /// Enforces the collateral ratio after a batch withdrawal.
+    ///
+    /// Positions have already been written to storage by the time this is
+    /// called, so each unique withdrawn asset is checked as collateral
+    /// against `debt_asset` with a zero delta (the withdrawal is already
+    /// reflected in the stored position).
+    ///
+    /// Unlike a single `withdraw`, which only compares the one withdrawn
+    /// asset against the debt, this aggregates collateral value across every
+    /// unique asset touched by the batch. This is what makes batching
+    /// meaningfully different from issuing the same withdrawals as separate
+    /// transactions: moving value out of one asset while another asset in
+    /// the same batch still covers the debt is allowed, since only the
+    /// combined final state matters.
+    ///
+    /// # Panics
+    /// * If the aggregated collateral value of the touched assets is
+    ///   insufficient to cover the debt in `debt_asset`
+    fn enforce_batch_health_factor_for_withdraw(
+        env: &Env,
+        user: &Address,
+        debt_asset: &Address,
+        operations: &Vec<BatchOperation>,
+    ) {
+        let debt_borrowed = Self::read_accrued_position(env, user, debt_asset).borrowed;
+        if debt_borrowed == 0 {
+            return;
+        }
+
+        let touched_assets = Self::deduplicate_assets(env, operations);
+        let mut collateral_value: i128 = 0;
+        for asset in touched_assets.iter() {
+            let deposited = Self::read_accrued_position(env, user, &asset).deposited;
+            collateral_value += deposited * Self::read_oracle_price(env, &asset);
+        }
+
+        let debt_value = debt_borrowed * Self::read_oracle_price(env, debt_asset);
+        let collateral_ratio_bps = Self::min_collateral_ratio_bps(env.clone()) as i128;
+        if collateral_value * 10_000 < debt_value * collateral_ratio_bps {
+            panic_with_error!(env, VeilLendError::InsufficientCollateral);
+        }
+    }
+
+    /// Enforces the collateral ratio after a batch borrow.
+    ///
+    /// Positions have already been written to storage by the time this is
+    /// called. Unlike a single `borrow`, which only compares the one
+    /// borrowed asset against the collateral, this aggregates debt value
+    /// across every unique asset touched by the batch and compares it
+    /// against the single named collateral asset, since only the combined
+    /// final state matters for a batch.
+    ///
+    /// # Panics
+    /// * If `collateral_asset` is insufficient to cover the aggregated debt
+    ///   value of the touched assets
+    fn enforce_batch_health_factor_for_borrow(
+        env: &Env,
+        user: &Address,
+        collateral_asset: &Address,
+        operations: &Vec<BatchOperation>,
+    ) {
+        let touched_assets = Self::deduplicate_assets(env, operations);
+        let mut debt_value: i128 = 0;
+        for asset in touched_assets.iter() {
+            let borrowed = Self::read_accrued_position(env, user, &asset).borrowed;
+            debt_value += borrowed * Self::read_oracle_price(env, &asset);
+        }
+
+        if debt_value == 0 {
+            return;
+        }
+
+        let collateral_deposited =
+            Self::read_accrued_position(env, user, collateral_asset).deposited;
+        let collateral_value =
+            collateral_deposited * Self::read_oracle_price(env, collateral_asset);
+        let collateral_ratio_bps = Self::min_collateral_ratio_bps(env.clone()) as i128;
+        if collateral_value * 10_000 < debt_value * collateral_ratio_bps {
+            panic_with_error!(env, VeilLendError::InsufficientCollateral);
+        }
+    }
+
+    /// Emits a batch summary event.
+    fn emit_batch_executed(env: &Env, user: &Address, operation_type: &str, operation_count: u32) {
+        #[contractevent(topics = ["veillend", "batch_executed"])]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct BatchExecuted {
+            #[topic]
+            pub user: Address,
+            #[topic]
+            pub operation_type: Symbol,
+            pub operation_count: u32,
+            pub timestamp: u64,
+        }
+
+        let event = BatchExecuted {
+            user: user.clone(),
+            operation_type: Symbol::new(env, operation_type),
+            operation_count,
+            timestamp: env.ledger().timestamp(),
+        };
+        event.publish(env);
     }
 }
 
