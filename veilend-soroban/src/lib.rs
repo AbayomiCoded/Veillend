@@ -14,6 +14,12 @@ use soroban_sdk::{
 mod flash_loan;
 mod flash_loan_receiver_example;
 
+mod permit;
+mod permit_helpers;
+
+pub use permit::{DomainSeparator, Permit, PermitWithExtra};
+pub use permit_helpers::{VerifiedPermit, verify_and_consume_permit};
+
 #[cfg(test)]
 mod test_flash_loan;
 
@@ -132,6 +138,8 @@ pub enum DataKey {
     /// for indexers, distinct from the current withdrawable balance
     /// (`AssetReserve.protocol_fees`).
     LifetimeReserveEarned(Address),
+    /// Monotonically increasing permit nonce per user (persistent storage)
+    PermitNonce(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -349,6 +357,14 @@ pub enum VeilLendError {
     /// Interest-rate model parameters are out of the allowed bounds.
     /// See `set_interest_params` for the exact validation rules.
     InvalidInterestParams = 40,
+    /// Permit signature verification failed
+    InvalidSignature = 41,
+    /// Permit has expired (deadline passed)
+    PermitExpired = 42,
+    /// Permit nonce does not match the expected value
+    PermitNonceMismatch = 43,
+    /// Permit chain ID does not match the contract's chain ID
+    PermitChainMismatch = 44,
 }
 
 #[contractevent(topics = ["veillend", "asset_configured"])]
@@ -2088,6 +2104,369 @@ impl VeilLendContract {
         // Emit batch summary event
         Self::emit_batch_executed(&env, &user, "repay_batch", total_operations);
     }
+
+    // ─── Permit Entrypoints ──────────────────────────────────────────────────────
+
+/// Returns the domain separator for this contract instance.
+///
+/// This is used by off-chain signers to construct the permit digest.
+pub fn get_domain_separator(env: Env) -> DomainSeparator {
+    DomainSeparator {
+        contract_id: env.current_contract_address(),
+        version: CONTRACT_VERSION,
+        chain_id: env.ledger().network_id().into(),
+    }
+}
+
+/// Gets the current permit nonce for a user.
+pub fn get_permit_nonce(env: Env, user: Address) -> u64 {
+    permit::get_current_nonce(&env, &user)
+}
+
+/// Deposit on behalf of a user using a signed permit.
+///
+/// # Arguments
+/// * `permit` - The signed permit structure
+/// * `signature` - The ed25519 signature (64 bytes)
+/// * `asset` - The asset to deposit
+/// * `amount` - The amount to deposit
+///
+/// # Authentication
+/// No direct authentication is required - the permit signature verifies
+/// the user's authorization.
+///
+/// # Panics
+/// * If the signature is invalid
+/// * If the permit is expired
+/// * If the nonce doesn't match
+/// * If the asset is not supported
+/// * If the amount is invalid
+pub fn deposit_for(
+    env: Env,
+    permit: Permit,
+    signature: Bytes,
+    asset: Address,
+    amount: i128,
+) {
+    // Verify and consume the permit
+    let domain = Self::get_domain_separator(env.clone());
+    let verified = permit_helpers::verify_and_consume_permit(
+        &env,
+        &domain,
+        &permit,
+        &signature,
+    ).unwrap();
+
+    // Ensure the action matches
+    if verified.action != Symbol::new(&env, "deposit") {
+        panic_with_error!(&env, VeilLendError::InvalidSignature);
+    }
+
+    // Ensure the permit's asset matches the call parameter
+    if verified.asset != asset {
+        panic_with_error!(&env, VeilLendError::UnsupportedAsset);
+    }
+    if verified.amount != amount {
+        panic_with_error!(&env, VeilLendError::InvalidAmount);
+    }
+
+    // Execute the deposit using the internal helper
+    Self::do_deposit(&env, &verified.user, &asset, amount);
+}
+
+/// Withdraw on behalf of a user using a signed permit.
+///
+/// # Arguments
+/// * `permit` - The signed permit structure
+/// * `signature` - The ed25519 signature (64 bytes)
+/// * `withdrawn_asset` - The asset to withdraw
+/// * `debt_asset` - The asset used for collateral ratio calculation
+/// * `amount` - The amount to withdraw
+///
+/// # Authentication
+/// No direct authentication is required - the permit signature verifies
+/// the user's authorization.
+pub fn withdraw_for(
+    env: Env,
+    permit: Permit,
+    signature: Bytes,
+    withdrawn_asset: Address,
+    debt_asset: Address,
+    amount: i128,
+) {
+    let domain = Self::get_domain_separator(env.clone());
+    let verified = permit_helpers::verify_and_consume_permit(
+        &env,
+        &domain,
+        &permit,
+        &signature,
+    ).unwrap();
+
+    if verified.action != Symbol::new(&env, "withdraw") {
+        panic_with_error!(&env, VeilLendError::InvalidSignature);
+    }
+    if verified.asset != withdrawn_asset {
+        panic_with_error!(&env, VeilLendError::UnsupportedAsset);
+    }
+    if verified.amount != amount {
+        panic_with_error!(&env, VeilLendError::InvalidAmount);
+    }
+
+    Self::do_withdraw(&env, &verified.user, &withdrawn_asset, &debt_asset, amount);
+}
+
+/// Borrow on behalf of a user using a signed permit.
+///
+/// # Arguments
+/// * `permit` - The signed permit structure
+/// * `signature` - The ed25519 signature (64 bytes)
+/// * `borrow_asset` - The asset to borrow
+/// * `collateral_asset` - The asset used as collateral
+/// * `amount` - The amount to borrow
+pub fn borrow_for(
+    env: Env,
+    permit: Permit,
+    signature: Bytes,
+    borrow_asset: Address,
+    collateral_asset: Address,
+    amount: i128,
+) {
+    let domain = Self::get_domain_separator(env.clone());
+    let verified = permit_helpers::verify_and_consume_permit(
+        &env,
+        &domain,
+        &permit,
+        &signature,
+    ).unwrap();
+
+    if verified.action != Symbol::new(&env, "borrow") {
+        panic_with_error!(&env, VeilLendError::InvalidSignature);
+    }
+    if verified.asset != borrow_asset {
+        panic_with_error!(&env, VeilLendError::UnsupportedAsset);
+    }
+    if verified.amount != amount {
+        panic_with_error!(&env, VeilLendError::InvalidAmount);
+    }
+
+    Self::do_borrow(&env, &verified.user, &borrow_asset, &collateral_asset, amount);
+}
+
+/// Repay on behalf of a user using a signed permit.
+///
+/// # Arguments
+/// * `permit` - The signed permit structure
+/// * `signature` - The ed25519 signature (64 bytes)
+/// * `asset` - The asset to repay
+/// * `amount` - The amount to repay
+pub fn repay_for(
+    env: Env,
+    permit: Permit,
+    signature: Bytes,
+    asset: Address,
+    amount: i128,
+) {
+    let domain = Self::get_domain_separator(env.clone());
+    let verified = permit_helpers::verify_and_consume_permit(
+        &env,
+        &domain,
+        &permit,
+        &signature,
+    ).unwrap();
+
+    if verified.action != Symbol::new(&env, "repay") {
+        panic_with_error!(&env, VeilLendError::InvalidSignature);
+    }
+    if verified.asset != asset {
+        panic_with_error!(&env, VeilLendError::UnsupportedAsset);
+    }
+    if verified.amount != amount {
+        panic_with_error!(&env, VeilLendError::InvalidAmount);
+    }
+
+    Self::do_repay(&env, &verified.user, &asset, amount);
+}
+
+// ─── Internal Helpers for Permit Entrypoints ──────────────────────────────
+
+/// Internal deposit helper used by both direct and permit deposit.
+fn do_deposit(env: &Env, user: &Address, asset: &Address, amount: i128) {
+    Self::require_not_paused(env);
+    Self::require_supported_asset(env, asset);
+    Self::require_positive_amount(env, amount);
+
+    let interest_state = Self::accrue_and_persist_interest(env, asset).state;
+    Self::check_deposit_cap(env, asset, amount);
+    Self::enforce_supply_cap(env, asset, amount);
+
+    let mut position = interest::compute_accrued_position(
+        &Self::read_position(env, user, asset),
+        &interest_state,
+    );
+    let mut reserve = Self::read_asset_reserve(env, asset);
+    position.deposited += amount;
+    reserve.total_balance += amount;
+    Self::write_position(env, user, asset, &position);
+    Self::write_asset_reserve(env, asset, &reserve);
+
+    let total = Self::get_total_deposited(env.clone(), asset.clone()) + amount;
+    env.storage()
+        .persistent()
+        .set(&DataKey::TotalDeposited(asset.clone()), &total);
+
+    DepositEvent {
+        user: user.clone(),
+        asset: asset.clone(),
+        amount,
+    }
+    .publish(env);
+    Self::publish_asset_reserve_updated(env, asset, &reserve, ReserveUpdateKind::Deposit);
+}
+
+/// Internal withdraw helper used by both direct and permit withdraw.
+fn do_withdraw(
+    env: &Env,
+    user: &Address,
+    withdrawn_asset: &Address,
+    debt_asset: &Address,
+    amount: i128,
+) {
+    Self::require_supported_asset(env, withdrawn_asset);
+    Self::require_supported_asset(env, debt_asset);
+    Self::require_positive_amount(env, amount);
+
+    let interest_state = Self::accrue_and_persist_interest(env, withdrawn_asset).state;
+
+    let mut position = interest::compute_accrued_position(
+        &Self::read_position(env, user, withdrawn_asset),
+        &interest_state,
+    );
+    let mut reserve = Self::read_asset_reserve(env, withdrawn_asset);
+    if amount > position.deposited {
+        panic_with_error!(env, VeilLendError::InsufficientDeposit);
+    }
+    if amount > reserve.total_balance {
+        panic_with_error!(env, VeilLendError::InsufficientReserve);
+    }
+
+    position.deposited -= amount;
+    reserve.total_balance -= amount;
+    Self::assert_collateralized(
+        env,
+        withdrawn_asset,
+        debt_asset,
+        user,
+        CollateralAction::Withdraw { amount },
+    );
+    Self::write_position(env, user, withdrawn_asset, &position);
+    Self::write_asset_reserve(env, withdrawn_asset, &reserve);
+
+    let total = Self::get_total_deposited(env.clone(), withdrawn_asset.clone()) - amount;
+    env.storage()
+        .persistent()
+        .set(&DataKey::TotalDeposited(withdrawn_asset.clone()), &total);
+
+    WithdrawEvent {
+        user: user.clone(),
+        asset: withdrawn_asset.clone(),
+        amount,
+    }
+    .publish(env);
+    Self::publish_asset_reserve_updated(env, withdrawn_asset, &reserve, ReserveUpdateKind::Withdraw);
+}
+
+/// Internal borrow helper used by both direct and permit borrow.
+fn do_borrow(
+    env: &Env,
+    user: &Address,
+    borrow_asset: &Address,
+    collateral_asset: &Address,
+    amount: i128,
+) {
+    Self::require_not_paused(env);
+    Self::require_supported_asset(env, borrow_asset);
+    Self::require_supported_asset(env, collateral_asset);
+    Self::require_positive_amount(env, amount);
+
+    let interest_state = Self::accrue_and_persist_interest(env, borrow_asset).state;
+    Self::check_borrow_cap(env, borrow_asset, amount);
+    Self::enforce_borrow_cap(env, borrow_asset, amount);
+
+    let mut position = interest::compute_accrued_position(
+        &Self::read_position(env, user, borrow_asset),
+        &interest_state,
+    );
+    let mut reserve = Self::read_asset_reserve(env, borrow_asset);
+    if amount > reserve.total_balance {
+        panic_with_error!(env, VeilLendError::InsufficientReserve);
+    }
+    position.borrowed += amount;
+    reserve.total_balance -= amount;
+    Self::assert_collateralized(
+        env,
+        collateral_asset,
+        borrow_asset,
+        user,
+        CollateralAction::Borrow { amount },
+    );
+    Self::write_position(env, user, borrow_asset, &position);
+    Self::write_asset_reserve(env, borrow_asset, &reserve);
+
+    let total = Self::get_total_borrowed(env.clone(), borrow_asset.clone()) + amount;
+    env.storage()
+        .persistent()
+        .set(&DataKey::TotalBorrowed(borrow_asset.clone()), &total);
+
+    BorrowEvent {
+        user: user.clone(),
+        asset: borrow_asset.clone(),
+        amount,
+    }
+    .publish(env);
+    Self::publish_asset_reserve_updated(env, borrow_asset, &reserve, ReserveUpdateKind::Borrow);
+}
+
+/// Internal repay helper used by both direct and permit repay.
+fn do_repay(env: &Env, user: &Address, asset: &Address, amount: i128) {
+    Self::require_supported_asset(env, asset);
+    Self::require_positive_amount(env, amount);
+
+    let interest_state = Self::accrue_and_persist_interest(env, asset).state;
+
+    let mut position = interest::compute_accrued_position(
+        &Self::read_position(env, user, asset),
+        &interest_state,
+    );
+    let mut reserve = Self::read_asset_reserve(env, asset);
+    if amount > position.borrowed {
+        panic_with_error!(env, VeilLendError::RepayTooLarge);
+    }
+
+    position.borrowed -= amount;
+    reserve.total_balance += amount;
+
+    let mut dust_delta = 0;
+    if position.borrowed > 0 && position.borrowed <= DUST_THRESHOLD {
+        dust_delta = position.borrowed;
+        position.borrowed = 0;
+    }
+
+    Self::write_position(env, user, asset, &position);
+    Self::write_asset_reserve(env, asset, &reserve);
+
+    let total = Self::get_total_borrowed(env.clone(), asset.clone()) - amount - dust_delta;
+    env.storage()
+        .persistent()
+        .set(&DataKey::TotalBorrowed(asset.clone()), &total);
+
+    RepayEvent {
+        user: user.clone(),
+        asset: asset.clone(),
+        amount,
+    }
+    .publish(env);
+    Self::publish_asset_reserve_updated(env, asset, &reserve, ReserveUpdateKind::Repay);
+}
 }
 
 /// Describes the pending mutation being validated against the cross-asset
