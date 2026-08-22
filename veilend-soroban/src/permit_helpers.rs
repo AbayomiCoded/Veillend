@@ -1,8 +1,8 @@
 //! Permit helper functions for the Veilend contract.
 
-use crate::permit::{compute_permit_digest, DomainSeparator, Permit};
+use crate::permit::{DomainSeparator, Permit};
 use crate::DataKey;
-use soroban_sdk::{contracttype, Address, Bytes, Env, Symbol};
+use soroban_sdk::{Address, Bytes, Env, Symbol};
 
 /// A verified permit that has passed signature, deadline, and nonce checks.
 ///
@@ -42,26 +42,49 @@ pub fn verify_and_consume_permit(
     permit: &Permit,
     signature: &Bytes,
 ) -> Result<VerifiedPermit, crate::VeilLendError> {
-    use crate::VeilLendError;
-    use crate::permit::{validate_permit, verify_permit, advance_nonce, emit_permit_executed};
+    use crate::permit::{
+        advance_nonce, emit_permit_executed, emit_permit_failed, signer_address, validate_permit,
+        verify_permit,
+    };
 
-    // Verify the signature
-    verify_permit(env, domain, permit, signature)?;
+    // The acting Address is a pure function of the public key, so it can be
+    // derived up front and used to annotate a PermitFailed event on any of
+    // the checks below (this is only observable via transaction simulation,
+    // since a failing call still reverts all of its effects on submission).
+    let user = signer_address(env, &permit.public_key);
+
+    // Verify the signature. Note: an invalid signature aborts the
+    // transaction directly inside the host call and never reaches here, so
+    // it cannot be reported through `emit_permit_failed`.
+    if let Err(e) = verify_permit(env, domain, permit, signature) {
+        emit_permit_failed(env, &user, &permit.action, e as u32);
+        return Err(e);
+    }
 
     // Get the current nonce
-    let current_nonce = get_current_nonce(env, &permit.user);
+    let current_nonce = get_current_nonce(env, &user);
 
     // Validate deadline and nonce
-    validate_permit(env, permit, current_nonce)?;
+    if let Err(e) = validate_permit(env, permit, current_nonce) {
+        emit_permit_failed(env, &user, &permit.action, e as u32);
+        return Err(e);
+    }
 
     // Advance the nonce (consume the permit)
-    let new_nonce = advance_nonce(env, &permit.user);
+    let new_nonce = advance_nonce(env, &user);
 
     // Emit permit executed event
-    emit_permit_executed(env, &permit.user, &permit.action, &permit.asset, permit.amount, new_nonce);
+    emit_permit_executed(
+        env,
+        &user,
+        &permit.action,
+        &permit.asset,
+        permit.amount,
+        new_nonce,
+    );
 
     Ok(VerifiedPermit {
-        user: permit.user.clone(),
+        user,
         action: permit.action.clone(),
         asset: permit.asset.clone(),
         amount: permit.amount,

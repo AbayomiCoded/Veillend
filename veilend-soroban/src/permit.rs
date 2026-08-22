@@ -6,7 +6,8 @@
 
 use crate::{DataKey, VeilLendError};
 use soroban_sdk::{
-    contracttype, panic_with_error, Address, Bytes, Env, String, Symbol, Vec,
+    address_payload::AddressPayload, contractevent, contracttype, xdr::ToXdr, Address, Bytes,
+    BytesN, Env, Symbol,
 };
 
 /// Domain separator for permit signatures.
@@ -23,13 +24,21 @@ pub struct DomainSeparator {
 
 /// Permit structure for meta-transactions.
 ///
-/// Users sign this struct off-chain, and relayers submit it on-chain.
-/// All fields are included in the signature digest to prevent tampering.
+/// Users sign this struct off-chain, and relayers submit it on-chain. All
+/// fields are included in the signature digest (via XDR serialization) to
+/// prevent tampering.
+///
+/// The signer is identified by `public_key`, an Ed25519 public key, rather
+/// than a Soroban `Address`: a contract cannot safely extract a raw signing
+/// key from an arbitrary `Address` (it may be a contract address, or an
+/// account whose signers have since been rotated away from its master key).
+/// Instead, the acting `Address` is derived deterministically from
+/// `public_key` (see [`signer_address`]), so the two can never disagree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct Permit {
-    /// The user who authorizes the action (signer)
-    pub user: Address,
+    /// The Ed25519 public key that must have signed this permit.
+    pub public_key: BytesN<32>,
     /// The action to perform (deposit, withdraw, borrow, repay)
     pub action: Symbol,
     /// The asset address for the operation
@@ -56,142 +65,29 @@ pub struct PermitWithExtra {
     pub extra_asset: Address,
 }
 
+/// Derives the Address controlled by an Ed25519 public key.
+///
+/// This is the account `Address` whose master key is `public_key`. A
+/// successfully verified permit is only authoritative for accounts where
+/// that master key is actually the authorizing signer, i.e. simple,
+/// non-multisig accounts (the common case for regular wallets).
+pub fn signer_address(env: &Env, public_key: &BytesN<32>) -> Address {
+    Address::from_payload(
+        env,
+        AddressPayload::AccountIdPublicKeyEd25519(public_key.clone()),
+    )
+}
+
 /// Computes the digest to be signed for a permit.
 ///
-/// The digest is a hash of the domain separator and the permit fields,
-/// following the EIP-712 style pattern.
-pub fn compute_permit_digest(
-    env: &Env,
-    domain: &DomainSeparator,
-    permit: &Permit,
-) -> Result<Bytes, VeilLendError> {
-    use soroban_sdk::crypto::Hash;
-
-    // Encode domain separator
-    let domain_encoded = encode_domain(env, domain);
-
-    // Encode permit fields
-    let permit_encoded = encode_permit(env, permit);
-
-    // Combine and hash
-    let mut combined = Vec::new(env);
-    combined.append(&domain_encoded);
-    combined.append(&permit_encoded);
-
-    let hash = Hash::from_bytes(env, &combined);
-    Ok(Bytes::from_array(env, &hash.to_array()))
-}
-
-/// Encodes the domain separator for hashing.
-fn encode_domain(env: &Env, domain: &DomainSeparator) -> Vec<u8> {
-    let mut encoded = Vec::new(env);
-
-    // Encode contract_id as bytes
-    let contract_bytes = domain.contract_id.to_bytes(env);
-    for b in contract_bytes.iter() {
-        encoded.push_back(b);
-    }
-
-    // Encode version as u32 bytes (big endian)
-    encoded.push_back(((domain.version >> 24) & 0xFF) as u8);
-    encoded.push_back(((domain.version >> 16) & 0xFF) as u8);
-    encoded.push_back(((domain.version >> 8) & 0xFF) as u8);
-    encoded.push_back((domain.version & 0xFF) as u8);
-
-    // Encode chain_id as u64 bytes (big endian)
-    encoded.push_back(((domain.chain_id >> 56) & 0xFF) as u8);
-    encoded.push_back(((domain.chain_id >> 48) & 0xFF) as u8);
-    encoded.push_back(((domain.chain_id >> 40) & 0xFF) as u8);
-    encoded.push_back(((domain.chain_id >> 32) & 0xFF) as u8);
-    encoded.push_back(((domain.chain_id >> 24) & 0xFF) as u8);
-    encoded.push_back(((domain.chain_id >> 16) & 0xFF) as u8);
-    encoded.push_back(((domain.chain_id >> 8) & 0xFF) as u8);
-    encoded.push_back((domain.chain_id & 0xFF) as u8);
-
-    encoded
-}
-
-/// Encodes the permit fields for hashing.
-fn encode_permit(env: &Env, permit: &Permit) -> Vec<u8> {
-    let mut encoded = Vec::new(env);
-
-    // Encode user address
-    let user_bytes = permit.user.to_bytes(env);
-    for b in user_bytes.iter() {
-        encoded.push_back(b);
-    }
-
-    // Encode action as Symbol bytes
-    let action_bytes = permit.action.to_bytes(env);
-    for b in action_bytes.iter() {
-        encoded.push_back(b);
-    }
-
-    // Encode asset address
-    let asset_bytes = permit.asset.to_bytes(env);
-    for b in asset_bytes.iter() {
-        encoded.push_back(b);
-    }
-
-    // Encode amount as i128 bytes (big endian)
-    let amount = permit.amount;
-    encoded.push_back(((amount >> 120) & 0xFF) as u8);
-    encoded.push_back(((amount >> 112) & 0xFF) as u8);
-    encoded.push_back(((amount >> 104) & 0xFF) as u8);
-    encoded.push_back(((amount >> 96) & 0xFF) as u8);
-    encoded.push_back(((amount >> 88) & 0xFF) as u8);
-    encoded.push_back(((amount >> 80) & 0xFF) as u8);
-    encoded.push_back(((amount >> 72) & 0xFF) as u8);
-    encoded.push_back(((amount >> 64) & 0xFF) as u8);
-    encoded.push_back(((amount >> 56) & 0xFF) as u8);
-    encoded.push_back(((amount >> 48) & 0xFF) as u8);
-    encoded.push_back(((amount >> 40) & 0xFF) as u8);
-    encoded.push_back(((amount >> 32) & 0xFF) as u8);
-    encoded.push_back(((amount >> 24) & 0xFF) as u8);
-    encoded.push_back(((amount >> 16) & 0xFF) as u8);
-    encoded.push_back(((amount >> 8) & 0xFF) as u8);
-    encoded.push_back((amount & 0xFF) as u8);
-
-    // Encode nonce as u64 bytes (big endian)
-    let nonce = permit.nonce;
-    encoded.push_back(((nonce >> 56) & 0xFF) as u8);
-    encoded.push_back(((nonce >> 48) & 0xFF) as u8);
-    encoded.push_back(((nonce >> 40) & 0xFF) as u8);
-    encoded.push_back(((nonce >> 32) & 0xFF) as u8);
-    encoded.push_back(((nonce >> 24) & 0xFF) as u8);
-    encoded.push_back(((nonce >> 16) & 0xFF) as u8);
-    encoded.push_back(((nonce >> 8) & 0xFF) as u8);
-    encoded.push_back((nonce & 0xFF) as u8);
-
-    // Encode deadline as u64 bytes (big endian)
-    let deadline = permit.deadline;
-    encoded.push_back(((deadline >> 56) & 0xFF) as u8);
-    encoded.push_back(((deadline >> 48) & 0xFF) as u8);
-    encoded.push_back(((deadline >> 40) & 0xFF) as u8);
-    encoded.push_back(((deadline >> 32) & 0xFF) as u8);
-    encoded.push_back(((deadline >> 24) & 0xFF) as u8);
-    encoded.push_back(((deadline >> 16) & 0xFF) as u8);
-    encoded.push_back(((deadline >> 8) & 0xFF) as u8);
-    encoded.push_back((deadline & 0xFF) as u8);
-
-    // Encode chain_id as u64 bytes (big endian)
-    let chain_id = permit.chain_id;
-    encoded.push_back(((chain_id >> 56) & 0xFF) as u8);
-    encoded.push_back(((chain_id >> 48) & 0xFF) as u8);
-    encoded.push_back(((chain_id >> 40) & 0xFF) as u8);
-    encoded.push_back(((chain_id >> 32) & 0xFF) as u8);
-    encoded.push_back(((chain_id >> 24) & 0xFF) as u8);
-    encoded.push_back(((chain_id >> 16) & 0xFF) as u8);
-    encoded.push_back(((chain_id >> 8) & 0xFF) as u8);
-    encoded.push_back((chain_id & 0xFF) as u8);
-
-    // Encode contract_id
-    let contract_bytes = permit.contract_id.to_bytes(env);
-    for b in contract_bytes.iter() {
-        encoded.push_back(b);
-    }
-
-    encoded
+/// The digest is the SHA-256 hash of the XDR encoding of the domain
+/// separator followed by the XDR encoding of the permit, following an
+/// EIP-712-style domain-separation pattern.
+pub fn compute_permit_digest(env: &Env, domain: &DomainSeparator, permit: &Permit) -> Bytes {
+    let mut combined = Bytes::new(env);
+    combined.append(&domain.clone().to_xdr(env));
+    combined.append(&permit.clone().to_xdr(env));
+    Bytes::from(env.crypto().sha256(&combined))
 }
 
 /// Verifies a signature against a permit.
@@ -203,30 +99,29 @@ fn encode_permit(env: &Env, permit: &Permit) -> Vec<u8> {
 /// * `signature` - The ed25519 signature (64 bytes)
 ///
 /// # Returns
-/// * `Ok(())` if the signature is valid
-/// * `Err(VeilLendError::InvalidSignature)` if verification fails
+/// * `Ok(())` if the signature is well-formed (verification failure aborts
+///   the transaction directly, see below)
+/// * `Err(VeilLendError::InvalidSignature)` if the signature is not 64 bytes
+///
+/// # Panics
+/// The host's `ed25519_verify` traps the transaction if the signature does
+/// not match `permit.public_key` over the computed digest; there is no way
+/// to recover from this within the contract, so an invalid signature never
+/// returns an `Err` — it aborts execution outright.
 pub fn verify_permit(
     env: &Env,
     domain: &DomainSeparator,
     permit: &Permit,
     signature: &Bytes,
 ) -> Result<(), VeilLendError> {
-    // Validate signature length (ed25519 signatures are 64 bytes)
-    if signature.len() != 64 {
-        return Err(VeilLendError::InvalidSignature);
-    }
+    let signature: BytesN<64> = signature
+        .try_into()
+        .map_err(|_| VeilLendError::InvalidSignature)?;
 
-    // Compute the digest
-    let digest = compute_permit_digest(env, domain, permit)?;
+    let digest = compute_permit_digest(env, domain, permit);
 
-    // Verify the signature
-    let is_valid = env
-        .crypto()
-        .ed25519_verify(&permit.user, &digest, signature);
-
-    if !is_valid {
-        return Err(VeilLendError::InvalidSignature);
-    }
+    env.crypto()
+        .ed25519_verify(&permit.public_key, &digest, &signature);
 
     Ok(())
 }
@@ -274,10 +169,6 @@ pub fn advance_nonce(env: &Env, user: &Address) -> u64 {
     let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     let next = current + 1;
     env.storage().persistent().set(&key, &next);
-    // Bump TTL
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, crate::storage::MIN_TTL, crate::storage::BUMP_TTL);
     next
 }
 
@@ -291,12 +182,7 @@ pub fn advance_nonce(env: &Env, user: &Address) -> u64 {
 /// * The current nonce value
 pub fn get_current_nonce(env: &Env, user: &Address) -> u64 {
     let key = DataKey::PermitNonce(user.clone());
-    let nonce: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-    // Bump TTL on read
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, crate::storage::MIN_TTL, crate::storage::BUMP_TTL);
-    nonce
+    env.storage().persistent().get(&key).unwrap_or(0)
 }
 
 /// Emits a permit executed event.
@@ -333,12 +219,7 @@ pub fn emit_permit_executed(
 }
 
 /// Emits a permit failed event.
-pub fn emit_permit_failed(
-    env: &Env,
-    user: &Address,
-    action: &Symbol,
-    error_code: u32,
-) {
+pub fn emit_permit_failed(env: &Env, user: &Address, action: &Symbol, error_code: u32) {
     #[contractevent(topics = ["veillend", "permit_failed"])]
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct PermitFailed {
