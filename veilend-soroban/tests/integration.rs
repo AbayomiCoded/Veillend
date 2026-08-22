@@ -2571,3 +2571,358 @@ fn test_interest_params_invalid_inputs_panic() {
     let result = client.try_set_interest_params(&admin, &asset, &bad_reserve);
     assert!(result.is_err(), "reserve_factor_bps > 5_000 must panic");
 }
+
+// ─── Batch Operation Tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_deposit_batch_single_operation_matches_single() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    // Single deposit
+    client.deposit(&user, &asset, &100_000);
+    let single_position = client.get_position(&user, &asset);
+    let single_total = client.get_total_deposited(&asset);
+
+    // Batch deposit with one operation
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 100_000,
+        }
+    ];
+    client.deposit_batch(&user, &ops);
+
+    let batch_position = client.get_position(&user, &asset);
+    let batch_total = client.get_total_deposited(&asset);
+
+    assert_eq!(single_position.deposited * 2, batch_position.deposited);
+    assert_eq!(single_total * 2, batch_total);
+}
+
+#[test]
+fn test_deposit_batch_multiple_assets_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset1 = Address::generate(&env);
+    let asset2 = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset1);
+    configure_asset(&env, &client, &admin, &asset2);
+    set_oracle_price(&env, &client, &admin, &asset1, &100);
+    set_oracle_price(&env, &client, &admin, &asset2, &100);
+
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset1.clone(),
+            amount: 100_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset2.clone(),
+            amount: 50_000,
+        }
+    ];
+
+    client.deposit_batch(&user, &ops);
+
+    assert_eq!(client.get_total_deposited(&asset1), 100_000);
+    assert_eq!(client.get_total_deposited(&asset2), 50_000);
+    assert_eq!(client.balance_of(&user, &asset1), 100_000);
+    assert_eq!(client.balance_of(&user, &asset2), 50_000);
+}
+
+#[test]
+fn test_withdraw_batch_multiple_assets_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset1 = Address::generate(&env);
+    let asset2 = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset1);
+    configure_asset(&env, &client, &admin, &asset2);
+    set_oracle_price(&env, &client, &admin, &asset1, &100);
+    set_oracle_price(&env, &client, &admin, &asset2, &100);
+
+    // First deposit assets
+    let deposit_ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset1.clone(),
+            amount: 100_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset2.clone(),
+            amount: 50_000,
+        }
+    ];
+    client.deposit_batch(&user, &deposit_ops);
+
+    // Now withdraw
+    let withdraw_ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset1.clone(),
+            amount: 50_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset2.clone(),
+            amount: 25_000,
+        }
+    ];
+    client.withdraw_batch(&user, &asset1, &withdraw_ops);
+
+    assert_eq!(client.get_total_deposited(&asset1), 50_000);
+    assert_eq!(client.get_total_deposited(&asset2), 25_000);
+}
+
+#[test]
+fn test_borrow_batch_multiple_assets_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    // Deposit collateral
+    client.deposit(&user, &asset, &1_000_000);
+
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 100_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 50_000,
+        }
+    ];
+
+    client.borrow_batch(&user, &asset, &ops);
+
+    assert_eq!(client.get_total_borrowed(&asset), 150_000);
+    assert_eq!(client.get_position(&user, &asset).borrowed, 150_000);
+}
+
+#[test]
+fn test_repay_batch_multiple_assets_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 10_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    // Deposit collateral and borrow
+    client.deposit(&user, &asset, &1_000_000);
+    client.borrow(&user, &asset, &asset, &200_000);
+
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 100_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 50_000,
+        }
+    ];
+
+    client.repay_batch(&user, &ops);
+
+    assert_eq!(client.get_total_borrowed(&asset), 50_000);
+    assert_eq!(client.get_position(&user, &asset).borrowed, 50_000);
+}
+
+#[test]
+fn test_withdraw_then_deposit_batch_succeeds_final_healthy() {
+    // Classic footgun: withdraw all XLM then add more ETH collateral
+    // This should succeed as a batch but fail as separate transactions
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset_xlm = Address::generate(&env);
+    let asset_eth = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset_xlm);
+    configure_asset(&env, &client, &admin, &asset_eth);
+    set_oracle_price(&env, &client, &admin, &asset_xlm, &1);
+    set_oracle_price(&env, &client, &admin, &asset_eth, &100);
+
+    // Deposit XLM as collateral
+    client.deposit(&user, &asset_xlm, &10_000);
+    // Deposit ETH as collateral
+    client.deposit(&user, &asset_eth, &100);
+
+    // Borrow against XLM
+    client.borrow(&user, &asset_xlm, &asset_xlm, &5_000);
+
+    // Single transaction: withdraw all XLM then add more ETH
+    // This should succeed because final state is healthy
+    let withdraw_ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset_xlm.clone(),
+            amount: 10_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset_eth.clone(),
+            amount: 50,
+        }
+    ];
+
+    // This should succeed
+    client.withdraw_batch(&user, &asset_xlm, &withdraw_ops);
+
+    // Verify final state
+    let xlm_position = client.get_position(&user, &asset_xlm);
+    let eth_position = client.get_position(&user, &asset_eth);
+    assert_eq!(xlm_position.deposited, 0);
+    assert_eq!(eth_position.deposited, 150);
+
+    // Should still have debt
+    assert!(xlm_position.borrowed > 0);
+}
+
+#[test]
+fn test_batch_fails_if_final_undercollateralized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    // Deposit collateral and borrow to near limit
+    client.deposit(&user, &asset, &1_000);
+    client.borrow(&user, &asset, &asset, &600);
+
+    // Try to withdraw too much, making final state undercollateralized
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 500, // Withdraw 500 of 1000 collateral, leaving 500 collateral against 600 debt
+        }
+    ];
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.withdraw_batch(&user, &asset, &ops);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_deposit_batch_with_duplicate_assets_aggregates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    // Duplicate asset deposits should aggregate
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 100_000,
+        },
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 50_000,
+        }
+    ];
+
+    client.deposit_batch(&user, &ops);
+
+    assert_eq!(client.get_total_deposited(&asset), 150_000);
+    assert_eq!(client.get_position(&user, &asset).deposited, 150_000);
+}
+
+#[test]
+fn test_batch_events_emitted() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(VeilLendContract, (admin.clone(), 15_000u32));
+    let client = VeilLendContractClient::new(&env, &contract_id);
+
+    configure_asset(&env, &client, &admin, &asset);
+    set_oracle_price(&env, &client, &admin, &asset, &100);
+
+    let ops = soroban_sdk::vec![
+        &env,
+        veillend_contract::BatchOperation {
+            asset: asset.clone(),
+            amount: 100_000,
+        }
+    ];
+
+    client.deposit_batch(&user, &ops);
+
+    // Check events
+    let events = env.events().all();
+    let mut deposit_events = 0;
+    let mut batch_events = 0;
+
+    for (_, topics, _) in events.iter() {
+        if topics.len() >= 2 {
+            let topic0 = topics.get(0).unwrap();
+            let topic1 = topics.get(1).unwrap();
+            // Check for deposit event
+            if topic0 == Symbol::new(&env, "veillend") {
+                if let Ok(sym) = Symbol::try_from_val(&env, &topic1) {
+                    if sym == Symbol::new(&env, "deposit") {
+                        deposit_events += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(deposit_events, 1);
+}
